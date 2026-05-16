@@ -324,12 +324,13 @@ fn build_ui(app: &Application) {
         // Watch the Accessibility grant continuously for the lifetime
         // of the process. On a grant, swap the warning row into its
         // "relaunch required" state (the daemon subprocess already
-        // bailed and can't recover without a restart). On a REVOKE,
-        // quit immediately — an active CGEventTap at
-        // HeadInsertEventTap can wedge system input if the process
-        // lingers after losing AX, and forcing the process to exit is
-        // the only bulletproof way to guarantee the kernel tears the
-        // tap down.
+        // bailed and can't recover without a restart) and present the
+        // modal relaunch prompt — this transition is the one
+        // unambiguous "relaunch needed" moment. On a REVOKE, quit
+        // immediately — an active CGEventTap at HeadInsertEventTap can
+        // wedge system input if the process lingers after losing AX,
+        // and forcing the process to exit is the only bulletproof way
+        // to guarantee the kernel tears the tap down.
         let window_weak = window.downgrade();
         let app_weak = app.downgrade();
         macos_privacy::watch_accessibility_state(move |change| match change {
@@ -337,6 +338,7 @@ fn build_ui(app: &Application) {
                 if let Some(window) = window_weak.upgrade() {
                     window.present();
                     window.refresh_capture_emulation_status();
+                    window.show_relaunch_required_dialog();
                 }
             }
             macos_privacy::AccessibilityChange::Revoked => {

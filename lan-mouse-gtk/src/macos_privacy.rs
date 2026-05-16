@@ -195,6 +195,119 @@ fn open_url(url: &str) {
     }
 }
 
+/// Build the AppleScript that draws the relaunch alert. Uses
+/// `display dialog` (not `display alert`) because only `display dialog`
+/// accepts `with icon`, which lets us show the Lan Mouse app icon instead
+/// of the generic `osascript` icon. "Later" is also the cancel button, so
+/// Escape dismisses it as "Later".
+///
+/// `icon_icns` is the absolute path to the bundle's `icon.icns`; when
+/// `None` (e.g. running outside an `.app` bundle) the `with icon` clause is
+/// omitted and macOS falls back to its default.
+fn relaunch_alert_script(icon_icns: Option<&str>) -> String {
+    let mut script = String::from(concat!(
+        "activate\n",
+        "display dialog \"Accessibility access has been granted. Lan Mouse ",
+        "needs to quit and reopen for keyboard and mouse capture to take ",
+        "effect.\" ",
+        "with title \"Relaunch Required\" ",
+        "buttons {\"Later\", \"Quit & Reopen\"} ",
+        "default button \"Quit & Reopen\" cancel button \"Later\"",
+    ));
+    if let Some(path) = icon_icns {
+        script.push_str(" with icon POSIX file \"");
+        script.push_str(path);
+        script.push('"');
+    }
+    script
+}
+
+/// Absolute path to the running `.app` bundle's `icon.icns`, for use in the
+/// relaunch alert's `with icon` clause. Resolved from the current
+/// executable (`<bundle>/Contents/MacOS/lan-mouse` → three parents up is
+/// the bundle root), matching [`relaunch_bundle`]. Returns `None` when not
+/// running from a bundle, the icon is missing, or the path contains a
+/// character that would need escaping inside the AppleScript string literal
+/// (`"` / `\`) — a real bundle path never does, so falling back to the
+/// default icon is safe.
+fn relaunch_alert_icon_path() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let bundle = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)?;
+    let icon = bundle.join("Contents/Resources/icon.icns");
+    if !icon.is_file() {
+        return None;
+    }
+    let path = icon.to_str()?;
+    if path.contains('"') || path.contains('\\') {
+        return None;
+    }
+    Some(path.to_owned())
+}
+
+/// Show a native macOS alert telling the user that a relaunch is required
+/// for a just-granted Accessibility permission to take effect.
+///
+/// macOS fires this kind of "quit and reopen" alert *itself* for Screen
+/// Recording / Camera / Microphone grants, but not for Accessibility.
+///
+/// The alert is rendered by a short-lived `osascript` subprocess rather
+/// than an in-process `NSAlert`. GTK4's macOS backend owns the
+/// `NSApplication` and the event pump in a way that breaks AppKit's modal
+/// machinery: an in-process `NSAlert` — `runModal` *or* the asynchronous
+/// `beginSheetModalForWindow:` sheet — auto-dismisses with the default
+/// response without ever waiting for the user (`runModal` needs
+/// `[NSApp run]`, which GTK never calls; the sheet gets torn down by
+/// GTK's own window handling shortly after it attaches). A separate
+/// process has its own clean AppKit run loop, so the alert behaves
+/// correctly there.
+///
+/// The subprocess is run asynchronously via `gio::Subprocess` so the GTK
+/// main loop keeps running. `on_choice` is invoked on the GTK main thread
+/// with `true` for "Quit & Reopen", and `false` for "Later" / Escape / any
+/// failure to show the alert.
+pub fn show_relaunch_required_alert<F>(on_choice: F)
+where
+    F: Fn(bool) + 'static,
+{
+    use gtk::gio;
+
+    let script = relaunch_alert_script(relaunch_alert_icon_path().as_deref());
+    let proc = match gio::Subprocess::newv(
+        &[
+            std::ffi::OsStr::new("osascript"),
+            std::ffi::OsStr::new("-e"),
+            std::ffi::OsStr::new(&script),
+        ],
+        // STDERR_SILENCE swallows the "User canceled. (-128)" osascript
+        // prints whenever the cancel button ("Later") or Escape is used.
+        gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_SILENCE,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("failed to spawn osascript for relaunch alert: {e}");
+            return;
+        }
+    };
+
+    proc.communicate_utf8_async(
+        None,
+        gio::Cancellable::NONE,
+        move |result| {
+            // "Quit & Reopen" → osascript prints `button returned:Quit & Reopen`.
+            // "Later" / Escape → osascript exits via the cancel path with no
+            // such line. Anything else (spawn/IO failure) is treated as "Later".
+            let relaunch = matches!(
+                &result,
+                Ok((Some(stdout), _)) if stdout.contains("Quit & Reopen")
+            );
+            on_choice(relaunch);
+        },
+    );
+}
+
 /// One-shot, at GUI startup: if a permission is missing, fire the system
 /// prompt. This is where the familiar first-launch "Lan Mouse.app would
 /// like to control this computer" alert comes from. Subsequent clicks on

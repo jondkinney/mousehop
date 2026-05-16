@@ -756,6 +756,42 @@ impl Window {
         }
     }
 
+    /// Modal "Relaunch Required" alert, shown once when Accessibility is
+    /// granted while the app is already running.
+    ///
+    /// Called only from the Accessibility grant-*transition* watcher — NOT
+    /// from the general capture/emulation status update. The transition is
+    /// the one unambiguous "relaunch needed" signal: AX was missing, the
+    /// daemon subprocess bailed because of it, and the user has now granted
+    /// it. Triggering off "AX granted && capture/emulation off" instead
+    /// would also fire during the brief startup window before the daemon
+    /// reports healthy status, re-prompting on every relaunch — an
+    /// infinite loop. The relaunched process starts with AX already
+    /// granted, so no transition occurs and the alert does not re-fire.
+    ///
+    /// "Quit & Reopen" reuses the same relaunch path as the inline row's
+    /// Relaunch button. The alert is a native macOS panel drawn by a
+    /// short-lived `osascript` subprocess (see
+    /// `macos_privacy::show_relaunch_required_alert` for why an in-process
+    /// `NSAlert` can't be used under GTK4). We defer the call onto a GTK
+    /// idle callback so it doesn't run in the middle of a widget update /
+    /// signal emission; the subprocess is non-blocking and its completion
+    /// closure runs later on the main thread when the user picks a button.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn show_relaunch_required_dialog(&self) {
+        let app = self.application();
+        glib::idle_add_local_once(move || {
+            crate::macos_privacy::show_relaunch_required_alert(move |relaunch| {
+                if relaunch {
+                    crate::macos_privacy::relaunch_bundle();
+                    if let Some(app) = &app {
+                        app.quit();
+                    }
+                }
+            });
+        });
+    }
+
     pub(super) fn set_authorized_keys(
         &self,
         mut fingerprints: HashMap<String, lan_mouse_ipc::IncomingPeerConfig>,
