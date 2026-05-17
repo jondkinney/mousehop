@@ -1,4 +1,7 @@
-# Mousehop
+<h1>
+  <img src="assets/icons/png/mousehop-512.png" alt="Mousehop icon" width="72" height="72" align="middle">
+  &nbsp;Mousehop
+</h1>
 
 [![CI](https://github.com/jondkinney/mousehop/actions/workflows/rust.yml/badge.svg)](https://github.com/jondkinney/mousehop/actions/workflows/rust.yml) [![Cachix](https://github.com/jondkinney/mousehop/actions/workflows/cachix.yml/badge.svg)](https://github.com/jondkinney/mousehop/actions/workflows/cachix.yml) [![Release](https://github.com/jondkinney/mousehop/actions/workflows/release.yml/badge.svg)](https://github.com/jondkinney/mousehop/actions/workflows/release.yml)
 

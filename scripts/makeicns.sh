@@ -3,24 +3,26 @@ set -e
 
 usage() {
     cat <<EOF
-$0: Make a macOS icns file from an SVG with rsvg-convert, ImageMagick and iconutil.
+$0: Build the macOS icns file and menu-bar template from the mousehop SVGs.
 
-Follows the Big Sur+ icon template:
-  - 1024x1024 canvas with a rounded-square (squircle) background
-  - Icon artwork scaled to fit inside an 824x824 content area, centered
-  - Transparent padding outside the squircle so the Dock/Finder render it
-    like other first-party macOS apps.
+The app icon SVG is a self-contained rounded tile (its own background and
+rounded corners), so it is rendered straight into the Big Sur+ 824px squircle
+and centered on a 1024 canvas with transparent padding. The menu-bar template
+is the tray glyph, flattened to black+alpha so NSStatusBarButton can tint it
+for light and dark menu bars.
 
-usage: $0 [SVG [ICNS [ICONSET]]]
+usage: $0 [APP_SVG [TRAY_SVG [ICNS [ICONSET]]]]
 
 ARGUMENTS
-    SVG     The SVG file to convert
-            Defaults to ./mousehop-gtk/resources/com.mousehop.Mousehop.svg
-    ICNS    The icns file to create
-            Defaults to ./target/icon.icns
-    ICONSET The iconset directory to create
-            Defaults to ./target/icon.iconset
-            This is just a temporary directory
+    APP_SVG  The app icon SVG (a self-contained rounded tile)
+             Defaults to ./mousehop-gtk/resources/com.mousehop.Mousehop.svg
+    TRAY_SVG The tray / menu-bar glyph SVG
+             Defaults to ./mousehop-gtk/resources/icons/mousehop-tray.svg
+    ICNS     The icns file to create
+             Defaults to ./target/icon.icns
+    ICONSET  The iconset directory to create
+             Defaults to ./target/icon.iconset
+             This is just a temporary directory
 EOF
 }
 
@@ -29,9 +31,10 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     exit 0
 fi
 
-svg="${1:-./mousehop-gtk/resources/com.mousehop.Mousehop.svg}"
-icns="${2:-./target/icon.icns}"
-iconset="${3:-./target/icon.iconset}"
+app_svg="${1:-./mousehop-gtk/resources/com.mousehop.Mousehop.svg}"
+tray_svg="${2:-./mousehop-gtk/resources/icons/mousehop-tray.svg}"
+icns="${3:-./target/icon.icns}"
+iconset="${4:-./target/icon.iconset}"
 
 set -u
 
@@ -40,37 +43,26 @@ rm -rf "$iconset" "$workdir"
 mkdir -p "$iconset" "$workdir"
 
 # Big Sur+ macOS icon template proportions (in a 1024 canvas):
-#   canvas  = 1024
-#   squircle = 824  (the white rounded-square background, inset 100px)
-#   content  = 560  (artwork inside the squircle, with generous margin)
-#   radius   = 185  (~22.5% of the squircle, the characteristic curvature)
+#   canvas   = 1024
+#   squircle = 824  (the rounded tile, inset 100px from the canvas edges)
+# The app SVG already carries its own background and rounded corners (rx
+# 22.5%), so it is rendered straight to the squircle size — no separate
+# background fill is needed.
 CANVAS=1024
 SQUIRCLE=824
-CONTENT=560
-RADIUS=185
-BG_COLOR="#FFFFFF"
-SQUIRCLE_OFFSET=$(( (CANVAS - SQUIRCLE) / 2 ))
-CONTENT_OFFSET=$(( (CANVAS - CONTENT) / 2 ))
+OFFSET=$(( (CANVAS - SQUIRCLE) / 2 ))
 
-# 1) Render the SVG to the content size at full fidelity.
+# 1) Render the app tile at squircle size.
 #    rsvg-convert handles our SVG correctly; ImageMagick sometimes crops it.
-rsvg-convert -w "$CONTENT" -h "$CONTENT" "$svg" -o "$workdir/content.png"
+rsvg-convert -w "$SQUIRCLE" -h "$SQUIRCLE" "$app_svg" -o "$workdir/tile.png"
 
-# 2) Draw the rounded-square (squircle) background on a transparent canvas.
-#    The squircle is inset from the canvas edges (transparent padding), so the
-#    Dock/Finder render it at the same visual size as other first-party apps.
+# 2) Center the tile on a transparent canvas. The transparent padding makes
+#    the Dock/Finder render it at the same visual size as first-party apps.
 magick -size ${CANVAS}x${CANVAS} xc:none \
-    -fill "$BG_COLOR" \
-    -draw "roundrectangle ${SQUIRCLE_OFFSET},${SQUIRCLE_OFFSET} $((CANVAS-SQUIRCLE_OFFSET-1)),$((CANVAS-SQUIRCLE_OFFSET-1)) $RADIUS,$RADIUS" \
-    "$workdir/background.png"
-
-# 3) Composite the artwork onto the background, centered inside the content area.
-magick "$workdir/background.png" \
-    "$workdir/content.png" -geometry +${CONTENT_OFFSET}+${CONTENT_OFFSET} -composite \
+    "$workdir/tile.png" -geometry +${OFFSET}+${OFFSET} -composite \
     -colorspace sRGB -type TrueColorAlpha PNG32:"$workdir/icon-1024.png"
 
-# 4) Generate each iconset size from the master so all sizes share the same
-#    squircle proportions and look consistent at every resolution.
+# 3) Generate each iconset size from the master so all sizes stay consistent.
 for size in 1024 512 256 128 64 32 16; do
     magick "$workdir/icon-1024.png" -resize ${size}x${size} \
         -colorspace sRGB -type TrueColorAlpha PNG32:"$workdir/${size}.png"
@@ -89,11 +81,12 @@ cp "$workdir/16.png"   "$iconset"/icon_16x16.png
 
 mkdir -p "$(dirname "$icns")"
 
-# Menu bar template icon: flatten all RGB channels to 0 (black) while keeping
-# alpha so the artwork reads as a clean silhouette. NSStatusBarButton tints
-# template images to match the menu bar appearance in light and dark modes.
+# Menu-bar template icon: render the tray glyph (the purpose-built small-size
+# mark) and flatten all RGB channels to 0 (black) while keeping alpha, so the
+# artwork reads as a clean silhouette. NSStatusBarButton tints template images
+# to match the menu bar appearance in light and dark modes.
 menubar_template="$(dirname "$icns")/menubar-template.png"
-rsvg-convert -w 44 -h 44 "$svg" -o "$workdir/menubar-44.png"
+rsvg-convert -w 44 -h 44 "$tray_svg" -o "$workdir/menubar-44.png"
 magick "$workdir/menubar-44.png" -channel RGB -evaluate set 0 +channel \
     "$menubar_template"
 
