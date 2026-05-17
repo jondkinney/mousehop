@@ -10,7 +10,7 @@
 //! — Wi-Fi can win the race even when the user has Ethernet ranked
 //! higher in macOS's service order.
 //!
-//! Each lan-mouse instance registers a `_lan-mouse._udp.local.`
+//! Each mousehop instance registers a `_mousehop._udp.local.`
 //! Bonjour service whose TXT record advertises `primary=<ip>`, where
 //! `<ip>` is the IPv4 of the interface that owns the default route
 //! (which on macOS reflects service order). The dialer browses the
@@ -35,7 +35,7 @@ use std::{
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio::task::{JoinHandle, spawn_local};
 
-const SERVICE_TYPE: &str = "_lan-mouse._udp.local.";
+const SERVICE_TYPE: &str = "_mousehop._udp.local.";
 const TXT_PRIMARY_KEY: &str = "primary";
 
 /// Cross-platform: IP of the interface that owns the default route.
@@ -54,7 +54,7 @@ fn local_hostname() -> String {
     hostname::get()
         .ok()
         .and_then(|s| s.into_string().ok())
-        .unwrap_or_else(|| "lan-mouse".to_string())
+        .unwrap_or_else(|| "mousehop".to_string())
 }
 
 /// Strip a single trailing dot if present. Bonjour hostnames are
@@ -68,10 +68,10 @@ fn strip_trailing_dot(s: &str) -> &str {
 /// Pull the service-instance label off a Bonjour fullname.
 ///
 /// `mdns-sd` returns fullnames as `"<instance>.<service-type>"` where
-/// `<service-type>` is e.g. `"_lan-mouse._udp.local."`. The instance
+/// `<service-type>` is e.g. `"_mousehop._udp.local."`. The instance
 /// label is the user-visible identifier the announcer chose for itself
 /// — typically the system hostname, and the same string the user puts
-/// in their lan-mouse config's `hostname = "..."`. We key
+/// in their mousehop config's `hostname = "..."`. We key
 /// [`PrimaryCache`] on this instead of the SRV target so the dialer
 /// matches the config hostname even when the announcer's SRV target
 /// has macOS-style suffixes (`Foo.local` vs `Foo-2.local`) or other
@@ -164,7 +164,7 @@ impl Discovery {
         }
     }
 
-    /// Register `_lan-mouse._udp.local.` with our hostname + primary
+    /// Register `_mousehop._udp.local.` with our hostname + primary
     /// IP. Called on construction and again whenever the primary IP
     /// or port may have changed.
     fn register(&mut self) {
@@ -273,7 +273,7 @@ impl Drop for Discovery {
     }
 }
 
-/// Spawn a background task that browses `_lan-mouse._udp.local.` and
+/// Spawn a background task that browses `_mousehop._udp.local.` and
 /// keeps `primary_cache` updated as ServiceResolved / ServiceRemoved
 /// events arrive.
 fn start_browse(

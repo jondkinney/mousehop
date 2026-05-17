@@ -4,7 +4,7 @@ description = "cross-platform input-event types for input-capture / input-emulat
 version = "0.3.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/feschber/lan-mouse"
+repository = "https://github.com/jondkinney/mousehop"
 
 [dependencies]
 futures-core = "0.3.30"

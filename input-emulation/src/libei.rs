@@ -62,7 +62,7 @@ fn get_token_file_path() -> PathBuf {
             PathBuf::from(home).join(".cache")
         });
 
-    cache_dir.join("lan-mouse").join("remote-desktop.token")
+    cache_dir.join("mousehop").join("remote-desktop.token")
 }
 
 /// Read the RemoteDesktop token from file
@@ -126,7 +126,7 @@ impl LibeiEmulation {
         stream.set_nonblocking(true)?;
         let context = ei::Context::new(stream)?;
         let (conn, events) = context
-            .handshake_tokio("de.feschber.LanMouse", ContextType::Sender)
+            .handshake_tokio("com.mousehop.Mousehop", ContextType::Sender)
             .await?;
         let devices = Devices::default();
         let libei_error = Arc::new(AtomicBool::default());

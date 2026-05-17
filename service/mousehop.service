@@ -1,0 +1,13 @@
+[Unit]
+Description=Mousehop
+# mousehop needs an active graphical session
+After=graphical-session.target
+# make sure the service terminates with the graphical session
+BindsTo=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/mousehop daemon
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

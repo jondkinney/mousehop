@@ -3,8 +3,8 @@
 # configure release bind
 release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 
-# optional port (defaults to 4242)
-port = 4242
+# optional port (defaults to 4252)
+port = 4252
 
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic
@@ -17,7 +17,7 @@ port = 4242
 position = "right"
 # hostname
 hostname = "iridium"
-# activate this client immediately when lan-mouse is started
+# activate this client immediately when mousehop is started
 activate_on_startup = true
 # optional list of (known) ip addresses
 ips = ["192.168.178.156"]
@@ -31,4 +31,4 @@ hostname = "thorium"
 # ips for ethernet and wifi
 ips = ["192.168.178.189", "192.168.178.172"]
 # optional port
-port = 4242
+port = 4252

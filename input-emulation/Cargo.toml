@@ -1,10 +1,10 @@
 [package]
 name = "input-emulation"
-description = "cross-platform input emulation library used by lan-mouse"
+description = "cross-platform input emulation library used by mousehop"
 version = "0.3.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/feschber/lan-mouse"
+repository = "https://github.com/jondkinney/mousehop"
 
 [dependencies]
 async-trait = "0.1.80"

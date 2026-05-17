@@ -34,17 +34,17 @@ jobs:
       - uses: cachix/install-nix-action@v31
       - uses: cachix/cachix-action@v16
         with:
-          name: lan-mouse
+          name: mousehop
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
 
-      - name: Build lan-mouse (x86_64-linux)
+      - name: Build mousehop (x86_64-linux)
         if: matrix.os == 'ubuntu-latest'
-        run: nix build --print-build-logs --show-trace .#packages.x86_64-linux.lan-mouse
+        run: nix build --print-build-logs --show-trace .#packages.x86_64-linux.mousehop
 
-      - name: Build lan-mouse (x86_64-darwin)
+      - name: Build mousehop (x86_64-darwin)
         if: matrix.os == 'macos-15-intel'
-        run: nix build --print-build-logs --show-trace .#packages.x86_64-darwin.lan-mouse
+        run: nix build --print-build-logs --show-trace .#packages.x86_64-darwin.mousehop
 
-      - name: Build lan-mouse (aarch64-darwin)
+      - name: Build mousehop (aarch64-darwin)
         if: matrix.os == 'macos-latest'
-        run: nix build --print-build-logs --show-trace .#packages.aarch64-darwin.lan-mouse
+        run: nix build --print-build-logs --show-trace .#packages.aarch64-darwin.mousehop

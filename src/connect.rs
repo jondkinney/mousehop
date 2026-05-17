@@ -1,13 +1,14 @@
 use crate::client::ClientManager;
 use crate::config::local_commit;
 use crate::discovery::{PrimaryCache, normalize_mdns_name};
-use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
-use lan_mouse_proto::{
-    MAX_CLIPBOARD_SIZE, MAX_EVENT_SIZE, ProtoEvent, decode_clipboard_event, encode_clipboard_event,
-};
 use local_channel::mpsc::{Receiver, Sender, channel};
+use mousehop_ipc::{ClientHandle, DEFAULT_PORT};
+use mousehop_proto::{
+    MAX_CLIPBOARD_SIZE, MAX_EVENT_SIZE, PROTOCOL_MAGIC, ProtoEvent, decode_clipboard_event,
+    encode_clipboard_event,
+};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     io,
@@ -30,7 +31,7 @@ use webrtc_dtls::{
 use webrtc_util::Conn;
 
 #[derive(Debug, Error)]
-pub(crate) enum LanMouseConnectionError {
+pub(crate) enum MousehopConnectionError {
     #[error(transparent)]
     Bind(#[from] io::Error),
     #[error(transparent)]
@@ -102,7 +103,7 @@ fn record_retry_failure(
 async fn connect(
     addr: SocketAddr,
     cert: Certificate,
-) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
+) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, MousehopConnectionError)> {
     log::info!("connecting to {addr} ...");
     let conn = Arc::new(
         UdpSocket::bind("0.0.0.0:0")
@@ -119,7 +120,7 @@ async fn connect(
     };
     let timeout = tokio::time::sleep(DEFAULT_CONNECTION_TIMEOUT);
     tokio::select! {
-        _ = timeout => Err((addr, LanMouseConnectionError::Timeout)),
+        _ = timeout => Err((addr, MousehopConnectionError::Timeout)),
         result = DTLSConn::new(conn, config, true, None) => match result {
             Ok(dtls_conn) => Ok((Arc::new(dtls_conn), addr)),
             Err(e) => Err((addr, e.into())),
@@ -138,7 +139,7 @@ async fn connect_any(
     addrs: &[SocketAddr],
     preferred: Option<SocketAddr>,
     cert: Certificate,
-) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), LanMouseConnectionError> {
+) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), MousehopConnectionError> {
     let mut joinset = JoinSet::new();
     if let Some(p) = preferred {
         // Dial the peer's mDNS-advertised primary first. If it
@@ -168,7 +169,7 @@ async fn connect_any(
     }
     loop {
         match joinset.join_next().await {
-            None => return Err(LanMouseConnectionError::NotConnected),
+            None => return Err(MousehopConnectionError::NotConnected),
             Some(r) => match r.expect("join error") {
                 Ok(conn) => return Ok(conn),
                 Err((a, e)) => {
@@ -179,7 +180,7 @@ async fn connect_any(
     }
 }
 
-pub(crate) struct LanMouseConnection {
+pub(crate) struct MousehopConnection {
     cert: Certificate,
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
@@ -201,7 +202,7 @@ pub(crate) struct LanMouseConnection {
     retry_state: Rc<RefCell<HashMap<ClientHandle, RetryState>>>,
 }
 
-impl LanMouseConnection {
+impl MousehopConnection {
     pub(crate) fn new(
         cert: Certificate,
         client_manager: ClientManager,
@@ -227,7 +228,7 @@ impl LanMouseConnection {
 
     /// Cheap send-only handle that shares all the dialer state with
     /// `self`. The clone's `recv_rx` is a dead stub — only the
-    /// original [`LanMouseConnection`] (held by Capture) drains the
+    /// original [`MousehopConnection`] (held by Capture) drains the
     /// live receiver. Used by Service to fan clipboard frames out
     /// without routing through the capture session loop.
     pub(crate) fn sender_clone(&self) -> Self {
@@ -249,7 +250,7 @@ impl LanMouseConnection {
         &self,
         event: ProtoEvent,
         handle: ClientHandle,
-    ) -> Result<(), LanMouseConnectionError> {
+    ) -> Result<(), MousehopConnectionError> {
         let event_display = format!("{event}");
         // Clipboard frames are variable-length and can't ride the
         // fixed-size codec; route them through the dedicated helper.
@@ -281,7 +282,7 @@ impl LanMouseConnection {
             };
             if let Some(conn) = conn {
                 if !self.client_manager.alive(handle) {
-                    return Err(LanMouseConnectionError::TargetEmulationDisabled);
+                    return Err(MousehopConnectionError::TargetEmulationDisabled);
                 }
                 match conn.send(buf).await {
                     Ok(_) => {}
@@ -312,7 +313,7 @@ impl LanMouseConnection {
                 self.retry_state.clone(),
             ));
         }
-        Err(LanMouseConnectionError::NotConnected)
+        Err(MousehopConnectionError::NotConnected)
     }
 
     /// Decide whether to spawn another `connect_to_handle` for `handle`.
@@ -356,7 +357,7 @@ async fn connect_to_handle(
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     primary_hints: PrimaryCache,
     retry_state: Rc<RefCell<HashMap<ClientHandle, RetryState>>>,
-) -> Result<(), LanMouseConnectionError> {
+) -> Result<(), MousehopConnectionError> {
     log::info!("client {handle} connecting ...");
     // sending did not work, figure out active conn.
     if let Some(ips_set) = client_manager.get_ips(handle) {
@@ -384,7 +385,7 @@ async fn connect_to_handle(
             // the backoff elapses or new info arrives.
             record_retry_failure(&retry_state, handle, &ips_set, primary_ip);
             connecting.lock().await.remove(&handle);
-            return Err(LanMouseConnectionError::NotConnected);
+            return Err(MousehopConnectionError::NotConnected);
         }
         let res = connect_any(&addrs, preferred, cert).await;
         let (conn, addr) = match res {
@@ -401,18 +402,15 @@ async fn connect_to_handle(
         connecting.lock().await.remove(&handle);
         retry_state.borrow_mut().remove(&handle);
 
-        // Best-effort version handshake. Send our commit hash once
-        // immediately after the DTLS handshake; the listen side
-        // mirrors a Hello back so the receive loop can populate
-        // `peer_commit`. Old peers will silently skip this event
-        // per the forward-compat handler in [`receive_loop`].
-        let (buf, len) = ProtoEvent::Hello {
-            commit: local_commit(),
-        }
-        .into();
-        if let Err(e) = conn.send(&buf[..len]).await {
-            log::debug!("hello send to {addr} failed: {e}");
-        }
+        // Protocol handshake. mousehop refuses any peer that does not
+        // present a valid `Hello` (carrying `PROTOCOL_MAGIC`) shortly
+        // after the DTLS connection authenticates — a deliberate hard
+        // cut-over so mousehop never silently half-interoperates with
+        // lan-mouse. `receive_loop` flips `hello_ok` once the peer's
+        // echoed Hello validates; `hello_handshake` retransmits until
+        // then and tears the connection down if the window elapses.
+        let hello_ok = Rc::new(Cell::new(false));
+        spawn_local(hello_handshake(addr, conn.clone(), hello_ok.clone()));
 
         // poll connection for active
         spawn_local(ping_pong(addr, conn.clone(), ping_response.clone()));
@@ -426,11 +424,52 @@ async fn connect_to_handle(
             conns,
             tx,
             ping_response.clone(),
+            hello_ok,
         ));
         return Ok(());
     }
     connecting.lock().await.remove(&handle);
-    Err(LanMouseConnectionError::NotConnected)
+    Err(MousehopConnectionError::NotConnected)
+}
+
+/// Number of times the connect side retransmits its `Hello` while
+/// waiting for the peer to echo a valid one back, and the gap
+/// between attempts. Their product is the effective handshake
+/// deadline: if `hello_ok` is still unset after the final attempt
+/// the peer never spoke a valid mousehop handshake and the
+/// connection is closed.
+const HELLO_MAX_ATTEMPTS: u32 = 8;
+const HELLO_RETRY_INTERVAL: Duration = Duration::from_millis(750);
+
+/// Drive the protocol handshake on a freshly-connected outbound DTLS
+/// link. Retransmits our [`ProtoEvent::hello`] until `receive_loop`
+/// flips `hello_ok` (the peer echoed a `PROTOCOL_MAGIC`-stamped
+/// Hello) or the attempt budget runs out. A peer that never returns
+/// a valid Hello — a stock lan-mouse, or anything that is not
+/// mousehop — has its connection refused here. This is the
+/// connect-side half of the deliberate hard cut-over from lan-mouse.
+async fn hello_handshake(
+    addr: SocketAddr,
+    conn: Arc<dyn Conn + Send + Sync>,
+    hello_ok: Rc<Cell<bool>>,
+) {
+    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::hello(local_commit()).into();
+    for _ in 0..HELLO_MAX_ATTEMPTS {
+        if hello_ok.get() {
+            return;
+        }
+        if let Err(e) = conn.send(&buf[..len]).await {
+            log::debug!("hello send to {addr} failed: {e}");
+        }
+        tokio::time::sleep(HELLO_RETRY_INTERVAL).await;
+    }
+    if !hello_ok.get() {
+        log::warn!(
+            "refusing {addr}: peer did not complete the mousehop handshake \
+             (no valid Hello) — closing connection"
+        );
+        let _ = conn.close().await;
+    }
 }
 
 async fn ping_pong(
@@ -461,6 +500,7 @@ async fn ping_pong(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_loop(
     client_manager: ClientManager,
     handle: ClientHandle,
@@ -469,6 +509,7 @@ async fn receive_loop(
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    hello_ok: Rc<Cell<bool>>,
 ) {
     // Buffer sized for the largest legal clipboard frame so a single
     // DTLS recv never gets truncated. Non-clipboard events use only
@@ -498,7 +539,16 @@ async fn receive_loop(
                 client_manager.set_alive(handle, b);
                 ping_response.borrow_mut().insert(addr);
             }
-            ProtoEvent::Hello { commit } => {
+            ProtoEvent::Hello { magic, commit } => {
+                if magic != PROTOCOL_MAGIC {
+                    log::warn!(
+                        "refusing {addr}: peer presented a foreign protocol \
+                         handshake (not mousehop) — closing connection"
+                    );
+                    let _ = conn.close().await;
+                    break;
+                }
+                hello_ok.set(true);
                 client_manager.set_peer_commit(handle, Some(commit));
                 // Forward to capture.rs so Service can
                 // broadcast — without this the GUI's
@@ -507,13 +557,13 @@ async fn receive_loop(
                 // match `get_client(addr)`, which fails when
                 // Mac dials in before Linux's outbound dial
                 // has populated `active_addr`.
-                tx.send((handle, ProtoEvent::Hello { commit }))
+                tx.send((handle, ProtoEvent::hello(commit)))
                     .expect("channel closed");
             }
             event => tx.send((handle, event)).expect("channel closed"),
         }
     }
-    log::warn!("recv error");
+    log::debug!("{addr}: receive loop ended");
     disconnect(&client_manager, handle, addr, &conns).await;
 }
 
@@ -522,7 +572,7 @@ async fn receive_loop(
 /// `try_into` path. Returns `None` on any decode failure (bad tag,
 /// truncated payload, oversize frame).
 fn decode_proto_datagram(bytes: &[u8]) -> Option<ProtoEvent> {
-    use lan_mouse_proto::EventType;
+    use mousehop_proto::EventType;
     let tag = *bytes.first()?;
     if tag == EventType::Clipboard as u8 {
         return decode_clipboard_event(bytes).ok();

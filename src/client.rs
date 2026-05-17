@@ -7,7 +7,7 @@ use std::{
 
 use slab::Slab;
 
-use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Position};
+use mousehop_ipc::{ClientConfig, ClientHandle, ClientState, Position};
 
 use crate::config::ConfigClient;
 

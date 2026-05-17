@@ -1,16 +1,16 @@
 use env_logger::Env;
 use input_capture::InputCaptureError;
 use input_emulation::InputEmulationError;
-use lan_mouse::{
+use mousehop::{
     capture_test,
     config::{self, Command, Config, ConfigError},
     emulation_test,
     service::{Service, ServiceError},
 };
-use lan_mouse_cli::CliError;
+use mousehop_cli::CliError;
 #[cfg(feature = "gtk")]
-use lan_mouse_gtk::GtkError;
-use lan_mouse_ipc::{IpcError, IpcListenerCreationError};
+use mousehop_gtk::GtkError;
+use mousehop_ipc::{IpcError, IpcListenerCreationError};
 use std::{
     future::Future,
     io,
@@ -20,7 +20,7 @@ use thiserror::Error;
 use tokio::task::LocalSet;
 
 #[derive(Debug, Error)]
-enum LanMouseError {
+enum MousehopError {
     #[error(transparent)]
     Service(#[from] ServiceError),
     #[error(transparent)]
@@ -42,7 +42,7 @@ enum LanMouseError {
 
 fn main() {
     // init logging
-    let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
+    let env = Env::default().filter_or("MOUSEHOP_LOG_LEVEL", "info");
     env_logger::init_from_env(env);
 
     if let Err(e) = run() {
@@ -51,17 +51,17 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), LanMouseError> {
+fn run() -> Result<(), MousehopError> {
     let config = config::Config::new()?;
     match config.command() {
         Some(command) => match command {
             Command::TestEmulation(args) => run_async(emulation_test::run(config, args))?,
             Command::TestCapture(args) => run_async(capture_test::run(config, args))?,
-            Command::Cli(cli_args) => run_async(lan_mouse_cli::run(cli_args))?,
+            Command::Cli(cli_args) => run_async(mousehop_cli::run(cli_args))?,
             Command::Daemon => {
                 // if daemon is specified we run the service
                 match run_async(run_service(config)) {
-                    Err(LanMouseError::Service(ServiceError::IpcListen(
+                    Err(MousehopError::Service(ServiceError::IpcListen(
                         IpcListenerCreationError::AlreadyRunning,
                     ))) => log::info!("service already running!"),
                     r => r?,
@@ -70,12 +70,12 @@ fn run() -> Result<(), LanMouseError> {
             #[cfg(target_os = "macos")]
             Command::AxProbe => {
                 // Fresh-process probe of TCC Accessibility state. Spawned
-                // by the daemon's TCC.db watcher (see lan_mouse::tcc_watch
+                // by the daemon's TCC.db watcher (see mousehop::tcc_watch
                 // on macOS) to bypass cached-trust state in already-running
                 // processes — particularly important for the "remove from
                 // list" case where AXIsProcessTrusted in the parent keeps
                 // reporting cached-true. Exit 0 = granted, 1 = revoked.
-                let granted = lan_mouse::macos_tcc_probe::is_accessibility_granted();
+                let granted = mousehop::macos_tcc_probe::is_accessibility_granted();
                 process::exit(if granted { 0 } else { 1 });
             }
         },
@@ -85,7 +85,7 @@ fn run() -> Result<(), LanMouseError> {
             #[cfg(feature = "gtk")]
             {
                 let mut service = start_service()?;
-                let res = lan_mouse_gtk::run(config::local_commit());
+                let res = mousehop_gtk::run(config::local_commit());
 
                 // Bound the daemon-child cleanup so a wedged daemon
                 // (CGEventTap stuck on macOS, hung syscall, etc.)
@@ -128,7 +128,7 @@ fn run() -> Result<(), LanMouseError> {
             {
                 // run daemon if gtk is diabled
                 match run_async(run_service(config)) {
-                    Err(LanMouseError::Service(ServiceError::IpcListen(
+                    Err(MousehopError::Service(ServiceError::IpcListen(
                         IpcListenerCreationError::AlreadyRunning,
                     ))) => log::info!("service already running!"),
                     r => r?,
@@ -140,10 +140,10 @@ fn run() -> Result<(), LanMouseError> {
     Ok(())
 }
 
-fn run_async<F, E>(f: F) -> Result<(), LanMouseError>
+fn run_async<F, E>(f: F) -> Result<(), MousehopError>
 where
     F: Future<Output = Result<(), E>>,
-    LanMouseError: From<E>,
+    MousehopError: From<E>,
 {
     // create single threaded tokio runtime
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -176,7 +176,7 @@ async fn run_service(config: Config) -> Result<(), ServiceError> {
     // catches the toggle-off case; the remove case leaves the cached
     // trust state stuck at true forever. See `macos_tcc_watch`.
     #[cfg(target_os = "macos")]
-    lan_mouse::macos_tcc_watch::spawn();
+    mousehop::macos_tcc_watch::spawn();
 
     service.run().await?;
     log::info!("service exited!");

@@ -1920,10 +1920,10 @@ dependencies = [
  "futures-core",
  "input-event",
  "keycode",
- "lan-mouse-ipc",
  "libc",
  "log",
  "memmap",
+ "mousehop-ipc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -2103,95 +2103,6 @@ dependencies = [
  "dbus-codegen",
  "dbus-tree",
  "thiserror 1.0.69",
-]
-
-[[package]]
-name = "lan-mouse"
-version = "0.10.0"
-dependencies = [
- "clap 4.6.0",
- "env_logger",
- "futures",
- "hostname",
- "if-addrs 0.13.4",
- "if-watch",
- "input-capture",
- "input-emulation",
- "input-event",
- "lan-mouse-cli",
- "lan-mouse-gtk",
- "lan-mouse-ipc",
- "lan-mouse-proto",
- "libc",
- "local-channel",
- "log",
- "mdns-sd",
- "netdev",
- "notify",
- "rcgen",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "shadow-rs",
- "slab",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "toml 0.8.23",
- "toml_edit 0.22.27",
- "webrtc-dtls",
- "webrtc-util",
-]
-
-[[package]]
-name = "lan-mouse-cli"
-version = "0.2.0"
-dependencies = [
- "clap 4.6.0",
- "futures",
- "lan-mouse-ipc",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "lan-mouse-gtk"
-version = "0.2.0"
-dependencies = [
- "async-channel",
- "glib-build-tools",
- "gtk4",
- "hostname",
- "input-capture",
- "ksni",
- "lan-mouse-ipc",
- "libadwaita",
- "log",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "lan-mouse-ipc"
-version = "0.2.0"
-dependencies = [
- "futures",
- "log",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
-name = "lan-mouse-proto"
-version = "0.2.0"
-dependencies = [
- "input-event",
- "num_enum",
- "paste",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2407,6 +2318,95 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mousehop"
+version = "0.10.0"
+dependencies = [
+ "clap 4.6.0",
+ "env_logger",
+ "futures",
+ "hostname",
+ "if-addrs 0.13.4",
+ "if-watch",
+ "input-capture",
+ "input-emulation",
+ "input-event",
+ "libc",
+ "local-channel",
+ "log",
+ "mdns-sd",
+ "mousehop-cli",
+ "mousehop-gtk",
+ "mousehop-ipc",
+ "mousehop-proto",
+ "netdev",
+ "notify",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shadow-rs",
+ "slab",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "toml 0.8.23",
+ "toml_edit 0.22.27",
+ "webrtc-dtls",
+ "webrtc-util",
+]
+
+[[package]]
+name = "mousehop-cli"
+version = "0.2.0"
+dependencies = [
+ "clap 4.6.0",
+ "futures",
+ "mousehop-ipc",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "mousehop-gtk"
+version = "0.2.0"
+dependencies = [
+ "async-channel",
+ "glib-build-tools",
+ "gtk4",
+ "hostname",
+ "input-capture",
+ "ksni",
+ "libadwaita",
+ "log",
+ "mousehop-ipc",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "mousehop-ipc"
+version = "0.2.0"
+dependencies = [
+ "futures",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
+name = "mousehop-proto"
+version = "0.2.0"
+dependencies = [
+ "input-event",
+ "num_enum",
+ "paste",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

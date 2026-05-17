@@ -408,7 +408,7 @@ fn get_events(
             //
             //   1. Classic was the canonical scroll convention when
             //      the scroll wheel was invented; using it as the
-            //      wire format keeps Lan Mouse predictable for any
+            //      wire format keeps Mousehop predictable for any
             //      receiver, including non-natural-aware peers.
             //   2. Receivers opt into natural-feel via their own
             //      `natural_scroll` config, mirroring how libinput's
@@ -972,7 +972,7 @@ fn request_macos_capture_permissions() -> Result<(), MacosCaptureCreationError> 
 
 fn request_accessibility_permission() -> bool {
     // Silent check. The GUI owns the one-time user-visible prompt at
-    // startup (see lan_mouse_gtk::macos_privacy) so retries triggered by
+    // startup (see mousehop_gtk::macos_privacy) so retries triggered by
     // clicking the "Reenable" button don't pop a fresh Accessibility
     // alert every time.
     unsafe { AXIsProcessTrusted() }

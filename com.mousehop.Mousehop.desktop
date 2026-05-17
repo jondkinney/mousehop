@@ -1,0 +1,12 @@
+[Desktop Entry]
+Categories=Utility;
+Comment[en_US]=Mouse & Keyboard sharing via LAN
+Comment=Mouse & Keyboard sharing via LAN
+Comment[de_DE]=Maus- und Tastaturfreigabe über LAN
+Exec=mousehop
+Icon=com.mousehop.Mousehop
+Name[en_US]=Mousehop
+Name=Mousehop
+StartupNotify=true
+Terminal=false
+Type=Application

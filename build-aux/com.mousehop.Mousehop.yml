@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/flatpak/flatpak-builder/refs/heads/main/data/flatpak-manifest.schema.json
+app-id: com.mousehop.Mousehop
+runtime: org.gnome.Platform
+runtime-version: "48"
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm20
+command: /app/bin/mousehop
+build-options:
+  append-path: "/usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin"
+  env:
+    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER": "clang"
+    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=/usr/lib/sdk/rust-stable/bin/mold"
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER": "clang"
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=/usr/lib/sdk/rust-stable/bin/mold"
+    build-args:
+      "--share=network"
+    prepend-ld-library-path:
+      "/usr/lib/sdk/llvm19/lib"
+
+finish-args:
+  - "--socket=wayland"
+  - "--socket=fallback-x11"
+  - "--device=dri"
+  - "--socket=session-bus"
+  - "--share=network"
+  - "--filesystem=xdg-config"
+  - "--env=RUST_BACKTRACE=1"
+  - "--env=RUST_LOG=mousehop=debug"
+  - "--env=GTK_PATH=/app/lib/gtk-4.0"
+
+modules:
+  - name: mousehop
+    buildsystem: simple
+    build-options:
+      build-args:
+        - "--share=network"
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/mousehop/cargo
+    build-commands:
+      - cargo fetch --manifest-path Cargo.toml --verbose
+      - cargo build
+      - install -Dm0755 target/debug/mousehop /app/bin/mousehop
+      - install -Dm0644 mousehop-gtk/resources/com.mousehop.Mousehop.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
+      - install -Dm0644 com.mousehop.Mousehop.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
+    sources:
+      - type: dir
+        path: ..

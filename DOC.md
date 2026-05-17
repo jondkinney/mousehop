@@ -2,7 +2,7 @@
 
 ## Events
 
-Each instance of lan-mouse can emit and receive events, where
+Each instance of mousehop can emit and receive events, where
 an event is either a mouse or keyboard event for now.
 
 The general Architecture is shown in the following flow chart:
@@ -72,6 +72,6 @@ Either events are sent or received.
 
 This ensures that
 - a) Events can never result in a feedback loop.
-- b) As soon as a virtual input enters another client, lan-mouse will stop receiving events,
+- b) As soon as a virtual input enters another client, mousehop will stop receiving events,
 which ensures clients can only be controlled directly and not indirectly through other clients.
 

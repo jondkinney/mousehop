@@ -15,8 +15,8 @@ use thiserror::Error;
 use toml;
 use toml_edit::{self, DocumentMut};
 
-use lan_mouse_cli::CliArgs;
-use lan_mouse_ipc::{ClipboardSuppression, DEFAULT_PORT, IncomingPeerConfig, Position};
+use mousehop_cli::CliArgs;
+use mousehop_ipc::{ClipboardSuppression, DEFAULT_PORT, IncomingPeerConfig, Position};
 
 use input_event::scancode::{
     self,
@@ -28,7 +28,7 @@ use shadow_rs::shadow;
 shadow!(build);
 
 /// Local build's 8-byte ASCII short commit hash, suitable for use
-/// in [`lan_mouse_proto::ProtoEvent::Hello`]. Pads with `'?'` if
+/// in [`mousehop_proto::ProtoEvent::Hello`]. Pads with `'?'` if
 /// shadow_rs returns an unexpected length so the field is always
 /// well-formed on the wire.
 pub fn local_commit() -> [u8; 8] {
@@ -40,21 +40,21 @@ pub fn local_commit() -> [u8; 8] {
 }
 
 const CONFIG_FILE_NAME: &str = "config.toml";
-const CERT_FILE_NAME: &str = "lan-mouse.pem";
+const CERT_FILE_NAME: &str = "mousehop.pem";
 
 fn default_path() -> Result<PathBuf, VarError> {
     #[cfg(unix)]
     let default_path = {
         let xdg_config_home =
             env::var("XDG_CONFIG_HOME").unwrap_or(format!("{}/.config", env::var("HOME")?));
-        format!("{xdg_config_home}/lan-mouse/")
+        format!("{xdg_config_home}/mousehop/")
     };
 
     #[cfg(not(unix))]
     let default_path = {
         let app_data =
             env::var("LOCALAPPDATA").unwrap_or(format!("{}/.config", env::var("USERPROFILE")?));
-        format!("{app_data}\\lan-mouse\\")
+        format!("{app_data}\\mousehop\\")
     };
     Ok(PathBuf::from(default_path))
 }
@@ -69,7 +69,7 @@ struct ConfigToml {
     /// 0 (or absent) disables it; the cursor only releases on the
     /// release-bind chord or a peer-side `Leave`.
     release_threshold_px: Option<u32>,
-    /// Advertise (and consume) `_lan-mouse._udp.local.` Bonjour
+    /// Advertise (and consume) `_mousehop._udp.local.` Bonjour
     /// service records. The TXT record's `primary=` field tells the
     /// dialer which interface IP the OS prefers (macOS service order
     /// / Linux default route), so when a peer is multi-homed the
@@ -114,7 +114,7 @@ impl ConfigToml {
 #[derive(Parser, Debug)]
 #[command(author, version=build::CLAP_LONG_VERSION, about, long_about = None)]
 struct Args {
-    /// the listen port for lan-mouse
+    /// the listen port for mousehop
     #[arg(short, long)]
     port: Option<u16>,
 
@@ -145,7 +145,7 @@ pub enum Command {
     TestEmulation(TestEmulationArgs),
     /// test input capture
     TestCapture(TestCaptureArgs),
-    /// Lan Mouse commandline interface
+    /// Mousehop commandline interface
     Cli(CliArgs),
     /// run in daemon mode
     Daemon,

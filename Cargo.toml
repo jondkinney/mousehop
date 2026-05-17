@@ -3,19 +3,19 @@ members = [
     "input-capture",
     "input-emulation",
     "input-event",
-    "lan-mouse-ipc",
-    "lan-mouse-cli",
-    "lan-mouse-gtk",
-    "lan-mouse-proto",
+    "mousehop-ipc",
+    "mousehop-cli",
+    "mousehop-gtk",
+    "mousehop-proto",
 ]
 
 [package]
-name = "lan-mouse"
+name = "mousehop"
 description = "Software KVM Switch / mouse & keyboard sharing software for Local Area Networks"
 version = "0.10.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/feschber/lan-mouse"
+repository = "https://github.com/jondkinney/mousehop"
 
 [profile.release]
 codegen-units = 1
@@ -30,10 +30,10 @@ shadow-rs = "1.2.0"
 input-event = { path = "input-event", version = "0.3.0" }
 input-emulation = { path = "input-emulation", version = "0.3.0", default-features = false }
 input-capture = { path = "input-capture", version = "0.3.0", default-features = false }
-lan-mouse-cli = { path = "lan-mouse-cli", version = "0.2.0" }
-lan-mouse-gtk = { path = "lan-mouse-gtk", version = "0.2.0", optional = true }
-lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.2.0" }
-lan-mouse-proto = { path = "lan-mouse-proto", version = "0.2.0" }
+mousehop-cli = { path = "mousehop-cli", version = "0.2.0" }
+mousehop-gtk = { path = "mousehop-gtk", version = "0.2.0", optional = true }
+mousehop-ipc = { path = "mousehop-ipc", version = "0.2.0" }
+mousehop-proto = { path = "mousehop-proto", version = "0.2.0" }
 shadow-rs = { version = "1.2.0", features = ["metadata"] }
 
 toml = "0.8"
@@ -87,7 +87,7 @@ default = [
     "rdp_emulation",
     "x11_emulation",
 ]
-gtk = ["dep:lan-mouse-gtk"]
+gtk = ["dep:mousehop-gtk"]
 layer_shell_capture = ["input-capture/layer_shell"]
 x11_capture = ["input-capture/x11"]
 libei_capture = ["input-event/libei", "input-capture/libei"]
@@ -97,8 +97,8 @@ x11_emulation = ["input-emulation/x11"]
 rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
 [package.metadata.bundle]
-name = "Lan Mouse"
+name = "Mousehop"
 icon = ["target/icon.icns"]
-identifier = "de.feschber.LanMouse"
+identifier = "com.mousehop.Mousehop"
 osx_info_plist_exts = ["build-aux/macos-lsui-element.plist"]
 resources = ["target/menubar-template.png"]

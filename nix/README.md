@@ -3,10 +3,10 @@
 ## Run
 
 ```bash
-nix run github:feschber/lan-mouse
+nix run github:jondkinney/mousehop
 
 # With params
-nix run github:feschber/lan-mouse -- --help
+nix run github:jondkinney/mousehop -- --help
 
 ```
 
@@ -16,24 +16,26 @@ Add input:
 
 ```nix
 inputs = {
-    lan-mouse.url = "github:feschber/lan-mouse";
+    mousehop.url = "github:jondkinney/mousehop";
 }
 ```
 
-Optional: add [our binary cache](https://app.cachix.org/cache/lan-mouse) to allow a faster package install.
+Optional: once a [cachix cache](https://app.cachix.org/cache/mousehop) is set up
+for this fork, add it as a binary cache for faster package installs.
 
 ```nix
 nixConfig = {
     extra-substituters = [
-        "https://lan-mouse.cachix.org/"
+        "https://mousehop.cachix.org/"
     ];
     extra-trusted-public-keys = [
-      "lan-mouse.cachix.org-1:KlE2AEZUgkzNKM7BIzMQo8w9yJYqUpor1CAUNRY6OyM="
+        # TODO: add the public key for the `mousehop` cachix cache once it
+        # exists, e.g. "mousehop.cachix.org-1:<public-key>"
     ];
 };
 ```
 
-Enable lan-mouse:
+Enable mousehop:
 
 ``` nix
 {
@@ -41,12 +43,12 @@ Enable lan-mouse:
   ...
 }: {
   # Add the Home Manager module
-  imports = [inputs.lan-mouse.homeManagerModules.default];
+  imports = [inputs.mousehop.homeManagerModules.default];
 
-  programs.lan-mouse = {
+  programs.mousehop = {
     enable = true;
     # systemd = false;
-    # package = inputs.lan-mouse.packages.${pkgs.stdenv.hostPlatform.system}.default
+    # package = inputs.mousehop.packages.${pkgs.stdenv.hostPlatform.system}.default
     # Optional configuration in nix syntax, see config.toml for available options
     # settings = { };
     };

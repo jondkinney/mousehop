@@ -343,7 +343,7 @@ impl VirtualInput {
                         // drop continuous scroll. AxisSource::Finger
                         // matches a Mac trackpad gesture, which is the
                         // typical source for continuous scroll
-                        // forwarded by Lan Mouse. We also use the
+                        // forwarded by Mousehop. We also use the
                         // local `now` timestamp because the upstream
                         // CGEventTap path passes time=0 and some
                         // compositors filter zero-time events.

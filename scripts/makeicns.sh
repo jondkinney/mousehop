@@ -15,7 +15,7 @@ usage: $0 [SVG [ICNS [ICONSET]]]
 
 ARGUMENTS
     SVG     The SVG file to convert
-            Defaults to ./lan-mouse-gtk/resources/de.feschber.LanMouse.svg
+            Defaults to ./mousehop-gtk/resources/com.mousehop.Mousehop.svg
     ICNS    The icns file to create
             Defaults to ./target/icon.icns
     ICONSET The iconset directory to create
@@ -29,7 +29,7 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     exit 0
 fi
 
-svg="${1:-./lan-mouse-gtk/resources/de.feschber.LanMouse.svg}"
+svg="${1:-./mousehop-gtk/resources/com.mousehop.Mousehop.svg}"
 icns="${2:-./target/icon.icns}"
 iconset="${3:-./target/icon.iconset}"
 

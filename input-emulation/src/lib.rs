@@ -75,7 +75,7 @@ impl Display for Backend {
 /// Per-handle receive-side post-processing applied to forwarded
 /// events before they reach the platform emulation backend.
 ///
-/// `lan-mouse-ipc::IncomingPeerConfig` is the persistent form of
+/// `mousehop-ipc::IncomingPeerConfig` is the persistent form of
 /// these preferences (keyed by TLS fingerprint). The conversion
 /// happens in `src/emulation.rs`, so this crate stays decoupled
 /// from the IPC layer.

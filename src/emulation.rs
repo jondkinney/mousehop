@@ -1,13 +1,13 @@
 use crate::config::local_commit;
-use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
+use crate::listen::{ListenEvent, ListenerCreationError, MousehopListener};
 use futures::StreamExt;
 use input_emulation::{
     EmulationHandle, InputEmulation, InputEmulationError, ReceivePostProcessing,
 };
 use input_event::{ClipboardEvent, Event};
-use lan_mouse_ipc::IncomingPeerConfig;
-use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
+use mousehop_ipc::IncomingPeerConfig;
+use mousehop_proto::{Position, ProtoEvent};
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -47,7 +47,7 @@ pub(crate) enum EmulationEvent {
         /// address of the connection
         addr: SocketAddr,
         /// position of the connection
-        pos: lan_mouse_ipc::Position,
+        pos: mousehop_ipc::Position,
         /// certificate fingerprint of the connection
         fingerprint: String,
     },
@@ -107,7 +107,7 @@ enum EmulationRequest {
 impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
-        listener: LanMouseListener,
+        listener: MousehopListener,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
         let (request_tx, request_rx) = channel();
@@ -173,7 +173,7 @@ impl Emulation {
 }
 
 struct ListenTask {
-    listener: LanMouseListener,
+    listener: MousehopListener,
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
@@ -304,8 +304,8 @@ impl ListenTask {
                             // listener down) the version display would
                             // otherwise silently say "unknown" while
                             // the peer is in fact happily talking to us.
-                            ProtoEvent::Hello { commit } => {
-                                self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
+                            ProtoEvent::Hello { commit, .. } => {
+                                self.listener.reply(addr, ProtoEvent::hello(local_commit())).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
                             // Capturing peer told us where on its own
@@ -714,12 +714,12 @@ impl EmulationTask {
     }
 }
 
-fn to_ipc_pos(pos: Position) -> lan_mouse_ipc::Position {
+fn to_ipc_pos(pos: Position) -> mousehop_ipc::Position {
     match pos {
-        Position::Left => lan_mouse_ipc::Position::Left,
-        Position::Right => lan_mouse_ipc::Position::Right,
-        Position::Top => lan_mouse_ipc::Position::Top,
-        Position::Bottom => lan_mouse_ipc::Position::Bottom,
+        Position::Left => mousehop_ipc::Position::Left,
+        Position::Right => mousehop_ipc::Position::Right,
+        Position::Top => mousehop_ipc::Position::Top,
+        Position::Bottom => mousehop_ipc::Position::Bottom,
     }
 }
 

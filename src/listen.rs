@@ -1,9 +1,12 @@
 use futures::{Stream, StreamExt};
-use lan_mouse_ipc::IncomingPeerConfig;
-use lan_mouse_proto::{MAX_CLIPBOARD_SIZE, MAX_EVENT_SIZE, ProtoEvent, decode_clipboard_event};
 use local_channel::mpsc::{Receiver, Sender, channel};
+use mousehop_ipc::IncomingPeerConfig;
+use mousehop_proto::{
+    MAX_CLIPBOARD_SIZE, MAX_EVENT_SIZE, PROTOCOL_MAGIC, ProtoEvent, decode_clipboard_event,
+};
 use rustls::pki_types::CertificateDer;
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     rc::Rc,
@@ -53,7 +56,7 @@ pub(crate) enum ListenEvent {
     },
 }
 
-pub(crate) struct LanMouseListener {
+pub(crate) struct MousehopListener {
     listen_rx: Receiver<ListenEvent>,
     listen_tx: Sender<ListenEvent>,
     listen_task: JoinHandle<()>,
@@ -85,7 +88,7 @@ impl Drop for ListenerSlot {
     }
 }
 
-impl LanMouseListener {
+impl MousehopListener {
     pub(crate) async fn new(
         port: u16,
         cert: Certificate,
@@ -256,7 +259,7 @@ impl LanMouseListener {
     }
 }
 
-impl Stream for LanMouseListener {
+impl Stream for MousehopListener {
     type Item = ListenEvent;
 
     fn poll_next(
@@ -270,7 +273,7 @@ impl Stream for LanMouseListener {
 /// Enumerate local IPv4 addresses suitable for binding a public
 /// listener: skip loopback (127.0.0.0/8) and link-local
 /// (169.254.0.0/16) since neither is reachable from a peer. IPv6
-/// is intentionally omitted — lan-mouse is IPv4-only on the wire
+/// is intentionally omitted — mousehop is IPv4-only on the wire
 /// today.
 fn enumerate_listenable_ipv4() -> Vec<IpAddr> {
     let ifaces = match if_addrs::get_if_addrs() {
@@ -387,7 +390,7 @@ fn spawn_supervisor_task(
             Err(e) => {
                 log::warn!(
                     "if_watch::IfWatcher::new failed: {e}; interface plug/unplug \
-                     will not be detected (restart lan-mouse to pick up new addrs)"
+                     will not be detected (restart mousehop to pick up new addrs)"
                 );
                 None
             }
@@ -540,12 +543,38 @@ async fn read_loop(
     // keyboard datagrams use only the first MAX_EVENT_SIZE bytes.
     let mut b = [0u8; MAX_CLIPBOARD_SIZE];
 
+    // Handshake gate: the peer must present a `Hello` carrying
+    // `PROTOCOL_MAGIC` within `HELLO_TIMEOUT`. `hello_watchdog`
+    // closes the connection if it doesn't; a `Hello` with the wrong
+    // magic is refused immediately below. This is the listen-side
+    // half of the deliberate hard cut-over from lan-mouse — a
+    // foreign peer is rejected with a clear log instead of silently
+    // half-working.
+    let hello_ok = Rc::new(Cell::new(false));
+    spawn_local(hello_watchdog(addr, conn.clone(), hello_ok.clone()));
+
     while let Ok(n) = conn.recv(&mut b).await {
         if n == 0 {
             continue;
         }
         let datagram = &b[..n];
         match decode_listen_datagram(datagram) {
+            Some(ProtoEvent::Hello { magic, commit }) => {
+                if magic != PROTOCOL_MAGIC {
+                    log::warn!(
+                        "refusing {addr}: peer presented a foreign protocol \
+                         handshake (not mousehop) — closing connection"
+                    );
+                    break;
+                }
+                hello_ok.set(true);
+                dtls_tx
+                    .send(ListenEvent::Msg {
+                        event: ProtoEvent::hello(commit),
+                        addr,
+                    })
+                    .expect("channel closed");
+            }
             Some(event) => dtls_tx
                 .send(ListenEvent::Msg { event, addr })
                 .expect("channel closed"),
@@ -555,7 +584,7 @@ async fn read_loop(
                 // datagram, so a parse error here can't desync a
                 // stream; the next call gets a fresh, framed
                 // message. This makes the protocol forward-
-                // compatible: a peer running a newer Lan Mouse
+                // compatible: a peer running a newer Mousehop
                 // version can introduce additional event types
                 // and old peers will simply ignore them rather
                 // than dropping the connection.
@@ -573,12 +602,34 @@ async fn read_loop(
     Ok(())
 }
 
+/// Connection-establishment deadline. A peer that has not presented
+/// a `PROTOCOL_MAGIC`-stamped `Hello` within this window is not a
+/// mousehop instance and its connection is closed. The connect side
+/// retransmits its `Hello` across a shorter span, so a genuine
+/// mousehop peer always flips `hello_ok` well before this fires.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Close `conn` if `hello_ok` is still unset after [`HELLO_TIMEOUT`].
+/// Reaching the close path means the peer never spoke a valid
+/// mousehop handshake — the listen-side enforcement of the hard
+/// cut-over from lan-mouse.
+async fn hello_watchdog(addr: SocketAddr, conn: ArcConn, hello_ok: Rc<Cell<bool>>) {
+    tokio::time::sleep(HELLO_TIMEOUT).await;
+    if !hello_ok.get() {
+        log::warn!(
+            "refusing {addr}: peer did not complete the mousehop handshake \
+             within {HELLO_TIMEOUT:?} — closing connection"
+        );
+        let _ = conn.close().await;
+    }
+}
+
 /// Classify a DTLS datagram by its first-byte event-type tag and
 /// route through the variable-length clipboard codec or the fixed-
 /// buffer `try_into` path. Mirrors `decode_proto_datagram` on the
 /// connect side so both directions accept the same wire formats.
 fn decode_listen_datagram(bytes: &[u8]) -> Option<ProtoEvent> {
-    use lan_mouse_proto::EventType;
+    use mousehop_proto::EventType;
     let tag = *bytes.first()?;
     if tag == EventType::Clipboard as u8 {
         return decode_clipboard_event(bytes).ok();

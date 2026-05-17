@@ -2,23 +2,23 @@ use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
     config::{Config, ConfigClient},
-    connect::LanMouseConnection,
+    connect::MousehopConnection,
     crypto,
     discovery::{Discovery, PrimaryCache},
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
-    listen::{LanMouseListener, ListenerCreationError},
+    listen::{ListenerCreationError, MousehopListener},
 };
 use futures::StreamExt;
 use input_capture::clipboard::{ClipboardMonitor, SuppressionList};
 use input_capture::frontmost_app;
 use input_event::{ClipboardEvent, Event as InputEvent};
-use lan_mouse_ipc::{
+use log;
+use mousehop_ipc::{
     AppIdent, AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, HostKind,
     IncomingPeerConfig, IpcError, IpcListenerCreationError, Position, Status,
 };
-use lan_mouse_proto::ProtoEvent;
-use log;
+use mousehop_proto::ProtoEvent;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     hash::{DefaultHasher, Hash, Hasher},
@@ -81,14 +81,14 @@ pub struct Service {
     next_trigger_handle: u64,
     /// mDNS-SD service registration + browse. Advertises our primary
     /// interface IP for peer dialers to bias toward; populates
-    /// shared `PrimaryCache` (read by `LanMouseConnection`) from
+    /// shared `PrimaryCache` (read by `MousehopConnection`) from
     /// peer announcements.
     discovery: Discovery,
     /// Outgoing connection handle to fan clipboard frames out from
     /// the capture / forwarding paths. Same handle Capture owns;
     /// cloned in `Service::new` so Service can call `send` directly
     /// without routing through the capture session loop.
-    conn: LanMouseConnection,
+    conn: MousehopConnection,
     /// Cross-platform clipboard poller. `None` when the platform
     /// clipboard couldn't be opened (headless CI, Wayland session
     /// without compositor support). Service drains it in the main
@@ -143,10 +143,10 @@ impl Service {
         // toggles; Discovery writes peer hints into it as browse
         // events arrive.
         let listener =
-            LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
+            MousehopListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
         let primary_cache: PrimaryCache = Default::default();
         let conn =
-            LanMouseConnection::new(cert.clone(), client_manager.clone(), primary_cache.clone());
+            MousehopConnection::new(cert.clone(), client_manager.clone(), primary_cache.clone());
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -394,7 +394,7 @@ impl Service {
     /// Persist the per-OS struct, refresh the runtime `HashSet`
     /// shared with [`ClipboardMonitor`], and push the host slot to
     /// the GUI. Centralized so add/remove can't drift apart.
-    fn commit_suppression(&mut self, suppression: lan_mouse_ipc::ClipboardSuppression) {
+    fn commit_suppression(&mut self, suppression: mousehop_ipc::ClipboardSuppression) {
         let host = HostKind::current();
         let host_list = suppression.host().clone();
         {

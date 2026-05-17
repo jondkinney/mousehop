@@ -1,0 +1,363 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.0"/>
+  <requires lib="libadwaita" version="1.0"/>
+  <template class="MousehopWindow" parent="AdwApplicationWindow">
+    <property name="default-width">600</property>
+    <property name="default-height">1400</property>
+    <property name="title" translatable="yes">Mousehop</property>
+    <property name="show-menubar">True</property>
+    <property name="content">
+      <object class="GtkBox">
+        <property name="orientation">vertical</property>
+        <child type="top">
+          <object class="AdwHeaderBar">
+            <style>
+              <class name="flat"/>
+            </style>
+          </object>
+        </child>
+        <child>
+          <object class="AdwToastOverlay" id="toast_overlay">
+            <child>
+              <object class="GtkScrolledWindow">
+                <property name="vexpand">true</property>
+                <property name="hexpand">true</property>
+                <property name="hscrollbar-policy">never</property>
+                <property name="vscrollbar-policy">automatic</property>
+                <property name="propagate-natural-height">true</property>
+                <child>
+                  <object class="AdwStatusPage">
+                    <property name="title" translatable="yes">Mousehop</property>
+                    <property name="description" translatable="yes">Easily use your mouse and keyboard on multiple computers.</property>
+                    <property name="icon-name">com.mousehop.Mousehop</property>
+                    <property name="child">
+                  <object class="AdwClamp">
+                  <property name="maximum-size">800</property>
+                  <property name="tightening-threshold">0</property>
+                  <property name="child">
+                    <object class="GtkBox">
+                    <property name="orientation">vertical</property>
+                    <property name="spacing">24</property>
+                    <property name="margin-bottom">36</property>
+                    <child>
+                      <object class="AdwPreferencesGroup" id="capture_emulation_group">
+                      <property name="title" translatable="yes">Capture / Emulation Status</property>
+                        <child>
+                          <object class="AdwActionRow" id="capture_status_row">
+                            <property name="title">Input Capture Disabled</property>
+                            <property name="subtitle">Required for outgoing and incoming connections.</property>
+                            <property name="icon-name">dialog-warning-symbolic</property>
+                            <child>
+                              <object class="GtkButton" id="input_capture_button">
+                                <property name="child">
+                                  <object class="AdwButtonContent">
+                                    <property name="icon-name">object-rotate-right-symbolic</property>
+                                    <property name="label" translatable="yes">Reenable</property>
+                                  </object>
+                                </property>
+                                <signal name="clicked" handler="handle_capture" swapped="true"/>
+                                <property name="valign">center</property>
+                                <style>
+                                  <class name="pill"/>
+                                  <class name="flat"/>
+                                </style>
+                              </object>
+                            </child>
+                            <style>
+                              <class name="warning"/>
+                            </style>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwActionRow" id="emulation_status_row">
+                            <property name="title">Input Emulation Disabled</property>
+                            <property name="subtitle">Required for incoming connections.</property>
+                            <property name="icon-name">dialog-warning-symbolic</property>
+                            <child>
+                              <object class="GtkButton" id="input_emulation_button">
+                                <property name="child">
+                                  <object class="AdwButtonContent">
+                                    <property name="icon-name">object-rotate-right-symbolic</property>
+                                    <property name="label" translatable="yes">Reenable</property>
+                                  </object>
+                                </property>
+                                <property name="valign">center</property>
+                                <signal name="clicked" handler="handle_emulation" swapped="true"/>
+                                <style>
+                                  <class name="pill"/>
+                                  <class name="flat"/>
+                                </style>
+                              </object>
+                            </child>
+                            <child>
+                            </child>
+                            <style>
+                              <class name="warning"/>
+                            </style>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwPreferencesGroup">
+                        <property name="title" translatable="yes">General</property>
+                        <!--
+                        <child>
+                          <object class="AdwActionRow">
+                            <property name="title" translatable="yes">enable</property>
+                            <child type="suffix">
+                              <object class="GtkSwitch">
+                                <property name="valign">center</property>
+                                <property name="tooltip-text" translatable="yes">enable</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        -->
+                        <child>
+                          <object class="AdwActionRow">
+                            <property name="title">Hostname &#38;amp; Port</property>
+                            <child>
+                              <object class="GtkButton" id="copy-hostname-button">
+                                    <!--<property name="icon-name">edit-copy-symbolic</property>-->
+                                <property name="valign">center</property>
+                                <signal name="clicked" handler="handle_copy_hostname" swapped="true"/>
+                                <child>
+                                  <object class="GtkBox">
+                                    <property name="spacing">30</property>
+                                    <child>
+                                      <object class="GtkLabel" id="hostname_label">
+                                        <property name="label">&lt;span font_style=&quot;italic&quot; font_weight=&quot;light&quot; foreground=&quot;darkgrey&quot;&gt;could not determine hostname&lt;/span&gt;</property>
+                                        <property name="use-markup">true</property>
+                                        <property name="valign">center</property>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkImage" id="hostname_copy_icon">
+                                        <property name="icon-name">edit-copy-symbolic</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkEntry" id="port_entry">
+                                <property name="max-width-chars">5</property>
+                                <signal name="activate" handler="handle_port_edit_apply" swapped="true"/>
+                                <signal name="changed" handler="handle_port_changed" swapped="true"/>
+                                <!-- <signal name="delete-text" handler="handle_port_changed" swapped="true"/> -->
+                                <!-- <property name="title" translatable="yes">port</property> -->
+                                <property name="placeholder-text">4252</property>
+                                <property name="width-chars">5</property>
+                                <property name="xalign">0.5</property>
+                                <property name="valign">center</property>
+                                <!-- <property name="show-apply-button">True</property> -->
+                                <property name="input-purpose">GTK_INPUT_PURPOSE_DIGITS</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkButton" id="port_edit_apply">
+                                <signal name="clicked" handler="handle_port_edit_apply" swapped="true"/>
+                                <property name="icon-name">object-select-symbolic</property>
+                                <property name="valign">center</property>
+                                <property name="visible">false</property>
+                                <property name="name">port-edit-apply</property>
+                                <style><class name="success"/></style>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkButton" id="port_edit_cancel">
+                                <signal name="clicked" handler="handle_port_edit_cancel" swapped="true"/>
+                                <property name="icon-name">process-stop-symbolic</property>
+                                <property name="valign">center</property>
+                                <property name="visible">false</property>
+                                <property name="name">port-edit-cancel</property>
+                                <style><class name="error"/></style>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwActionRow" id="fingerprint_row">
+                            <property name="title">Certificate Fingerprint</property>
+                            <property name="icon-name">auth-fingerprint-symbolic</property>
+                            <child>
+                              <object class="GtkButton" id="copy-fingerprint-button">
+                                <property name="icon-name">edit-copy-symbolic</property>
+                                <property name="valign">center</property>
+                                <signal name="clicked" handler="handle_copy_fingerprint" swapped="true"/>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwPreferencesGroup">
+                        <property name="title" translatable="yes">Outgoing Auto-Release</property>
+                        <property name="description" translatable="yes">Fallback release when the peer can't tell us the cursor reached its edge — typically because the peer's screen is locked. No effect on peers that release themselves; the cursor-release keybind still works either way.</property>
+                        <child>
+                          <object class="AdwActionRow" id="release_threshold_row">
+                            <property name="title" translatable="yes">Release Threshold</property>
+                            <property name="subtitle" translatable="yes">Pixels of wall-press past the entry edge before auto-release fires.</property>
+                            <child type="suffix">
+                              <object class="GtkLabel" id="release_threshold_value">
+                                <property name="label">Disabled</property>
+                                <property name="valign">center</property>
+                                <property name="width-chars">8</property>
+                                <property name="xalign">1.0</property>
+                                <style>
+                                  <class name="dim-label"/>
+                                  <class name="numeric"/>
+                                </style>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkScale" id="release_threshold_scale">
+                            <property name="orientation">horizontal</property>
+                            <property name="hexpand">true</property>
+                            <property name="draw-value">false</property>
+                            <property name="round-digits">0</property>
+                            <property name="margin-top">12</property>
+                            <property name="adjustment">
+                              <object class="GtkAdjustment" id="release_threshold_adjustment">
+                                <property name="lower">0</property>
+                                <property name="upper">500</property>
+                                <property name="step-increment">10</property>
+                                <property name="page-increment">50</property>
+                                <property name="value">0</property>
+                              </object>
+                            </property>
+                            <marks>
+                              <mark value="0" position="bottom">off</mark>
+                              <mark value="50" position="bottom">50</mark>
+                              <mark value="100" position="bottom">100</mark>
+                              <mark value="200" position="bottom">200</mark>
+                              <mark value="500" position="bottom">500</mark>
+                            </marks>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwPreferencesGroup">
+                        <property name="title" translatable="yes">Outgoing Connections</property>
+                        <property name="header-suffix">
+                          <object class="GtkButton">
+                            <signal name="clicked" handler="handle_add_client_pressed" swapped="true"/>
+                            <property name="child">
+                              <object class="AdwButtonContent">
+                                <property name="icon-name">list-add-symbolic</property>
+                                <property name="label" translatable="yes">Add</property>
+                              </object>
+                            </property>
+                          <style>
+                            <class name="flat"/>
+                          </style>
+                          </object>
+                        </property>
+                        <child>
+                          <object class="GtkListBox" id="client_list">
+                            <property name="selection-mode">none</property>
+                            <child type="placeholder">
+                              <object class="AdwActionRow" id="client_placeholder">
+                                <property name="title">No Connections</property>
+                                <property name="subtitle">Add a new client via the + button.</property>
+                              </object>
+                            </child>
+                            <style>
+                              <class name="boxed-list" />
+                            </style>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwPreferencesGroup">
+                        <property name="title" translatable="yes">Incoming Connections</property>
+                        <property name="header-suffix">
+                          <object class="GtkButton">
+                            <signal name="clicked" handler="handle_add_cert_fingerprint" swapped="true"/>
+                            <property name="child">
+                              <object class="AdwButtonContent">
+                                <property name="icon-name">auth-fingerprint-symbolic</property>
+                                <property name="label" translatable="yes">Authorize</property>
+                              </object>
+                            </property>
+                            <style>
+                              <class name="flat"/>
+                            </style>
+                          </object>
+                        </property>
+                        <child>
+                          <object class="GtkListBox" id="authorized_list">
+                            <property name="selection-mode">none</property>
+                            <child type="placeholder">
+                              <object class="AdwActionRow" id="authorized_placeholder">
+                                <property name="title">No Devices Registered</property>
+                                <property name="subtitle">Authorize a new device via the "Authorize" button.</property>
+                              </object>
+                            </child>
+                            <style>
+                              <class name="boxed-list" />
+                            </style>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwPreferencesGroup">
+                        <property name="title" translatable="yes">Network Discovery</property>
+                        <property name="description" translatable="yes">Advertise (and consume) Bonjour records so peers can pick the OS-preferred interface on multi-homed hosts. Turn off on networks where mDNS multicast is firewalled.</property>
+                        <child>
+                          <object class="AdwActionRow" id="mdns_discovery_row">
+                            <property name="title" translatable="yes">mDNS Discovery</property>
+                            <property name="subtitle" translatable="yes">Use _mousehop._udp.local. for service order hints.</property>
+                            <child type="suffix">
+                              <object class="GtkSwitch" id="mdns_discovery_switch">
+                                <property name="valign">center</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwPreferencesGroup">
+                        <property name="title" translatable="yes">Clipboard Privacy</property>
+                        <property name="description" translatable="yes">Apps in this list never share their clipboard with peers — useful for password managers and other tools whose clipboard you don't want syncing.</property>
+                        <child>
+                          <object class="AdwActionRow" id="clipboard_privacy_row">
+                            <property name="title" translatable="yes">Suppressed Apps</property>
+                            <property name="subtitle" translatable="yes">0 apps</property>
+                            <child type="suffix">
+                              <object class="GtkButton" id="clipboard_privacy_button">
+                                <property name="label" translatable="yes">Manage</property>
+                                <property name="valign">center</property>
+                                <style>
+                                  <class name="flat"/>
+                                </style>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    </object>
+                  </property>
+                  </object>
+                </property>
+              </object>
+                </child>
+              </object>
+            </child>
+          </object>
+        </child>
+      </object>
+    </property>
+  </template>
+</interface>

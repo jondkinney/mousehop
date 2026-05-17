@@ -100,7 +100,7 @@ impl MacOSEmulation {
     /// `Cell` and pass it back in. Required because plain
     /// `CGEventPost` doesn't trigger display wake on its own.
     fn declare_user_activity(&self) {
-        let cstr = match CString::new("Lan Mouse: remote input") {
+        let cstr = match CString::new("Mousehop: remote input") {
             Ok(c) => c,
             Err(_) => return,
         };
@@ -183,7 +183,7 @@ fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationErr
 
 fn request_accessibility_permission() -> bool {
     // Silent check. The GUI owns the one-time user-visible prompt at
-    // startup (see lan_mouse_gtk::macos_privacy).
+    // startup (see mousehop_gtk::macos_privacy).
     unsafe { AXIsProcessTrusted() }
 }
 

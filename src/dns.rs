@@ -6,7 +6,7 @@ use tokio::task::{JoinHandle, spawn_local};
 
 use tokio_util::sync::CancellationToken;
 
-use lan_mouse_ipc::ClientHandle;
+use mousehop_ipc::ClientHandle;
 
 pub(crate) struct DnsResolver {
     cancellation_token: CancellationToken,
