@@ -69,7 +69,7 @@ CRATES=(
 # names the account holding it — op:// references carry no account,
 # so `op` would otherwise use its default. `op` works the same on
 # macOS and Linux. Override either per-run with the matching env var.
-CRATES_IO_OP_REF="${CRATES_IO_OP_REF:-op://Private/crates.io/mousehop-publish-new}"
+CRATES_IO_OP_REF="${CRATES_IO_OP_REF:-op://Private/crates.io/mousehop-release}"
 CRATES_IO_OP_ACCOUNT="${CRATES_IO_OP_ACCOUNT:-kinneyfam.1password.com}"
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
