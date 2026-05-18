@@ -1,7 +1,7 @@
 [package]
 name = "mousehop-proto"
 description = "network protocol for mousehop"
-version = "0.2.0"
+version.workspace = true
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/jondkinney/mousehop"
@@ -9,5 +9,5 @@ repository = "https://github.com/jondkinney/mousehop"
 [dependencies]
 num_enum = "0.7.2"
 thiserror = "2.0.0"
-input-event = { package = "mousehop-input-event", path = "../input-event", version = "0.3.0" }
+input-event = { workspace = true }
 paste = "1.0"

@@ -1,7 +1,7 @@
 [package]
 name = "mousehop-gtk"
 description = "GTK4 / Libadwaita Frontend for mousehop"
-version = "0.2.0"
+version.workspace = true
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/jondkinney/mousehop"
@@ -12,8 +12,8 @@ adw = { package = "libadwaita", version = "0.7.0", features = ["v1_1"] }
 async-channel = { version = "2.1.1" }
 hostname = "0.4.0"
 log = "0.4.20"
-mousehop-ipc = { path = "../mousehop-ipc", version = "0.2.0" }
-input-capture = { package = "mousehop-input-capture", path = "../input-capture", version = "0.3.0", default-features = false }
+mousehop-ipc = { workspace = true }
+input-capture = { workspace = true, default-features = false }
 thiserror = "2.0.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
