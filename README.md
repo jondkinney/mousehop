@@ -85,12 +85,11 @@ It can be used as a remote control for any device supported by Mousehop.
 <details>
     <summary>MacOS</summary>
 
-- Download the package for your Mac (Intel or ARM) from the releases page
-- Unzip it
-- Remove the quarantine with `xattr -rd com.apple.quarantine "Mousehop.app"`
-- Launch the app
+- Download the `.dmg` for your Mac (Intel or Apple Silicon) from the releases page
+- Open the `.dmg` and drag `Mousehop.app` into `Applications`
+- Launch the app — release builds are signed with a Developer ID and notarized by Apple, so it opens with no Gatekeeper prompt
 - Use the menu bar item to open the settings window or quit Mousehop. Bundled macOS builds run as a menu bar app and do not keep a Dock icon visible.
-- Grant accessibility permissions in System Preferences
+- Grant accessibility permissions in System Settings
 
 </details>
 

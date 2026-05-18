@@ -114,7 +114,7 @@ jobs:
     - name: install dependencies
       run: |
         brew install --cask inkscape
-        brew install gtk4 libadwaita imagemagick librsvg
+        brew install gtk4 libadwaita imagemagick librsvg create-dmg
     - name: Release Build
       run: |
         cargo build --release
@@ -127,15 +127,35 @@ jobs:
       run: |
         cargo bundle --release
         scripts/copy-macos-dylib.sh "target/release/bundle/osx/Mousehop.app/Contents/MacOS/mousehop"
-    - name: Zip bundle
+    - name: Sign, notarize & package DMG
+      env:
+        # sign-and-notarize.sh consumes these; it no-ops to ad-hoc
+        # signing when MACOS_CERTIFICATE_P12_BASE64 is unset, so the
+        # build still succeeds without the secrets configured.
+        MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+        MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+        MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+        MOUSEHOP_SIGNING_PASSWORD: ${{ secrets.MOUSEHOP_SIGNING_PASSWORD }}
       run: |
-        cd target/release/bundle/osx
-        zip -r "mousehop-macos-intel.zip" "Mousehop.app"
+        app="target/release/bundle/osx/Mousehop.app"
+        dmg="target/release/bundle/osx/mousehop-macos-intel.dmg"
+        scripts/sign-and-notarize.sh --app "$app"
+        create-dmg \
+          --volname "Mousehop" \
+          --window-pos 200 120 \
+          --window-size 600 400 \
+          --icon-size 96 \
+          --icon "Mousehop.app" 150 200 \
+          --app-drop-link 450 200 \
+          --no-internet-enable \
+          "$dmg" "$app"
+        scripts/sign-and-notarize.sh --dmg "$dmg"
     - name: Upload build artifact
       uses: actions/upload-artifact@v6
       with:
         name: mousehop-macos-intel
-        path: target/release/bundle/osx/mousehop-macos-intel.zip
+        path: target/release/bundle/osx/mousehop-macos-intel.dmg
 
   macos-arm64-release-build:
     runs-on: macos-15
@@ -144,7 +164,7 @@ jobs:
     - name: install dependencies
       run: |
         brew install --cask inkscape
-        brew install gtk4 libadwaita imagemagick librsvg
+        brew install gtk4 libadwaita imagemagick librsvg create-dmg
     - name: Release Build
       run: |
         cargo build --release
@@ -157,15 +177,35 @@ jobs:
       run: |
         cargo bundle --release
         scripts/copy-macos-dylib.sh "target/release/bundle/osx/Mousehop.app/Contents/MacOS/mousehop"
-    - name: Zip bundle
+    - name: Sign, notarize & package DMG
+      env:
+        # sign-and-notarize.sh consumes these; it no-ops to ad-hoc
+        # signing when MACOS_CERTIFICATE_P12_BASE64 is unset, so the
+        # build still succeeds without the secrets configured.
+        MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+        MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+        MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+        MOUSEHOP_SIGNING_PASSWORD: ${{ secrets.MOUSEHOP_SIGNING_PASSWORD }}
       run: |
-        cd target/release/bundle/osx
-        zip -r "mousehop-macos-arm64.zip" "Mousehop.app"
+        app="target/release/bundle/osx/Mousehop.app"
+        dmg="target/release/bundle/osx/mousehop-macos-arm64.dmg"
+        scripts/sign-and-notarize.sh --app "$app"
+        create-dmg \
+          --volname "Mousehop" \
+          --window-pos 200 120 \
+          --window-size 600 400 \
+          --icon-size 96 \
+          --icon "Mousehop.app" 150 200 \
+          --app-drop-link 450 200 \
+          --no-internet-enable \
+          "$dmg" "$app"
+        scripts/sign-and-notarize.sh --dmg "$dmg"
     - name: Upload build artifact
       uses: actions/upload-artifact@v6
       with:
         name: mousehop-macos-arm64
-        path: target/release/bundle/osx/mousehop-macos-arm64.zip
+        path: target/release/bundle/osx/mousehop-macos-arm64.dmg
 
   release:
     name: "Release"
@@ -186,8 +226,8 @@ jobs:
         files: |
           mousehop-linux-x86_64/mousehop-linux-x86_64
           mousehop-linux-arm64/mousehop-linux-arm64
-          mousehop-macos-intel/mousehop-macos-intel.zip
-          mousehop-macos-arm64/mousehop-macos-arm64.zip
+          mousehop-macos-intel/mousehop-macos-intel.dmg
+          mousehop-macos-arm64/mousehop-macos-arm64.dmg
           mousehop-windows-x86_64/mousehop-windows-x86_64.zip
     - name: Create Tagged Release
       if: startsWith(github.ref, 'refs/tags/')
@@ -199,6 +239,6 @@ jobs:
         files: |
           mousehop-linux-x86_64/mousehop-linux-x86_64
           mousehop-linux-arm64/mousehop-linux-arm64
-          mousehop-macos-intel/mousehop-macos-intel.zip
-          mousehop-macos-arm64/mousehop-macos-arm64.zip
+          mousehop-macos-intel/mousehop-macos-intel.dmg
+          mousehop-macos-arm64/mousehop-macos-arm64.dmg
           mousehop-windows-x86_64/mousehop-windows-x86_64.zip
