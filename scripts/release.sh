@@ -19,8 +19,10 @@
 # crate already published at that version is skipped — so a publish
 # that fails partway is safe to resume.
 #
-# Requirements: cargo, perl, git, and (unless --skip-publish) a
-# crates.io token — run `cargo login` or set CARGO_REGISTRY_TOKEN.
+# Requirements: cargo, perl, git, curl, and — unless --skip-publish —
+# the 1Password CLI `op` (signed in, macOS or Linux) to read the
+# crates.io token; set CRATES_IO_OP_REF and CRATES_IO_OP_ACCOUNT
+# below. Export CARGO_REGISTRY_TOKEN to bypass 1Password.
 
 set -euo pipefail
 
@@ -61,6 +63,15 @@ CRATES=(
     mousehop
 )
 
+# crates.io token — read from 1Password at release time so it never
+# touches disk. CRATES_IO_OP_REF is THIS app's token reference (use
+# "Copy Secret Reference" in the 1Password app); CRATES_IO_OP_ACCOUNT
+# names the account holding it — op:// references carry no account,
+# so `op` would otherwise use its default. `op` works the same on
+# macOS and Linux. Override either per-run with the matching env var.
+CRATES_IO_OP_REF="${CRATES_IO_OP_REF:-op://Private/crates.io/mousehop-publish-new}"
+CRATES_IO_OP_ACCOUNT="${CRATES_IO_OP_ACCOUNT:-kinneyfam.1password.com}"
+
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 run() { printf '   \033[2m$\033[0m %s\n' "$*"; (( DRY_RUN )) || "$@"; }
@@ -69,12 +80,29 @@ run() { printf '   \033[2m$\033[0m %s\n' "$*"; (( DRY_RUN )) || "$@"; }
 say "checking preconditions"
 command -v cargo >/dev/null || die "cargo not found"
 command -v perl  >/dev/null || die "perl not found"
-[[ "$(git rev-parse --abbrev-ref HEAD)" == "main" ]] \
+# `git branch --show-current` (not `rev-parse --abbrev-ref HEAD`,
+# which a same-named tag can shadow into `heads/main`).
+[[ "$(git branch --show-current)" == "main" ]] \
     || die "not on 'main' — releases are cut from main"
-if (( ! SKIP_PUBLISH )) && (( ! DRY_RUN )); then
-    cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-    [[ -f "$cargo_home/credentials.toml" || -n "${CARGO_REGISTRY_TOKEN:-}" ]] \
-        || die "no crates.io token — run 'cargo login' or set CARGO_REGISTRY_TOKEN"
+# --- crates.io token (1Password) -----------------------------------
+# An already-exported CARGO_REGISTRY_TOKEN wins (CI, headless, manual
+# override); otherwise read the token from 1Password via `op`, which
+# behaves identically on macOS and Linux.
+if (( ! SKIP_PUBLISH )); then
+    if [[ -n "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+        say "crates.io token: using CARGO_REGISTRY_TOKEN from the environment"
+    elif (( DRY_RUN )); then
+        say "crates.io token: would read from 1Password [$CRATES_IO_OP_ACCOUNT] $CRATES_IO_OP_REF"
+    else
+        command -v op >/dev/null \
+            || die "1Password CLI 'op' not found — install it (https://developer.1password.com/docs/cli/get-started/), or export CARGO_REGISTRY_TOKEN to bypass 1Password"
+        say "reading crates.io token from 1Password [$CRATES_IO_OP_ACCOUNT] $CRATES_IO_OP_REF"
+        CARGO_REGISTRY_TOKEN="$(op read --account "$CRATES_IO_OP_ACCOUNT" "$CRATES_IO_OP_REF")" \
+            || die "could not read the crates.io token from 1Password — check CRATES_IO_OP_REF / CRATES_IO_OP_ACCOUNT, and that 'op' is signed in (desktop-app integration or OP_SERVICE_ACCOUNT_TOKEN)"
+        [[ -n "$CARGO_REGISTRY_TOKEN" ]] \
+            || die "1Password returned an empty value for $CRATES_IO_OP_REF"
+        export CARGO_REGISTRY_TOKEN
+    fi
 fi
 
 # An existing tag means the bump / commit / tag / push already
