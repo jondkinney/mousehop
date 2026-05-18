@@ -1,5 +1,5 @@
 [package]
-name = "input-capture"
+name = "mousehop-input-capture"
 description = "cross-platform input-capture library used by mousehop"
 version = "0.3.0"
 edition = "2021"
@@ -10,7 +10,7 @@ repository = "https://github.com/jondkinney/mousehop"
 futures = "0.3.28"
 futures-core = "0.3.30"
 log = "0.4.22"
-input-event = { path = "../input-event", version = "0.3.0" }
+input-event = { package = "mousehop-input-event", path = "../input-event", version = "0.3.0" }
 memmap = "0.7"
 tempfile = "3.25.0"
 thiserror = "2.0.0"

@@ -1,5 +1,5 @@
 [package]
-name = "input-emulation"
+name = "mousehop-input-emulation"
 description = "cross-platform input emulation library used by mousehop"
 version = "0.3.0"
 edition = "2021"
@@ -10,7 +10,7 @@ repository = "https://github.com/jondkinney/mousehop"
 async-trait = "0.1.80"
 futures = "0.3.28"
 log = "0.4.22"
-input-event = { path = "../input-event", version = "0.3.0" }
+input-event = { package = "mousehop-input-event", path = "../input-event", version = "0.3.0" }
 thiserror = "2.0.0"
 tokio = { version = "1.32.0", features = [
     "io-util",

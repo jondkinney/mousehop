@@ -1,5 +1,5 @@
 [package]
-name = "input-event"
+name = "mousehop-input-event"
 description = "cross-platform input-event types for input-capture / input-emulation"
 version = "0.3.0"
 edition = "2021"

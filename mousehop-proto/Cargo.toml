@@ -9,5 +9,5 @@ repository = "https://github.com/jondkinney/mousehop"
 [dependencies]
 num_enum = "0.7.2"
 thiserror = "2.0.0"
-input-event = { path = "../input-event", version = "0.3.0" }
+input-event = { package = "mousehop-input-event", path = "../input-event", version = "0.3.0" }
 paste = "1.0"

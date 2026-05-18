@@ -1906,82 +1906,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "input-capture"
-version = "0.3.0"
-dependencies = [
- "arboard",
- "ashpd",
- "async-trait",
- "bitflags 2.11.0",
- "core-foundation 0.10.1",
- "core-foundation-sys",
- "core-graphics",
- "futures",
- "futures-core",
- "input-event",
- "keycode",
- "libc",
- "log",
- "memmap",
- "mousehop-ipc",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "once_cell",
- "reis",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "wayland-client",
- "wayland-protocols",
- "wayland-protocols-wlr",
- "windows 0.61.3",
- "x11",
- "x11rb",
-]
-
-[[package]]
-name = "input-emulation"
-version = "0.3.0"
-dependencies = [
- "arboard",
- "ashpd",
- "async-trait",
- "bitflags 2.11.0",
- "core-foundation 0.10.1",
- "core-foundation-sys",
- "core-graphics",
- "futures",
- "input-event",
- "keycode",
- "log",
- "once_cell",
- "reis",
- "thiserror 2.0.18",
- "tokio",
- "wayland-client",
- "wayland-protocols",
- "wayland-protocols-misc",
- "wayland-protocols-wlr",
- "windows 0.61.3",
- "x11",
-]
-
-[[package]]
-name = "input-event"
-version = "0.3.0"
-dependencies = [
- "futures-core",
- "log",
- "num_enum",
- "reis",
- "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2330,15 +2254,15 @@ dependencies = [
  "hostname",
  "if-addrs 0.13.4",
  "if-watch",
- "input-capture",
- "input-emulation",
- "input-event",
  "libc",
  "local-channel",
  "log",
  "mdns-sd",
  "mousehop-cli",
  "mousehop-gtk",
+ "mousehop-input-capture",
+ "mousehop-input-emulation",
+ "mousehop-input-event",
  "mousehop-ipc",
  "mousehop-proto",
  "netdev",
@@ -2378,11 +2302,87 @@ dependencies = [
  "glib-build-tools",
  "gtk4",
  "hostname",
- "input-capture",
  "ksni",
  "libadwaita",
  "log",
+ "mousehop-input-capture",
  "mousehop-ipc",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "mousehop-input-capture"
+version = "0.3.0"
+dependencies = [
+ "arboard",
+ "ashpd",
+ "async-trait",
+ "bitflags 2.11.0",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "core-graphics",
+ "futures",
+ "futures-core",
+ "keycode",
+ "libc",
+ "log",
+ "memmap",
+ "mousehop-input-event",
+ "mousehop-ipc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "once_cell",
+ "reis",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
+ "windows 0.61.3",
+ "x11",
+ "x11rb",
+]
+
+[[package]]
+name = "mousehop-input-emulation"
+version = "0.3.0"
+dependencies = [
+ "arboard",
+ "ashpd",
+ "async-trait",
+ "bitflags 2.11.0",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "core-graphics",
+ "futures",
+ "keycode",
+ "log",
+ "mousehop-input-event",
+ "once_cell",
+ "reis",
+ "thiserror 2.0.18",
+ "tokio",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-misc",
+ "wayland-protocols-wlr",
+ "windows 0.61.3",
+ "x11",
+]
+
+[[package]]
+name = "mousehop-input-event"
+version = "0.3.0"
+dependencies = [
+ "futures-core",
+ "log",
+ "num_enum",
+ "reis",
+ "serde",
  "thiserror 2.0.18",
 ]
 
@@ -2403,7 +2403,7 @@ dependencies = [
 name = "mousehop-proto"
 version = "0.2.0"
 dependencies = [
- "input-event",
+ "mousehop-input-event",
  "num_enum",
  "paste",
  "thiserror 2.0.18",
