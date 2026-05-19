@@ -269,7 +269,7 @@ async fn do_capture(
         let cancel_session = CancellationToken::new();
         let cancel_update = CancellationToken::new();
 
-        let mut capture_event_occured: Option<LibeiNotifyEvent> = None;
+        let mut capture_event_occurred: Option<LibeiNotifyEvent> = None;
         let mut zones_have_changed = false;
 
         // kill session if clients need to be updated
@@ -287,7 +287,7 @@ async fn do_capture(
                 }, /* zones have changed */
                 e = capture_event.recv() => if let Some(e) = e { /* clients changed */
                     log::debug!("capture event: {e:?}");
-                    capture_event_occured.replace(e);
+                    capture_event_occurred.replace(e);
                 },
             }
             // kill session (might already be dead!)
@@ -331,7 +331,7 @@ async fn do_capture(
         }
 
         // update clients if requested
-        if let Some(event) = capture_event_occured.take() {
+        if let Some(event) = capture_event_occurred.take() {
             match event {
                 LibeiNotifyEvent::Create(p) => active_clients.push(p),
                 LibeiNotifyEvent::Destroy(p) => active_clients.retain(|&pos| pos != p),
