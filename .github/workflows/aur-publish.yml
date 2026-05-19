@@ -33,12 +33,19 @@ jobs:
           set -euo pipefail
           ver="${TAG#v}"
 
-          # SSH access to the AUR.
+          # SSH access to the AUR. StrictHostKeyChecking=accept-new
+          # writes the AUR's host key to known_hosts on first connect,
+          # avoiding an `ssh-keyscan` race that silently produced an
+          # empty known_hosts in some runs.
           install -dm700 ~/.ssh
           echo "$AUR_SSH_KEY" > ~/.ssh/id_aur
           chmod 600 ~/.ssh/id_aur
-          ssh-keyscan -t ed25519,rsa aur.archlinux.org > ~/.ssh/known_hosts
-          printf 'Host aur.archlinux.org\n  User aur\n  IdentityFile ~/.ssh/id_aur\n  IdentitiesOnly yes\n' \
+          printf '%s\n' \
+            'Host aur.archlinux.org' \
+            '  User aur' \
+            '  IdentityFile ~/.ssh/id_aur' \
+            '  IdentitiesOnly yes' \
+            '  StrictHostKeyChecking accept-new' \
             > ~/.ssh/config
 
           # Grab packaging/aur/PKGBUILD at the released tag.
