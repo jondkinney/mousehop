@@ -33,20 +33,17 @@ jobs:
           set -euo pipefail
           ver="${TAG#v}"
 
-          # SSH access to the AUR. StrictHostKeyChecking=accept-new
-          # writes the AUR's host key to known_hosts on first connect,
-          # avoiding an `ssh-keyscan` race that silently produced an
-          # empty known_hosts in some runs.
-          install -dm700 ~/.ssh
-          echo "$AUR_SSH_KEY" > ~/.ssh/id_aur
-          chmod 600 ~/.ssh/id_aur
-          printf '%s\n' \
-            'Host aur.archlinux.org' \
-            '  User aur' \
-            '  IdentityFile ~/.ssh/id_aur' \
-            '  IdentitiesOnly yes' \
-            '  StrictHostKeyChecking accept-new' \
-            > ~/.ssh/config
+          # SSH access to the AUR. Pass options inline via
+          # GIT_SSH_COMMAND so we don't depend on ~/.ssh/config being
+          # honored — earlier attempts via ssh-keyscan and a config-
+          # file `StrictHostKeyChecking=accept-new` both failed with
+          # "Host key verification failed". Inline `-o` flags apply
+          # to every git ssh invocation in this shell.
+          install -dm700 /root/.ssh
+          echo "$AUR_SSH_KEY" > /root/.ssh/id_aur
+          chmod 600 /root/.ssh/id_aur
+          touch /root/.ssh/known_hosts
+          export GIT_SSH_COMMAND='ssh -i /root/.ssh/id_aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/root/.ssh/known_hosts'
 
           # Grab packaging/aur/PKGBUILD at the released tag.
           git clone --depth 1 --branch "$TAG" "https://github.com/$GH_REPO.git" app
