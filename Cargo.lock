@@ -2246,7 +2246,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "clap 4.6.0",
  "env_logger",
@@ -2285,7 +2285,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-cli"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "clap 4.6.0",
  "futures",
@@ -2296,7 +2296,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-gtk"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "async-channel",
  "glib-build-tools",
@@ -2312,7 +2312,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-input-capture"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "arboard",
  "ashpd",
@@ -2349,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-input-emulation"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "arboard",
  "ashpd",
@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-input-event"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "futures-core",
  "log",
@@ -2388,7 +2388,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-ipc"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "futures",
  "log",
@@ -2401,7 +2401,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-proto"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "mousehop-input-event",
  "num_enum",
