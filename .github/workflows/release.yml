@@ -1,17 +1,16 @@
 name: "Release"
-run-name: "Release - ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.event.inputs.name || github.ref_name }}"
+run-name: "Release - ${{ github.event.release.tag_name || inputs.tag }}"
 
+# release-plz creates the GitHub Release; this workflow then builds the
+# platform binaries + Flatpak bundle and attaches them to it.
 on:
-  push:
-    branches: [ "main" ]
-    tags:
-      - v**
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
-      name:
-        description: 'Development release name'
-        required: false
-        default: ''
+      tag:
+        description: 'Existing release tag to (re)build binaries for'
+        required: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -206,37 +205,56 @@ jobs:
         path: target/release/bundle/osx/mousehop-macos-arm64.dmg
 
   release:
-    name: "Release"
+    name: "Attach binaries to the release"
     needs: [windows-release-build, linux-release-build, linux-arm64-release-build, macos-release-build, macos-arm64-release-build]
     runs-on: "ubuntu-latest"
     steps:
     - name: Download build artifacts
       uses: actions/download-artifact@v4
-    - name: Create Pre-Release
-      if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    - name: Upload binaries to the release
       uses: softprops/action-gh-release@v2
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
-        tag_name: ${{ github.event.inputs.name || github.ref_name }}
-        name: ${{ github.event.inputs.name || github.ref_name }}
-        prerelease: true
-        generate_release_notes: true
+        tag_name: ${{ github.event.release.tag_name || inputs.tag }}
         files: |
           mousehop-linux-x86_64/mousehop-linux-x86_64
           mousehop-linux-arm64/mousehop-linux-arm64
           mousehop-macos-intel/mousehop-macos-intel.dmg
           mousehop-macos-arm64/mousehop-macos-arm64.dmg
           mousehop-windows-x86_64/mousehop-windows-x86_64.zip
-    - name: Create Tagged Release
-      if: startsWith(github.ref, 'refs/tags/')
+
+  flatpak-build:
+    name: "Build the Flatpak bundle"
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      options: --privileged
+    steps:
+    - uses: actions/checkout@v6
+    - name: Build bundle
+      uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+      with:
+        bundle: mousehop.flatpak
+        manifest-path: build-aux/com.mousehop.Mousehop.yml
+        cache-key: flatpak-builder-${{ github.sha }}
+    - name: Upload bundle artifact
+      uses: actions/upload-artifact@v6
+      with:
+        name: mousehop-flatpak
+        path: mousehop.flatpak
+
+  flatpak-release:
+    name: "Attach Flatpak to the release"
+    needs: flatpak-build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download bundle
+      uses: actions/download-artifact@v4
+      with:
+        name: mousehop-flatpak
+    - name: Upload bundle to the release
       uses: softprops/action-gh-release@v2
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
-        name: ${{ github.ref_name }}
-        generate_release_notes: true
-        files: |
-          mousehop-linux-x86_64/mousehop-linux-x86_64
-          mousehop-linux-arm64/mousehop-linux-arm64
-          mousehop-macos-intel/mousehop-macos-intel.dmg
-          mousehop-macos-arm64/mousehop-macos-arm64.dmg
-          mousehop-windows-x86_64/mousehop-windows-x86_64.zip
+        tag_name: ${{ github.event.release.tag_name || inputs.tag }}
+        files: mousehop.flatpak
