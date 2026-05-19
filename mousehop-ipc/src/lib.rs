@@ -46,7 +46,7 @@ pub enum IpcListenerCreationError {
 
 #[derive(Debug, Error)]
 pub enum IpcError {
-    #[error("io error occured: `{0}`")]
+    #[error("io error occurred: `{0}`")]
     Io(#[from] io::Error),
     #[error("invalid json: `{0}`")]
     Json(#[from] serde_json::Error),
@@ -490,7 +490,7 @@ pub enum FrontendEvent {
     PortChanged(u16, Option<String>),
     /// list of all clients, used for initial state synchronization
     Enumerate(Vec<(ClientHandle, ClientConfig, ClientState)>),
-    /// an error occured
+    /// an error occurred
     Error(String),
     /// capture status
     CaptureStatus(Status),
