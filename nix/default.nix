@@ -15,7 +15,9 @@
 let
   cargoToml = fromTOML (builtins.readFile ../Cargo.toml);
   pname = cargoToml.package.name;
-  version = cargoToml.package.version;
+  # The root package inherits version via `version.workspace = true`,
+  # so the real version lives under [workspace.package].
+  version = cargoToml.workspace.package.version;
 in
 rustPlatform.buildRustPackage {
   inherit pname;
