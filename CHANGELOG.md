@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-05-19
+
+### Fixed
+
+- Flatpak icon validation: GdkPixbuf's SVG sniffer reads only the first
+  ~256 bytes looking for the `<svg` tag, and the multi-line XML
+  docstring above the root element pushed it past that window. Moved
+  the docstring inside `<svg>` so Flatpak's icon validator accepts the
+  app icon and the Flatpak bundle exports cleanly.
+
 ## [0.11.1] - 2026-05-19
 
 ### Fixed
