@@ -1,13 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!--
-  mousehop app icon — a cursor at the head of a "hop" trail on a rounded
-  indigo tile. Self-contained: the SVG carries its own background and rounded
-  corners (rx 230 of 1024 ≈ 22.5%, the macOS Big Sur squircle proportion), so
-  it works as-is as a Linux app icon and scripts/makeicns.sh renders it
-  straight into the macOS squircle. The bolder, tile-less small-size mark is
-  the separate resources/icons/mousehop-tray.svg.
--->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    mousehop app icon — a cursor at the head of a "hop" trail on a rounded
+    indigo tile. Self-contained: the SVG carries its own background and rounded
+    corners (rx 230 of 1024 ≈ 22.5%, the macOS Big Sur squircle proportion), so
+    it works as-is as a Linux app icon and scripts/makeicns.sh renders it
+    straight into the macOS squircle. The bolder, tile-less small-size mark is
+    the separate resources/icons/mousehop-tray.svg.
+
+    Keep this docstring inside <svg> — GdkPixbuf's SVG sniffer reads
+    only the first ~256 bytes looking for the <svg tag, and Flatpak's
+    icon validator (gdk-pixbuf-based) refuses the file as "Format not
+    recognized" if the tag is pushed past that window.
+  -->
   <rect width="1024" height="1024" rx="230" fill="#4F46E5"/>
   <!-- hop trail -->
   <path d="M278 742 Q322 356 604 381" fill="none" stroke="#ffffff"
