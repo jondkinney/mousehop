@@ -45,6 +45,13 @@ fn main() {
     let env = Env::default().filter_or("MOUSEHOP_LOG_LEVEL", "info");
     env_logger::init_from_env(env);
 
+    // On a Linux `cargo install` (no AUR / Flatpak / distro package)
+    // the binary alone wouldn't appear in launchers. This silently
+    // writes the .desktop entry + icon into ~/.local/share on the
+    // first launch, once. Best-effort — never blocks startup.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    mousehop::desktop_install::ensure_first_launch();
+
     if let Err(e) = run() {
         log::error!("{e}");
         process::exit(1);

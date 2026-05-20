@@ -28,7 +28,18 @@ version.workspace = true
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/jondkinney/mousehop"
-include = ["src/**/*", "build.rs", "README.md", "LICENSE", "NOTICE"]
+include = [
+    "src/**/*",
+    "build.rs",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    # First-launch desktop install (see src/desktop_install.rs) embeds
+    # these two files into the binary via include_bytes! / include_str!,
+    # so they must ship in the published crate.
+    "com.mousehop.Mousehop.desktop",
+    "assets/com.mousehop.Mousehop.svg",
+]
 
 [profile.release]
 codegen-units = 1
