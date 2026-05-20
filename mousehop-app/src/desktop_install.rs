@@ -41,7 +41,10 @@ fn xdg_data_home() -> io::Result<PathBuf> {
         return Ok(PathBuf::from(dir));
     }
     let home = std::env::var_os("HOME").ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "neither XDG_DATA_HOME nor HOME is set")
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "neither XDG_DATA_HOME nor HOME is set",
+        )
     })?;
     Ok(PathBuf::from(home).join(".local/share"))
 }
@@ -52,7 +55,10 @@ fn xdg_state_home() -> io::Result<PathBuf> {
         return Ok(PathBuf::from(dir));
     }
     let home = std::env::var_os("HOME").ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "neither XDG_STATE_HOME nor HOME is set")
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "neither XDG_STATE_HOME nor HOME is set",
+        )
     })?;
     Ok(PathBuf::from(home).join(".local/state"))
 }
@@ -74,11 +80,7 @@ fn install() -> io::Result<()> {
     let app_dir = data.join("applications");
     std::fs::create_dir_all(&app_dir)?;
     let exe = std::env::current_exe()?.display().to_string();
-    let entry = DESKTOP_ENTRY
-        .replace(
-            &format!("Exec={BINARY_NAME}\n"),
-            &format!("Exec={exe}\n"),
-        );
+    let entry = DESKTOP_ENTRY.replace(&format!("Exec={BINARY_NAME}\n"), &format!("Exec={exe}\n"));
     let entry_path = app_dir.join(format!("{APP_ID}.desktop"));
     std::fs::write(&entry_path, entry)?;
 
