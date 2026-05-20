@@ -19,6 +19,23 @@
       discovery, and a refreshed UI.
     </p>
   </description>
+  <categories>
+    <category>Utility</category>
+    <category>Network</category>
+  </categories>
+  <!-- OARS: every age-rating attribute defaults to "none", which is
+       correct for a software KVM. Peer-to-peer over the user's own
+       LAN with their own machines doesn't trigger social-info (which
+       is scoped to third-party sharing). Self-closing element is the
+       standard Flathub shorthand for an all-clean rating. -->
+  <content_rating type="oars-1.1"/>
+  <!-- Per-release entries: prepend a new <release> at the top when
+       release-plz cuts a new tag. Required by Flathub for the
+       Version history section on the listing page; the latest
+       release is the only one strictly required. -->
+  <releases>
+    <release version="0.11.3" date="2026-05-19"/>
+  </releases>
   <url type="homepage">https://mousehop.com</url>
   <url type="bugtracker">https://github.com/jondkinney/mousehop/issues</url>
   <developer_name>Jon Kinney</developer_name>
