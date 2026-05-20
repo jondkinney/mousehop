@@ -61,6 +61,17 @@ modules:
       - cargo build --release
       - install -Dm0755 target/release/mousehop /app/bin/mousehop
       - install -Dm0644 mousehop-gtk/resources/com.mousehop.Mousehop.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
+      # Render a hicolor PNG ladder from the source SVG so hosts
+       # that prefer fixed-size raster icons (older toolkits, certain
+       # KDE variants) get a sharp render without scaling the SVG at
+       # runtime. rsvg-convert ships with the GNOME runtime.
+      - |
+        for size in 16 22 24 32 48 64 128 256 512; do
+          install -d ${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps
+          rsvg-convert -w $size -h $size \
+            mousehop-gtk/resources/com.mousehop.Mousehop.svg \
+            -o ${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps/${FLATPAK_ID}.png
+        done
       - install -Dm0644 mousehop-app/com.mousehop.Mousehop.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
       # AppStream metainfo — required by Flathub, also picked up by
       # GNOME Software / KDE Discover for sideloaded bundles.
