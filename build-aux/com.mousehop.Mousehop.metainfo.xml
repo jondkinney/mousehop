@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.mousehop.Mousehop</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Mousehop</name>
+  <summary>Share one mouse, keyboard, and clipboard across machines</summary>
+  <icon type="stock">com.mousehop.Mousehop</icon>
+  <launchable type="desktop-id">com.mousehop.Mousehop.desktop</launchable>
+  <description>
+    <p>
+      Mousehop is an open-source software KVM. Glide a single mouse, keyboard, and
+      clipboard across Linux, macOS, and Windows machines over the local network — no
+      KVM hardware, no cloud service.
+    </p>
+    <p>
+      Mousehop is a fork of lan-mouse by Florian Eschberger, used under the GPL-3.0
+      license, with a native menu-bar app, a system tray, per-peer tuning, sturdier
+      discovery, and a refreshed UI.
+    </p>
+  </description>
+  <url type="homepage">https://mousehop.com</url>
+  <url type="bugtracker">https://github.com/jondkinney/mousehop/issues</url>
+  <developer_name>Jon Kinney</developer_name>
+</component>
