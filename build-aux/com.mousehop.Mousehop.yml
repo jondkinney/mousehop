@@ -34,7 +34,7 @@ finish-args:
   - "--share=ipc"
   # Per-app scope so a sandbox escape can't read every other app's
   # config; mousehop's config dir is `$XDG_CONFIG_HOME/mousehop/`
-  # (see mousehop-app/src/config.rs).
+  # (see mousehop/src/config.rs).
   - "--filesystem=xdg-config/mousehop:rw"
   # Software KVM relays clipboard across peers — needs the
   # Clipboard portal to read/write the host's selection.
@@ -72,7 +72,7 @@ modules:
             mousehop-gtk/resources/com.mousehop.Mousehop.svg \
             -o ${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps/${FLATPAK_ID}.png
         done
-      - install -Dm0644 mousehop-app/com.mousehop.Mousehop.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
+      - install -Dm0644 mousehop/com.mousehop.Mousehop.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
       # AppStream metainfo — required by Flathub, also picked up by
       # GNOME Software / KDE Discover for sideloaded bundles.
       - install -Dm0644 build-aux/com.mousehop.Mousehop.metainfo.xml ${FLATPAK_DEST}/share/metainfo/${FLATPAK_ID}.metainfo.xml

@@ -90,7 +90,7 @@ rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
 [package.metadata.bundle]
 name = "Mousehop"
-# Paths are relative to this manifest (mousehop-app/Cargo.toml).
+# Paths are relative to this manifest (mousehop/Cargo.toml).
 # `target/` and `build-aux/` live at the workspace root, so the
 # bundle's icon and resources sit one level up.
 icon = ["../target/icon.icns"]

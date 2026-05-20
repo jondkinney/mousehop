@@ -38,7 +38,7 @@ jobs:
         stage="mousehop-${ver}-x86_64"
         mkdir "$stage"
         cp target/release/mousehop \
-           mousehop-app/com.mousehop.Mousehop.desktop \
+           mousehop/com.mousehop.Mousehop.desktop \
            mousehop-gtk/resources/com.mousehop.Mousehop.svg \
            LICENSE NOTICE \
            "$stage/"
@@ -68,7 +68,7 @@ jobs:
         stage="mousehop-${ver}-aarch64"
         mkdir "$stage"
         cp target/release/mousehop \
-           mousehop-app/com.mousehop.Mousehop.desktop \
+           mousehop/com.mousehop.Mousehop.desktop \
            mousehop-gtk/resources/com.mousehop.Mousehop.svg \
            LICENSE NOTICE \
            "$stage/"
@@ -157,7 +157,7 @@ jobs:
     - name: Bundle
       # -p mousehop is required since the root is a virtual workspace
       # (PR #17); cargo bundle has no implicit root package to bundle.
-      # The [package.metadata.bundle] block lives in mousehop-app/Cargo.toml.
+      # The [package.metadata.bundle] block lives in mousehop/Cargo.toml.
       run: |
         cargo bundle --release -p mousehop
         scripts/copy-macos-dylib.sh "target/release/bundle/osx/Mousehop.app/Contents/MacOS/mousehop"
@@ -216,7 +216,7 @@ jobs:
     - name: Bundle
       # -p mousehop is required since the root is a virtual workspace
       # (PR #17); cargo bundle has no implicit root package to bundle.
-      # The [package.metadata.bundle] block lives in mousehop-app/Cargo.toml.
+      # The [package.metadata.bundle] block lives in mousehop/Cargo.toml.
       run: |
         cargo bundle --release -p mousehop
         scripts/copy-macos-dylib.sh "target/release/bundle/osx/Mousehop.app/Contents/MacOS/mousehop"
