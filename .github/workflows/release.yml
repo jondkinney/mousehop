@@ -27,14 +27,27 @@ jobs:
         sudo apt-get install libadwaita-1-dev libgtk-4-dev libdbus-1-dev
     - uses: Swatinem/rust-cache@v2
     - name: Release Build
+      run: cargo build --release
+    - name: Stage tarball contents
+      # Bundles the binary with the desktop file, app icon, LICENSE,
+      # and NOTICE so the mousehop-bin AUR PKGBUILD (and other distro
+      # packagers) can install everything from one tarball.
       run: |
-        cargo build --release
-        cp target/release/mousehop mousehop-linux-x86_64
+        TAG="${{ github.event.release.tag_name || inputs.tag }}"
+        ver="${TAG#v}"
+        stage="mousehop-${ver}-x86_64"
+        mkdir "$stage"
+        cp target/release/mousehop \
+           com.mousehop.Mousehop.desktop \
+           mousehop-gtk/resources/com.mousehop.Mousehop.svg \
+           LICENSE NOTICE \
+           "$stage/"
+        tar -czf "${stage}.tar.gz" "$stage"
     - name: Upload build artifact
       uses: actions/upload-artifact@v6
       with:
         name: mousehop-linux-x86_64
-        path: mousehop-linux-x86_64
+        path: mousehop-*-x86_64.tar.gz
 
   linux-arm64-release-build:
     runs-on: ubuntu-22.04-arm
@@ -47,14 +60,24 @@ jobs:
         sudo apt-get install libadwaita-1-dev libgtk-4-dev libdbus-1-dev
     - uses: Swatinem/rust-cache@v2
     - name: Release Build
+      run: cargo build --release
+    - name: Stage tarball contents
       run: |
-        cargo build --release
-        cp target/release/mousehop mousehop-linux-arm64
+        TAG="${{ github.event.release.tag_name || inputs.tag }}"
+        ver="${TAG#v}"
+        stage="mousehop-${ver}-aarch64"
+        mkdir "$stage"
+        cp target/release/mousehop \
+           com.mousehop.Mousehop.desktop \
+           mousehop-gtk/resources/com.mousehop.Mousehop.svg \
+           LICENSE NOTICE \
+           "$stage/"
+        tar -czf "${stage}.tar.gz" "$stage"
     - name: Upload build artifact
       uses: actions/upload-artifact@v6
       with:
         name: mousehop-linux-arm64
-        path: mousehop-linux-arm64
+        path: mousehop-*-aarch64.tar.gz
 
   windows-release-build:
     runs-on: windows-latest
@@ -234,8 +257,8 @@ jobs:
         token: ${{ secrets.GITHUB_TOKEN }}
         tag_name: ${{ github.event.release.tag_name || inputs.tag }}
         files: |
-          mousehop-linux-x86_64/mousehop-linux-x86_64
-          mousehop-linux-arm64/mousehop-linux-arm64
+          mousehop-linux-x86_64/*.tar.gz
+          mousehop-linux-arm64/*.tar.gz
           mousehop-macos-intel/mousehop-macos-intel.dmg
           mousehop-macos-arm64/mousehop-macos-arm64.dmg
           mousehop-windows-x86_64/mousehop-windows-x86_64.zip
