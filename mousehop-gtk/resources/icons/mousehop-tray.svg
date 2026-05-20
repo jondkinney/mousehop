@@ -2,15 +2,18 @@
 <!--
   Tray / menu-bar glyph for mousehop — a bolder, tile-less reduction of the
   app icon's cursor + hop-trail mark, drawn as one flat silhouette so it stays
-  legible at 12-22 px. The Linux StatusNotifierItem renders this to ARGB
-  pixmaps (see linux_tray.rs, which bbox-crops the square viewBox's padding);
-  macOS uses it via scripts/makeicns.sh as the flattened black+alpha menu-bar
-  template. Distinct from com.mousehop.Mousehop.svg, whose detail and
-  background become unreadable at tray sizes.
+  legible at 12-22 px. Fill / stroke are `currentColor` so the same SVG can
+  be re-tinted at runtime: linux_tray.rs substitutes white before rasterizing
+  to ARGB pixmaps for the StatusNotifierItem host; macOS rasterizes it as a
+  black+alpha menu-bar template via scripts/makeicns.sh (the magick step
+  zeroes RGB anyway, so the `color="black"` fallback below is just belt-and-
+  suspenders for any rasterizer that respects color attributes). Distinct
+  from com.mousehop.Mousehop.svg, whose detail and background become
+  unreadable at tray sizes.
 -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180" width="180" height="180">
-  <g fill="#e6e6e6">
-    <path d="M33 149 Q37 101 101 71" fill="none" stroke="#e6e6e6"
+  <g color="black" fill="currentColor">
+    <path d="M33 149 Q37 101 101 71" fill="none" stroke="currentColor"
           stroke-width="40" stroke-linecap="round"/>
     <path d="M0 0 L0 104 L27 80 L45 122 L66 113 L48 72 L84 72 Z"
           transform="translate(65,11) scale(1.22)"/>
