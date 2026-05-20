@@ -1,10 +1,14 @@
-name: Rust
+name: CI
+
+# Per-PR safety net: fmt + clippy + test on every OS we ship to.
+# Release-time builds live in release.yml; this is the pre-merge gate
+# that keeps main green.
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,86 +19,72 @@ concurrency:
 
 jobs:
   fmt:
-    name: Formatting
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: cargo fmt
-        run: cargo fmt --check
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
 
-  ci:
-    name: ${{ matrix.job }} ${{ matrix.os }}
+  check:
+    name: clippy + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os:
           - ubuntu-latest
-          - windows-latest
           - macos-latest
           - macos-15-intel
-        job:
-          - build
-          - check
-          - clippy
-          - test
+          - windows-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
+
       - name: Install Linux deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install libx11-dev libxtst-dev libadwaita-1-dev libgtk-4-dev libdbus-1-dev
-      - name: Install macOS dependencies
+
+      - name: Install macOS deps
         if: runner.os == 'macOS'
         run: brew install gtk4 libadwaita imagemagick
-      - name: Install Windows Dependencies - create gtk dir
+
+      # Windows GTK stack lives in C:\gtk-build, populated by gvsbuild
+      # and cached so we only pay the build cost on cold cache.
+      - name: Windows - create gtk dir
         if: runner.os == 'Windows'
         run: mkdir C:\gtk-build\gtk\x64\release
-      - name: Install Windows Dependencies - install gtk from cache
-        uses: actions/cache@v3
+      - name: Windows - cache gtk
         if: runner.os == 'Windows'
+        uses: actions/cache@v3
         id: cache
         with:
           path: c:/gtk-build/gtk/x64/release/**
           key: gtk-windows-build
           restore-keys: gtk-windows-build
-      - name: Install Windows Dependencies - update PATH
+      - name: Windows - update PATH
         if: runner.os == 'Windows'
         run: |
           echo "PKG_CONFIG=C:\gtk-build\gtk\x64\release\bin\pkgconf.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "C:\pkg-config-lite-0.28-1\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           echo "C:\gtk-build\gtk\x64\release\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo $env:GITHUB_PATH
-          echo $env:PATH
-      - name: Install Windows dependencies - build gtk
+      - name: Windows - build gtk on cache miss
         if: runner.os == 'Windows' && steps.cache.outputs.cache-hit != 'true'
         run: |
-          # choco install msys2
-          # choco install visualstudio2022-workload-vctools
-          # choco install pkgconfiglite
           py -m venv .venv
           .venv\Scripts\activate.ps1
           py -m pip install gvsbuild
           gvsbuild build --msys-dir=C:\msys64 gtk4 libadwaita librsvg
-      - name: cargo build
-        if: matrix.job == 'build'
-        run: cargo build
-
-      - name: cargo check
-        if: matrix.job == 'check'
-        run: cargo check --workspace --all-targets --all-features
-
-      - name: cargo test
-        if: matrix.job == 'test'
-        run: cargo test --workspace --all-features
 
       - name: cargo clippy
-        if: matrix.job == 'clippy'
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - uses: clechasseur/rs-clippy-check@v4
-        if: matrix.job == 'clippy'
-        with:
-          args: --workspace --all-targets --all-features
+      - name: cargo test
+        run: cargo test --workspace --all-features
