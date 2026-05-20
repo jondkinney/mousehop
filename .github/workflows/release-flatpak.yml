@@ -1,0 +1,84 @@
+name: release-flatpak
+
+# Build the Flatpak bundle for mousehop on every published Release
+# and attach it as a Release asset. Split out from release.yml
+# (which still builds Linux tarballs, Windows ZIP, macOS DMGs)
+# so:
+#  - a Flatpak failure doesn't fail-fast the macOS signing chain
+#  - workflow_dispatch can validate a manifest change against
+#    `ref=main` without rebuilding every platform
+#
+# Manifest lives at build-aux/com.mousehop.Mousehop.yml.
+# Mirrors release-flatpak.yml in jondkinney/vernier and
+# jondkinney/tensaku.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g. v0.12.0)'
+        required: true
+        type: string
+      ref:
+        # Validation knob: when set (e.g. `main`), the build comes
+        # from that ref instead of the tag, and the resulting bundle
+        # is NOT attached to the Release. Use this to verify a
+        # manifest change before cutting a release. Leave blank for
+        # the normal backfill-an-old-tag path.
+        description: 'Git ref to build from (default: the tag itself). Set to a branch (e.g. main) to validate without attaching to the Release.'
+        required: false
+        type: string
+
+jobs:
+  flatpak-build:
+    name: Build Flatpak bundle
+    runs-on: ubuntu-latest
+    permissions:
+      # gh release upload writes to the release assets.
+      contents: write
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      options: --privileged
+    steps:
+      - name: Resolve target tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Building Flatpak for $TAG"
+
+      - name: Checkout source
+        # Falls through to the tag on release events (where
+        # inputs.ref is empty) and on dispatches that leave `ref`
+        # blank. Only an explicit override changes the source.
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || steps.tag.outputs.tag }}
+
+      - name: Build bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: mousehop.flatpak
+          manifest-path: build-aux/com.mousehop.Mousehop.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+
+      - name: Upload bundle to GitHub Release
+        # Skip the upload when this is a validation run (inputs.ref
+        # is set). The bundle is still preserved as a GH Actions
+        # artifact by the flatpak-builder action above, so it can
+        # be downloaded for inspection without polluting Release
+        # assets.
+        if: inputs.ref == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" \
+            mousehop.flatpak \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber

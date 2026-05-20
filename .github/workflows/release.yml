@@ -263,38 +263,8 @@ jobs:
           mousehop-macos-arm64/mousehop-macos-arm64.dmg
           mousehop-windows-x86_64/mousehop-windows-x86_64.zip
 
-  flatpak-build:
-    name: "Build the Flatpak bundle"
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
-      options: --privileged
-    steps:
-    - uses: actions/checkout@v6
-    - name: Build bundle
-      uses: flatpak/flatpak-github-actions/flatpak-builder@v6
-      with:
-        bundle: mousehop.flatpak
-        manifest-path: build-aux/com.mousehop.Mousehop.yml
-        cache-key: flatpak-builder-${{ github.sha }}
-    - name: Upload bundle artifact
-      uses: actions/upload-artifact@v6
-      with:
-        name: mousehop-flatpak
-        path: mousehop.flatpak
-
-  flatpak-release:
-    name: "Attach Flatpak to the release"
-    needs: flatpak-build
-    runs-on: ubuntu-latest
-    steps:
-    - name: Download bundle
-      uses: actions/download-artifact@v4
-      with:
-        name: mousehop-flatpak
-    - name: Upload bundle to the release
-      uses: softprops/action-gh-release@v2
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        tag_name: ${{ github.event.release.tag_name || inputs.tag }}
-        files: mousehop.flatpak
+  # Flatpak bundle build + upload now lives in release-flatpak.yml,
+  # gated on the same `release: published` trigger. The split lets a
+  # Flatpak failure run independently of the macOS signing chain,
+  # and exposes a workflow_dispatch `ref` input so a manifest
+  # change can be validated against HEAD without cutting a release.
