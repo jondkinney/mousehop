@@ -27,11 +27,11 @@ Focus lies on performance, ease of use and a maintainable implementation that ca
 
 - _Now with a gtk frontend_
 
-<picture>
-    <source media="(prefers-color-scheme: dark)" srcset="/screenshots/dark.png?raw=true">
-    <source media="(prefers-color-scheme: light)" srcset="/screenshots/light.png?raw=true">
-    <img alt="Screenshot of Mousehop" srcset="/screenshots/dark.png">
-</picture>
+<p align="center">
+    <img alt="The Mousehop main window: General settings, Outgoing Auto-Release threshold, paired peers, mDNS discovery, and Clipboard Privacy"
+         src="screenshots/mousehop-prefs.png"
+         width="420">
+</p>
 
 
 ## Encryption
