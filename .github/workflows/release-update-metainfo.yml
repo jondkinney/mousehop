@@ -1,0 +1,106 @@
+name: release-update-metainfo
+
+# Prepend a per-version <release><description> block to the Flatpak
+# metainfo XML whenever a new GitHub Release is published. The
+# description body is parsed from the matching CHANGELOG.md
+# section so Flathub's Version-history shows real notes instead
+# of an empty stub.
+#
+# Mirrors release-update-site.yml's "fire on release, mutate a
+# file in this repo, push back" shape. Idempotent: if the
+# metainfo already references the version, the run is a no-op.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to record (e.g. v0.12.0)'
+        required: true
+        type: string
+
+jobs:
+  update:
+    name: Update metainfo from CHANGELOG
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed so the default GITHUB_TOKEN can push the follow-up
+      # commit back to main.
+      contents: write
+    env:
+      METAINFO: build-aux/com.mousehop.Mousehop.metainfo.xml
+      CHANGELOG: CHANGELOG.md
+    steps:
+      - name: Resolve tag / version / date
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          VERSION="${TAG#v}"
+          DATE=$(date -u +%Y-%m-%d)
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "date=$DATE"       >> "$GITHUB_OUTPUT"
+          echo "Recording $TAG (version $VERSION, date $DATE) in $METAINFO"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Skip if metainfo already references this version
+        id: idempotency
+        run: |
+          if grep -q "version=\"${{ steps.meta.outputs.version }}\"" "$METAINFO"; then
+            echo "metainfo already has version ${{ steps.meta.outputs.version }} — no-op"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true"  >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate <release> XML block from CHANGELOG
+        if: steps.idempotency.outputs.changed == 'true'
+        id: gen
+        run: |
+          python3 scripts/gen_appstream_release.py \
+            "$CHANGELOG" \
+            "${{ steps.meta.outputs.version }}" \
+            "${{ steps.meta.outputs.date }}" > /tmp/release.xml
+          echo "--- generated block ---"
+          cat /tmp/release.xml
+
+      - name: Insert block into metainfo
+        if: steps.idempotency.outputs.changed == 'true'
+        run: |
+          # Python over sed to avoid escape pain with the multi-line
+          # block. Inserts the new <release> right after the
+          # <releases> opening tag with 4-space indentation.
+          python3 - "$METAINFO" /tmp/release.xml <<'PY'
+          import pathlib, re, sys
+          meta = pathlib.Path(sys.argv[1])
+          xml  = meta.read_text(encoding="utf-8")
+          block = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").rstrip()
+          indented = "\n".join("    " + line for line in block.split("\n"))
+          new = re.sub(
+              r"(<releases>\s*\n)",
+              r"\1" + indented + "\n",
+              xml,
+              count=1,
+          )
+          if new == xml:
+              raise SystemExit("could not find <releases> tag to patch")
+          meta.write_text(new, encoding="utf-8")
+          PY
+          git --no-pager diff -- "$METAINFO" | head -60
+
+      - name: Commit + push
+        if: steps.idempotency.outputs.changed == 'true'
+        run: |
+          git config user.name  "mousehop-release-bot"
+          git config user.email "mousehop-release-bot@users.noreply.github.com"
+          git add "$METAINFO"
+          git commit -m "chore(metainfo): record release ${{ steps.meta.outputs.tag }}"
+          git push origin main
