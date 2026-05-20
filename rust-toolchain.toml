@@ -1,0 +1,7 @@
+# Pin the toolchain so CI is deterministic — a future clippy release
+# adding new lints can't turn the build red without a deliberate bump.
+# Bump together with the lint cleanup it implies.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
