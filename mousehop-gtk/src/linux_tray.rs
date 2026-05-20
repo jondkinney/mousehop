@@ -149,11 +149,39 @@ fn render_tray_pixmaps() -> Vec<Icon> {
     // and downscale, which is much sharper than upscaling a single
     // tiny pixmap.
     const TARGET_SIZES: &[i32] = &[16, 22, 32, 48, 64];
+    // The source SVG uses `currentColor`; substitute white before
+    // rasterizing so the glyph reads on dark waybars / system trays
+    // (the common case). SNI hosts don't expose their bar's background
+    // color, so we can't theme-adapt dynamically — white-on-dark is
+    // the safer pick than black-on-light.
+    const TRAY_COLOR: &str = "#ffffff";
+
+    let raw = match gio::resources_lookup_data(SVG_RESOURCE, gio::ResourceLookupFlags::NONE) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("linux_tray: load SVG resource: {e}");
+            return Vec::new();
+        }
+    };
+    let svg_str = match std::str::from_utf8(&raw) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("linux_tray: SVG is not UTF-8: {e}");
+            return Vec::new();
+        }
+    };
+    let recolored = svg_str.replace("currentColor", TRAY_COLOR);
+    let svg_bytes = glib::Bytes::from_owned(recolored.into_bytes());
 
     let mut icons = Vec::with_capacity(TARGET_SIZES.len());
     for &target in TARGET_SIZES {
         let render = target * RENDER_OVERSAMPLE;
-        let Ok(pixbuf) = Pixbuf::from_resource_at_scale(SVG_RESOURCE, render, render, true) else {
+        // MemoryInputStream is one-shot; recreate it per iteration so
+        // each Pixbuf::from_stream_at_scale reads from byte 0.
+        let stream = gio::MemoryInputStream::from_bytes(&svg_bytes);
+        let Ok(pixbuf) =
+            Pixbuf::from_stream_at_scale(&stream, render, render, true, gio::Cancellable::NONE)
+        else {
             log::warn!("linux_tray: failed to render SVG at {render}px");
             continue;
         };
