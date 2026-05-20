@@ -22,3 +22,14 @@ git_tag_name = "v{{ version }}"
 git_release_enable = true
 git_release_name = "v{{ version }}"
 changelog_update = true
+# Aggregate every workspace crate's commits into this crate's
+# CHANGELOG so a fix touching only a sibling still shows up here.
+changelog_include = [
+    "mousehop-cli",
+    "mousehop-gtk",
+    "mousehop-ipc",
+    "mousehop-proto",
+    "mousehop-input-event",
+    "mousehop-input-capture",
+    "mousehop-input-emulation",
+]
