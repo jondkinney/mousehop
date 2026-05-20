@@ -13,10 +13,15 @@ build-options:
   build-args:
     - "--share=network"
   env:
+    # Sparse registry shaves multiple minutes off the cold dep
+    # fetch — see https://blog.rust-lang.org/inside-rust/2023/01/30/cargo-sparse-protocol.html
+    "CARGO_REGISTRIES_CRATES_IO_PROTOCOL": "sparse"
     "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER": "clang"
-    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=/usr/lib/sdk/rust-stable/bin/mold"
+    # `-Wl,-z,now` forces immediate symbol resolution at load so
+    # full-RELRO actually applies; combined with mold for link speed.
+    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=/usr/lib/sdk/rust-stable/bin/mold -C link-arg=-Wl,-z,now"
     "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER": "clang"
-    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=/usr/lib/sdk/rust-stable/bin/mold"
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=/usr/lib/sdk/rust-stable/bin/mold -C link-arg=-Wl,-z,now"
 
 finish-args:
   - "--socket=wayland"
@@ -24,7 +29,20 @@ finish-args:
   - "--device=dri"
   - "--socket=session-bus"
   - "--share=network"
-  - "--filesystem=xdg-config"
+  # mousehop relays UDP traffic; --share=ipc is required alongside
+  # fallback-x11 (XSHM uses the shared IPC namespace).
+  - "--share=ipc"
+  # Per-app scope so a sandbox escape can't read every other app's
+  # config; mousehop's config dir is `$XDG_CONFIG_HOME/mousehop/`
+  # (see mousehop-app/src/config.rs).
+  - "--filesystem=xdg-config/mousehop:rw"
+  # Software KVM relays clipboard across peers — needs the
+  # Clipboard portal to read/write the host's selection.
+  - "--talk-name=org.freedesktop.portal.Clipboard"
+  # Connection / disconnection toasts use the Notifications
+  # portal; without this, peer-status notifications are silently
+  # swallowed by the sandbox.
+  - "--talk-name=org.freedesktop.Notifications"
   - "--env=RUST_BACKTRACE=1"
   - "--env=RUST_LOG=mousehop=debug"
   - "--env=GTK_PATH=/app/lib/gtk-4.0"
@@ -44,6 +62,9 @@ modules:
       - install -Dm0755 target/release/mousehop /app/bin/mousehop
       - install -Dm0644 mousehop-gtk/resources/com.mousehop.Mousehop.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
       - install -Dm0644 mousehop-app/com.mousehop.Mousehop.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
+      # AppStream metainfo — required by Flathub, also picked up by
+      # GNOME Software / KDE Discover for sideloaded bundles.
+      - install -Dm0644 build-aux/com.mousehop.Mousehop.metainfo.xml ${FLATPAK_DEST}/share/metainfo/${FLATPAK_ID}.metainfo.xml
     sources:
       - type: dir
         path: ..
