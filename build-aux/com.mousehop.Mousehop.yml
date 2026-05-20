@@ -43,7 +43,7 @@ modules:
       - cargo build --release
       - install -Dm0755 target/release/mousehop /app/bin/mousehop
       - install -Dm0644 mousehop-gtk/resources/com.mousehop.Mousehop.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
-      - install -Dm0644 com.mousehop.Mousehop.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
+      - install -Dm0644 mousehop-app/com.mousehop.Mousehop.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
     sources:
       - type: dir
         path: ..

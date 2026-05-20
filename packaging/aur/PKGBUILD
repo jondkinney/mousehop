@@ -34,7 +34,7 @@ build() {
 package() {
   cd "$pkgname-$pkgver"
   install -Dm755 target/release/mousehop "$pkgdir/usr/bin/mousehop"
-  install -Dm644 com.mousehop.Mousehop.desktop "$pkgdir/usr/share/applications/com.mousehop.Mousehop.desktop"
+  install -Dm644 mousehop-app/com.mousehop.Mousehop.desktop "$pkgdir/usr/share/applications/com.mousehop.Mousehop.desktop"
   install -Dm644 mousehop-gtk/resources/com.mousehop.Mousehop.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/com.mousehop.Mousehop.svg"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
