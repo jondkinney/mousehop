@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(desktop)* install desktop entry on first launch
 - *(tray)* recolor tray glyph at runtime via currentColor
 
 ## [0.11.2] - 2026-05-19
