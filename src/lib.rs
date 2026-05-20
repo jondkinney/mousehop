@@ -4,6 +4,8 @@ pub mod client;
 pub mod config;
 mod connect;
 mod crypto;
+#[cfg(all(unix, not(target_os = "macos")))]
+pub mod desktop_install;
 mod discovery;
 mod dns;
 mod emulation;
