@@ -13,11 +13,14 @@
   dbus,
 }:
 let
-  cargoToml = fromTOML (builtins.readFile ../Cargo.toml);
-  pname = cargoToml.package.name;
-  # The root package inherits version via `version.workspace = true`,
-  # so the real version lives under [workspace.package].
-  version = cargoToml.workspace.package.version;
+  # The workspace root is now virtual (no [package]); the mousehop
+  # binary crate lives in mousehop-app/. Pull the package name from
+  # there and the version from the workspace root, which still owns
+  # [workspace.package].
+  appCargoToml = fromTOML (builtins.readFile ../mousehop-app/Cargo.toml);
+  rootCargoToml = fromTOML (builtins.readFile ../Cargo.toml);
+  pname = appCargoToml.package.name;
+  version = rootCargoToml.workspace.package.version;
 in
 rustPlatform.buildRustPackage {
   inherit pname;
@@ -51,7 +54,7 @@ rustPlatform.buildRustPackage {
   RUST_BACKTRACE = "full";
 
   postInstall = ''
-    install -Dm444 *.desktop -t $out/share/applications
+    install -Dm444 mousehop-app/*.desktop -t $out/share/applications
     install -Dm444 mousehop-gtk/resources/*.svg -t $out/share/icons/hicolor/scalable/apps
   '';
 

@@ -38,7 +38,7 @@ jobs:
         stage="mousehop-${ver}-x86_64"
         mkdir "$stage"
         cp target/release/mousehop \
-           com.mousehop.Mousehop.desktop \
+           mousehop-app/com.mousehop.Mousehop.desktop \
            mousehop-gtk/resources/com.mousehop.Mousehop.svg \
            LICENSE NOTICE \
            "$stage/"
@@ -68,7 +68,7 @@ jobs:
         stage="mousehop-${ver}-aarch64"
         mkdir "$stage"
         cp target/release/mousehop \
-           com.mousehop.Mousehop.desktop \
+           mousehop-app/com.mousehop.Mousehop.desktop \
            mousehop-gtk/resources/com.mousehop.Mousehop.svg \
            LICENSE NOTICE \
            "$stage/"

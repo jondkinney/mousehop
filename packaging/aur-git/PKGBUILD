@@ -45,7 +45,7 @@ build() {
 package() {
   cd "$_pkgname"
   install -Dm755 target/release/mousehop "$pkgdir/usr/bin/mousehop"
-  install -Dm644 com.mousehop.Mousehop.desktop \
+  install -Dm644 mousehop-app/com.mousehop.Mousehop.desktop \
     "$pkgdir/usr/share/applications/com.mousehop.Mousehop.desktop"
   install -Dm644 mousehop-gtk/resources/com.mousehop.Mousehop.svg \
     "$pkgdir/usr/share/icons/hicolor/scalable/apps/com.mousehop.Mousehop.svg"

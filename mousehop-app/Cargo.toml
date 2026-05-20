@@ -1,0 +1,99 @@
+[package]
+name = "mousehop"
+description = "Software KVM Switch / mouse & keyboard sharing software for Local Area Networks"
+version.workspace = true
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/jondkinney/mousehop"
+include = [
+    "src/**/*",
+    "build.rs",
+    # First-launch desktop install (see src/desktop_install.rs) embeds
+    # these two files into the binary via include_bytes! / include_str!,
+    # so they must ship in the published crate.
+    "com.mousehop.Mousehop.desktop",
+    "assets/com.mousehop.Mousehop.svg",
+]
+
+[build-dependencies]
+shadow-rs = "1.2.0"
+
+[dependencies]
+input-event = { workspace = true }
+input-emulation = { workspace = true, default-features = false }
+input-capture = { workspace = true, default-features = false }
+mousehop-cli = { workspace = true }
+mousehop-gtk = { workspace = true, optional = true }
+mousehop-ipc = { workspace = true }
+mousehop-proto = { workspace = true }
+shadow-rs = { version = "1.2.0", features = ["metadata"] }
+
+toml = "0.8"
+toml_edit = { version = "0.22", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4.20"
+env_logger = "0.11.3"
+serde_json = "1.0.107"
+tokio = { version = "1.32.0", features = [
+    "io-util",
+    "io-std",
+    "macros",
+    "net",
+    "process",
+    "rt",
+    "sync",
+    "signal",
+] }
+futures = "0.3.28"
+clap = { version = "4.4.11", features = ["derive"] }
+slab = "0.4.9"
+thiserror = "2.0.0"
+tokio-util = "0.7.11"
+local-channel = "0.1.5"
+webrtc-dtls = { version = "0.12.0", features = ["pem"] }
+webrtc-util = "0.11.0"
+rustls = { version = "0.23.12", default-features = false, features = [
+    "std",
+    "ring",
+] }
+rcgen = "0.13.1"
+sha2 = "0.10.8"
+notify = "8.2.0"
+if-addrs = "0.13"
+if-watch = { version = "3.2", features = ["tokio"] }
+mdns-sd = "0.19"
+netdev = "0.43"
+hostname = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.148"
+
+[features]
+default = [
+    "gtk",
+    "layer_shell_capture",
+    "x11_capture",
+    "libei_capture",
+    "wlroots_emulation",
+    "libei_emulation",
+    "rdp_emulation",
+    "x11_emulation",
+]
+gtk = ["dep:mousehop-gtk"]
+layer_shell_capture = ["input-capture/layer_shell"]
+x11_capture = ["input-capture/x11"]
+libei_capture = ["input-event/libei", "input-capture/libei"]
+libei_emulation = ["input-event/libei", "input-emulation/libei"]
+wlroots_emulation = ["input-emulation/wlroots"]
+x11_emulation = ["input-emulation/x11"]
+rdp_emulation = ["input-emulation/remote_desktop_portal"]
+
+[package.metadata.bundle]
+name = "Mousehop"
+# Paths are relative to this manifest (mousehop-app/Cargo.toml).
+# `target/` and `build-aux/` live at the workspace root, so the
+# bundle's icon and resources sit one level up.
+icon = ["../target/icon.icns"]
+identifier = "com.mousehop.Mousehop"
+osx_info_plist_exts = ["../build-aux/macos-lsui-element.plist"]
+resources = ["../target/menubar-template.png"]
