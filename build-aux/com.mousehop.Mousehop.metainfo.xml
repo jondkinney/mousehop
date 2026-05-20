@@ -19,6 +19,12 @@
       discovery, and a refreshed UI.
     </p>
   </description>
+  <screenshots>
+    <screenshot type="default">
+      <caption>The Mousehop main window — peers, clipboard privacy, network discovery, and auto-release tuning</caption>
+      <image>https://mousehop.com/assets/screenshot-prefs.png</image>
+    </screenshot>
+  </screenshots>
   <categories>
     <category>Utility</category>
     <category>Network</category>
