@@ -13,6 +13,7 @@ mod macos_privacy;
 mod macos_status_item;
 mod modal_keys;
 mod running_app_object;
+mod single_instance;
 mod window;
 
 use std::{env, process, str, sync::OnceLock};
@@ -95,6 +96,23 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GtkError> {
         .set(local_commit)
         .expect("local_commit set once");
 
+    // Refuse to open a second preferences window. Held until `run`
+    // returns — i.e. for the whole GUI lifetime, including the joined
+    // GTK thread on Windows.
+    let _instance_guard = match single_instance::acquire() {
+        Ok(guard) => Some(guard),
+        Err(single_instance::AcquireError::AlreadyRunning) => {
+            log::info!("a mousehop preferences window is already open — exiting");
+            return Ok(());
+        }
+        // A lock we couldn't even create shouldn't strand the user
+        // without a GUI — log it and run anyway.
+        Err(e) => {
+            log::warn!("GUI single-instance lock unavailable ({e}); continuing without it");
+            None
+        }
+    };
+
     #[cfg(windows)]
     let ret = std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024) // https://gitlab.gnome.org/GNOME/gtk/-/commit/52dbb3f372b2c3ea339e879689c1de535ba2c2c3 -> caused crash on windows
@@ -130,7 +148,17 @@ fn gtk_main() -> glib::ExitCode {
         setup_actions(app);
         setup_menu(app);
     });
-    app.connect_activate(build_ui);
+    // A second `activate` — GApplication's D-Bus uniqueness handing
+    // off a relaunch on Linux, or any future re-activation — must
+    // raise the existing window rather than build a second one: each
+    // `build_ui` opens its own IPC connection and preferences window.
+    app.connect_activate(|app| {
+        if let Some(window) = app.windows().into_iter().next() {
+            window.present();
+            return;
+        }
+        build_ui(app);
+    });
 
     let args: Vec<&'static str> = vec![];
     app.run_with_args(&args)
