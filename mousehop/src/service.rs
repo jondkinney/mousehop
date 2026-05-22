@@ -248,7 +248,7 @@ impl Service {
 
         loop {
             tokio::select! {
-                request = self.frontend_listener.next() => self.handle_frontend_request(request),
+                request = self.frontend_listener.next() => self.handle_frontend_request(request).await,
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event).await,
                 event = self.capture.event() => self.handle_capture_event(event),
@@ -273,7 +273,10 @@ impl Service {
         Ok(())
     }
 
-    fn handle_frontend_request(&mut self, request: Option<Result<FrontendRequest, IpcError>>) {
+    async fn handle_frontend_request(
+        &mut self,
+        request: Option<Result<FrontendRequest, IpcError>>,
+    ) {
         let request = match request.expect("frontend listener closed") {
             Ok(r) => r,
             Err(e) => return log::error!("error receiving request: {e}"),
@@ -281,87 +284,87 @@ impl Service {
         match request {
             FrontendRequest::Activate(handle, active) => {
                 self.set_client_active(handle, active);
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::AuthorizeKey(desc, fp) => {
                 self.add_authorized_key(desc, fp);
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::ChangePort(port) => self.change_port(port),
             FrontendRequest::Create => {
                 self.add_client();
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::Delete(handle) => {
                 self.remove_client(handle);
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::EnableCapture => self.capture.reenable(),
             FrontendRequest::EnableEmulation => self.emulation.reenable(),
             FrontendRequest::Enumerate() => self.enumerate(),
             FrontendRequest::UpdateFixIps(handle, fix_ips) => {
                 self.update_fix_ips(handle, fix_ips);
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::UpdateHostname(handle, host) => {
                 self.update_hostname(handle, host);
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::UpdatePort(handle, port) => {
                 self.update_port(handle, port);
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::UpdatePosition(handle, pos) => {
                 self.update_pos(handle, pos);
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::ResolveDns(handle) => self.resolve(handle),
             FrontendRequest::Sync => self.sync_frontend(),
             FrontendRequest::RemoveAuthorizedKey(key) => {
                 self.remove_authorized_key(key);
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::UpdateEnterHook(handle, enter_hook) => {
                 self.update_enter_hook(handle, enter_hook)
             }
-            FrontendRequest::SaveConfiguration => self.save_config(),
+            FrontendRequest::SaveConfiguration => self.save_config().await,
             FrontendRequest::SetReleaseThreshold(threshold) => {
                 self.config.set_release_threshold_px(threshold);
                 self.capture.set_release_threshold(threshold);
                 self.notify_frontend(FrontendEvent::ReleaseThreshold(threshold));
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::SetIncomingPeerNaturalScroll(fp, natural_scroll) => {
                 self.set_incoming_peer_natural_scroll(fp, natural_scroll);
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::SetIncomingPeerSensitivity(fp, sensitivity) => {
                 self.set_incoming_peer_sensitivity(fp, sensitivity);
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::SetMdnsDiscovery(enabled) => {
                 self.config.set_mdns_discovery(enabled);
                 self.discovery.set_enabled(enabled);
                 self.notify_frontend(FrontendEvent::MdnsDiscovery(enabled));
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::SetClientClipboardSend(handle, enabled) => {
                 if self.client_manager.set_clipboard_send(handle, enabled) {
                     self.broadcast_client(handle);
-                    self.save_config();
+                    self.save_config().await;
                 }
             }
             FrontendRequest::SetIncomingPeerClipboardReceive(fp, enabled) => {
                 self.set_incoming_peer_clipboard_receive(fp, enabled);
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::AddSuppressedApp(value) => {
                 self.add_suppressed_app(value);
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::RemoveSuppressedApp(value) => {
                 self.remove_suppressed_app(value);
-                self.save_config();
+                self.save_config().await;
             }
             FrontendRequest::ListRunningApps => {
                 let apps = frontmost_app::list_running_apps();
@@ -416,32 +419,37 @@ impl Service {
     /// announced primary differs from the IP it actually connected
     /// from. Persists the update so the GUI keeps a useful
     /// identification across restarts.
-    fn update_incoming_peer_address(&mut self, addr: SocketAddr, fingerprint: &str) {
+    async fn update_incoming_peer_address(&mut self, addr: SocketAddr, fingerprint: &str) {
         let ip = addr.ip().to_string();
         let hostname = self.lookup_hostname_for_ip(addr.ip());
-        let mut keys = self.authorized_keys.write().expect("lock");
-        let Some(peer) = keys.get_mut(fingerprint) else {
-            return; // unauthorized peer; nothing to update
-        };
-        let mut changed = peer.last_addr.as_deref() != Some(&ip);
-        if changed {
-            peer.last_addr = Some(ip);
-        }
-        if let Some(h) = hostname {
-            if peer.last_hostname.as_deref() != Some(h.as_str()) {
-                peer.last_hostname = Some(h);
-                changed = true;
+        // Scope the write guard to this block: `save_config().await`
+        // below must not run while the non-async RwLock is held, or
+        // the lock would span a suspension point. The block yields
+        // the cloned snapshot and drops the guard before the await.
+        let snapshot = {
+            let mut keys = self.authorized_keys.write().expect("lock");
+            let Some(peer) = keys.get_mut(fingerprint) else {
+                return; // unauthorized peer; nothing to update
+            };
+            let mut changed = peer.last_addr.as_deref() != Some(&ip);
+            if changed {
+                peer.last_addr = Some(ip);
             }
-        }
-        if !changed {
-            return;
-        }
-        let snapshot = keys.clone();
-        drop(keys);
+            if let Some(h) = hostname {
+                if peer.last_hostname.as_deref() != Some(h.as_str()) {
+                    peer.last_hostname = Some(h);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return;
+            }
+            keys.clone()
+        };
         // No need to push to InputEmulation — last_addr/last_hostname
         // are display-only; per-pair scroll/sensitivity is unaffected.
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(snapshot));
-        self.save_config();
+        self.save_config().await;
     }
 
     fn lookup_hostname_for_ip(&self, target: std::net::IpAddr) -> Option<String> {
@@ -499,7 +507,7 @@ impl Service {
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
 
-    fn save_config(&mut self) {
+    async fn save_config(&mut self) {
         let clients = self.client_manager.clients();
         let clients = clients
             .into_iter()
@@ -516,7 +524,7 @@ impl Service {
         self.config.set_clients(clients);
         let authorized_keys = self.authorized_keys.read().expect("lock").clone();
         self.config.set_authorized_keys(authorized_keys);
-        if let Err(e) = self.config.write_back() {
+        if let Err(e) = self.config.write_back().await {
             log::warn!("failed to write config: {e}");
         }
     }
@@ -601,7 +609,7 @@ impl Service {
             }
             EmulationEvent::ReleaseNotify => self.capture.release_for_handover(),
             EmulationEvent::Connected { addr, fingerprint } => {
-                self.update_incoming_peer_address(addr, &fingerprint);
+                self.update_incoming_peer_address(addr, &fingerprint).await;
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
             EmulationEvent::PeerHello { addr, commit } => {

@@ -643,7 +643,7 @@ impl Config {
         Ok(changed)
     }
 
-    pub fn write_back(&mut self) -> Result<(), io::Error> {
+    pub async fn write_back(&mut self) -> Result<(), io::Error> {
         log::info!("writing config to {:?}", &self.config_path);
         /* the new config */
         let new_config = self.config_toml.clone().unwrap_or_default();
@@ -659,18 +659,30 @@ impl Config {
          */
 
         let _ = self.unwatch();
-        /* write new config to file */
-        if let Some(p) = self.config_path().parent() {
-            fs::create_dir_all(p)?;
-        }
-        {
-            let mut f = File::create(self.config_path())?;
+        /* Offload the write — and especially the fsync — to the
+         * blocking pool. `sync_all()` can stall for many ms on a
+         * busy disk, and `write_back` runs on the single-threaded
+         * runtime that also drains captured input events; a
+         * synchronous fsync here would briefly stall forwarding.
+         * Serializing the TOML above is cheap and stays inline;
+         * only the I/O is offloaded. The watcher is re-armed after
+         * the write completes (await), preserving the unwatch/watch
+         * bracket that suppresses a self-write reload. */
+        let path = self.config_path().to_path_buf();
+        let res = tokio::task::spawn_blocking(move || -> Result<(), io::Error> {
+            if let Some(p) = path.parent() {
+                fs::create_dir_all(p)?;
+            }
+            let mut f = File::create(&path)?;
             f.write_all(new_config.as_bytes())?;
             f.sync_all()?;
-        }
+            Ok(())
+        })
+        .await
+        .expect("config write task panicked");
 
         let _ = self.watch();
 
-        Ok(())
+        res
     }
 }
