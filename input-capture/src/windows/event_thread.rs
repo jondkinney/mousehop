@@ -22,12 +22,13 @@ use windows::core::{PCWSTR, w};
 
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW,
-    HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-    RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE,
-    WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP,
-    WNDCLASSW, WNDPROC, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    HHOOK, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
+    RegisterClassW, SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_USER,
+    WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC, WTS_SESSION_LOCK,
+    WTS_SESSION_UNLOCK,
 };
 
 use input_event::{
@@ -102,9 +103,10 @@ enum ClientUpdate {
     Destroy(Position),
 }
 
-fn blocking_send_event(pos: Position, event: CaptureEvent) {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().blocking_send((pos, event)).unwrap())
-}
+/// `SetTimer` id for the low-level-hook watchdog.
+const HOOK_WATCHDOG_TIMER: usize = 1;
+/// How often the watchdog checks that the hooks are still live.
+const HOOK_WATCHDOG_INTERVAL_MS: u32 = 3000;
 
 fn try_send_event(
     pos: Position,
@@ -134,7 +136,18 @@ thread_local! {
     /// would happily forward motion to the peer while the lock screen
     /// consumes keyboard events, leaving a half-broken state.
     static HOST_LOCKED: Cell<bool> = const { Cell::new(false) };
+    /// Handles to the installed low-level hooks. Kept so the
+    /// watchdog can unhook the stale handle before re-installing.
+    static MOUSE_HOOK: Cell<Option<HHOOK>> = const { Cell::new(None) };
+    static KBD_HOOK: Cell<Option<HHOOK>> = const { Cell::new(None) };
 }
+
+/// Set true by either hook procedure whenever it runs; swapped back
+/// to false by the watchdog timer. While a capture is active, a
+/// full watchdog interval with this still false means the OS has
+/// silently removed the hooks (it does this when a hook proc
+/// exceeds `LowLevelHooksTimeout`) and they must be re-installed.
+static HOOK_FIRED: AtomicBool = AtomicBool::new(false);
 
 fn get_msg() -> Option<MSG> {
     unsafe {
@@ -181,14 +194,17 @@ fn start_routine(
         cnd.notify_one();
     }
 
-    let mouse_proc: HOOKPROC = Some(mouse_proc);
-    let kybrd_proc: HOOKPROC = Some(kybrd_proc);
     let window_proc: WNDPROC = Some(window_proc);
 
-    /* register hooks */
-    unsafe {
-        let _ = SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, None, 0).unwrap();
-        let _ = SetWindowsHookExW(WH_KEYBOARD_LL, kybrd_proc, None, 0).unwrap();
+    /* register the low-level input hooks. The capture thread is
+     * useless without them, so a failure here is fatal to capture:
+     * log loudly and bail rather than spinning a dead message loop
+     * that silently captures nothing. (The previous `.unwrap()`
+     * panicked this spawned thread, which the joiner swallowed —
+     * same silent outcome, no diagnostic.) */
+    if let Err(e) = install_hooks() {
+        log::error!("failed to install low-level input hooks: {e:?} — capture disabled");
+        return;
     }
 
     let instance = unsafe { GetModuleHandleW(None).unwrap() };
@@ -247,6 +263,23 @@ fn start_routine(
         }
     }
 
+    /* arm the hook watchdog. Windows silently removes a low-level
+     * hook whose proc exceeds LowLevelHooksTimeout; the try_send
+     * hot path makes that unlikely but not impossible, and a
+     * removed hook would leave this thread alive but capturing
+     * nothing. The WM_TIMER tick detects that and re-installs. */
+    unsafe {
+        if SetTimer(
+            Some(msg_window),
+            HOOK_WATCHDOG_TIMER,
+            HOOK_WATCHDOG_INTERVAL_MS,
+            None,
+        ) == 0
+        {
+            log::warn!("SetTimer for hook watchdog failed — hook auto-recovery disabled");
+        }
+    }
+
     /* run message loop. mouse / keybrd procs don't actually return
      * a message, so `get_msg() == None` ends the loop; an Exit-typed
      * thread message breaks out from inside the body. */
@@ -283,9 +316,60 @@ fn start_routine(
         }
     }
 
-    /* unregister session-notification before the window goes away. */
+    /* tear down the watchdog timer, session-notification and hooks
+     * before the window/thread goes away. */
     unsafe {
+        let _ = KillTimer(Some(msg_window), HOOK_WATCHDOG_TIMER);
         let _ = WTSUnRegisterSessionNotification(msg_window);
+    }
+    uninstall_hooks();
+}
+
+/// Install the `WH_MOUSE_LL` / `WH_KEYBOARD_LL` hooks and stash
+/// their handles. Must run on the message-loop thread — low-level
+/// hooks deliver callbacks to the thread that installed them.
+fn install_hooks() -> windows::core::Result<()> {
+    let mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), None, 0)? };
+    let kbd = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(kybrd_proc), None, 0)? };
+    MOUSE_HOOK.set(Some(mouse));
+    KBD_HOOK.set(Some(kbd));
+    Ok(())
+}
+
+/// Remove the installed hooks, if any. Unhooking a handle the OS
+/// has already removed is a harmless no-op.
+fn uninstall_hooks() {
+    if let Some(h) = MOUSE_HOOK.take() {
+        unsafe {
+            let _ = UnhookWindowsHookEx(h);
+        }
+    }
+    if let Some(h) = KBD_HOOK.take() {
+        unsafe {
+            let _ = UnhookWindowsHookEx(h);
+        }
+    }
+}
+
+/// Watchdog tick (`WM_TIMER`). When a capture is active but no hook
+/// callback has fired for a whole interval, the hooks have almost
+/// certainly been removed by the OS — re-install them. When no
+/// capture is active, silence is expected, so this only resets the
+/// flag and waits.
+fn hook_watchdog_tick() {
+    if ACTIVE_CLIENT.get().is_none() {
+        HOOK_FIRED.store(false, Ordering::Relaxed);
+        return;
+    }
+    if !HOOK_FIRED.swap(false, Ordering::Relaxed) {
+        log::warn!(
+            "no input-hook callbacks during active capture — hooks presumed removed by the OS; re-installing"
+        );
+        uninstall_hooks();
+        match install_hooks() {
+            Ok(()) => log::warn!("re-installed low-level input hooks"),
+            Err(e) => log::error!("failed to re-install low-level input hooks: {e:?}"),
+        }
     }
 }
 
@@ -336,15 +420,24 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     });
     ENTRY_POINT.replace(entry_point);
 
-    /* notify main thread */
+    /* notify main thread. This runs inside the WH_MOUSE_LL hook
+     * proc, so it must not block: a blocked low-level hook freezes
+     * input system-wide and the OS then removes the hook outright.
+     * try_send it instead. With the deep channel a drop here is
+     * essentially impossible; if it ever happens it means ~1024
+     * events are already backlogged, in which case blocking would
+     * be far worse than a logged drop. */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
     let active = ACTIVE_CLIENT.get().expect("active client");
-    blocking_send_event(active, CaptureEvent::Begin { cursor: None });
+    if let Err(e) = try_send_event(active, CaptureEvent::Begin { cursor: None }) {
+        log::error!("forwarding channel full — dropped capture-begin event: {e}");
+    }
 
     ret
 }
 
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    HOOK_FIRED.store(true, Ordering::Relaxed);
     let active = check_client_activation(wparam, lparam);
 
     /* no client was active */
@@ -372,6 +465,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 }
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    HOOK_FIRED.store(true, Ordering::Relaxed);
     /* get active client if any */
     let Some(client) = ACTIVE_CLIENT.get() else {
         return CallNextHookEx(None, ncode, wparam, lparam);
@@ -399,6 +493,10 @@ unsafe extern "system" fn window_proc(
     if uint == WM_DISPLAYCHANGE {
         log::debug!("display resolution changed");
         DISPLAY_RESOLUTION_GENERATION.fetch_add(1, Ordering::Release);
+    } else if uint == WM_TIMER {
+        if wparam.0 == HOOK_WATCHDOG_TIMER {
+            hook_watchdog_tick();
+        }
     } else if uint == WM_WTSSESSION_CHANGE {
         match wparam.0 as u32 {
             WTS_SESSION_LOCK => {

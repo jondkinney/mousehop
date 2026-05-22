@@ -41,7 +41,13 @@ impl Capture for WindowsInputCapture {
 
 impl WindowsInputCapture {
     pub(crate) fn new() -> Self {
-        let (event_tx, event_rx) = channel(10);
+        // Deep buffer: the low-level hook procs feed this and must
+        // never block (a blocked WH_MOUSE_LL/WH_KEYBOARD_LL proc
+        // freezes input system-wide and the OS then removes the
+        // hook). A capacity of 10 filled almost immediately under
+        // any consumer stall; 1024 rides out brief stalls so the
+        // hooks' try_send path rarely has to drop an event.
+        let (event_tx, event_rx) = channel(1024);
         let event_thread = EventThread::new(event_tx);
         Self {
             event_thread,
