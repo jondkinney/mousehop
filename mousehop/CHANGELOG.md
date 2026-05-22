@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.7](https://github.com/jondkinney/mousehop/compare/v0.11.6...v0.11.7) - 2026-05-22
+
+### Other
+
+- Offload config file write to the blocking pool
+- Harden Windows capture against hook freeze and loss
+- Fix macOS capture dying on lock and input lag
+
 ## [0.11.6](https://github.com/jondkinney/mousehop/compare/v0.11.5...v0.11.6) - 2026-05-22
 
 ### Fixed
