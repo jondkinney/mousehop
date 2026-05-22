@@ -200,6 +200,11 @@ impl ListenTask {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut last_response = HashMap::new();
         let mut rejected_connections = HashMap::new();
+        // Last display geometry pushed to peers, so a change can be
+        // re-broadcast to an in-progress session (a peer that has
+        // already entered won't otherwise see the new size until it
+        // crosses back and re-enters).
+        let mut last_bounds = self.emulation_proxy.display_bounds();
         loop {
             select! {
                 e = self.listener.next() => {match e {
@@ -410,6 +415,21 @@ impl ListenTask {
                             true
                         }
                     });
+                    // Push refreshed display geometry to actively
+                    // responding peers if it changed since the last
+                    // tick. Old peers ignore unrecognized events; an
+                    // idle peer picks the new size up from the cache
+                    // on its next Enter regardless.
+                    let bounds = self.emulation_proxy.display_bounds();
+                    if bounds != last_bounds {
+                        last_bounds = bounds;
+                        if let Some((width, height)) = bounds {
+                            let addrs: Vec<SocketAddr> = last_response.keys().copied().collect();
+                            for addr in addrs {
+                                self.listener.reply(addr, ProtoEvent::Bounds { width, height }).await;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -654,8 +674,26 @@ impl EmulationTask {
         &mut self,
         emulation: &mut InputEmulation,
     ) -> Result<(), InputEmulationError> {
+        // Re-query display geometry periodically so a monitor
+        // hot-plug/unplug, a resolution change, or a MacBook
+        // lid-open-after-clamshell is picked up without restarting
+        // the backend. The shared cache feeds both the
+        // ProtoEvent::Bounds reply on Enter and the CursorPos warp
+        // clamping — left stale, it pins the cursor to the old
+        // display size until mousehop is quit.
+        let mut bounds_poll = tokio::time::interval(Duration::from_secs(2));
         loop {
             tokio::select! {
+                _ = bounds_poll.tick() => {
+                    let current = emulation.display_bounds();
+                    if current != self.display_bounds.get() {
+                        log::info!(
+                            "display geometry changed: {:?} -> {current:?}",
+                            self.display_bounds.get(),
+                        );
+                        self.display_bounds.set(current);
+                    }
+                }
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     ProxyRequest::Input(event, addr) => {
                         let handle = match self.handles.get(&addr) {
