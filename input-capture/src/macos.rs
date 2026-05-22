@@ -211,6 +211,22 @@ impl InputCaptureState {
                     self.show_cursor()?;
                     self.current_pos = None;
                 }
+                // A tap disabled while the host screen is locked is
+                // the lock screen's secure-input mode, not a
+                // permission revocation. AXIsProcessTrusted() is
+                // unreliable in the locked loginwindow session and
+                // can read `false` with the grant fully intact —
+                // probing it here would exit the daemon on every
+                // lock (and screen-saver). Treat lock as recoverable:
+                // the `com.apple.screenIsUnlocked` observer on the
+                // event-tap thread re-enables the tap once the user
+                // logs back in. Bail out before the AX probe.
+                if is_screen_locked() {
+                    log::info!(
+                        "CGEventTap disabled while screen locked — will re-enable on unlock"
+                    );
+                    return Ok(());
+                }
                 // Distinguish AX revocation from a recoverable cause
                 // (secure-input mode while typing in a password field
                 // also fires TapDisabledByUserInput). If AX is gone,
@@ -496,7 +512,7 @@ fn create_event_tap<'a>(
     client_state: Arc<Mutex<InputCaptureState>>,
     notify_tx: Sender<ProducerEvent>,
     event_tx: Sender<(Position, CaptureEvent)>,
-) -> Result<CGEventTap<'a>, MacosCaptureCreationError> {
+) -> Result<(CGEventTap<'a>, Arc<OnceLock<usize>>), MacosCaptureCreationError> {
     // Shared slot for the tap's mach port pointer. Stored as `usize`
     // because raw pointers aren't `Send`, but the integer
     // representation is — and CGEventTapEnable is documented as
@@ -637,11 +653,43 @@ fn create_event_tap<'a>(
         }
 
         if let Some(pos) = capture_position {
-            res_events.into_iter().for_each(|e| {
-                // error must be ignored, since the event channel
-                // may already be closed when the InputCapture instance is dropped.
-                let _ = event_tx.blocking_send((pos, e));
-            });
+            for e in res_events {
+                // This callback runs on the kernel's event-delivery
+                // thread: time spent here delays input for the whole
+                // system, and a *blocked* callback freezes input
+                // outright until kCGEventTapDisabledByTimeout fires —
+                // the user sees laggy, dropped keystrokes. So never
+                // block unconditionally on a backed-up forwarding
+                // channel (a slow/congested peer link fills it).
+                //
+                // Pointer-motion is a delta stream: a dropped sample
+                // is absorbed by the next one, so under pressure we
+                // drop it rather than block. Keyboard, button, scroll
+                // and lifecycle (Begin/AutoRelease) events are NOT
+                // self-correcting — a dropped key-up sticks a key on
+                // the peer — so for those, and only those, we accept
+                // a brief block. They're low-volume, so the channel
+                // is realistically only ever full of motion samples,
+                // which the drop path drains.
+                match event_tx.try_send((pos, e)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full((pos, e))) => {
+                        if matches!(
+                            e,
+                            CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { .. }))
+                        ) {
+                            log::debug!("forwarding channel full — dropping pointer-motion sample");
+                        } else {
+                            log::warn!("forwarding channel full — blocking to preserve {e}");
+                            // Closed only happens on shutdown; ignore.
+                            let _ = event_tx.blocking_send((pos, e));
+                        }
+                    }
+                    // Channel closed: the InputCapture instance is
+                    // being dropped. Nothing to forward to; ignore.
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                }
+            }
             // Returning Drop should stop the event from being processed
             // but core fundation still returns the event
             cg_ev.set_type(CGEventType::Null);
@@ -667,6 +715,9 @@ fn create_event_tap<'a>(
     let port_ptr = tap.mach_port().as_concrete_TypeRef() as usize;
     let _ = tap_mach_port.set(port_ptr);
 
+    // Hand the same slot back to the caller so the screen-unlock
+    // observer can re-enable the tap after a lock disables it.
+
     let tap_source: CFRunLoopSource = tap
         .mach_port()
         .create_runloop_source(0)
@@ -676,7 +727,7 @@ fn create_event_tap<'a>(
         CFRunLoop::get_current().add_source(&tap_source, kCFRunLoopCommonModes);
     }
 
-    Ok(tap)
+    Ok((tap, tap_mach_port))
 }
 
 fn event_tap_thread(
@@ -689,17 +740,52 @@ fn event_tap_thread(
     // Clone now: create_event_tap consumes notify_tx into its closure.
     let display_notify_tx = notify_tx.clone();
 
-    let _tap = match create_event_tap(client_state, notify_tx, event_tx) {
+    let (_tap, tap_mach_port) = match create_event_tap(client_state, notify_tx, event_tx) {
         Err(e) => {
             ready.send(Err(e)).expect("channel closed");
             return;
         }
-        Ok(tap) => {
+        Ok((tap, port)) => {
             let run_loop = CFRunLoop::get_current();
             ready.send(Ok(run_loop)).expect("channel closed");
-            tap
+            (tap, port)
         }
     };
+
+    // Subscribe to the screen-unlock distributed notification. When
+    // the host locks, the lock screen's password field enables
+    // secure event input, which disables our session event tap.
+    // macOS never re-enables it on unlock — without this observer
+    // the daemon survives the lock but the tap stays dead and
+    // mousehop silently stops capturing. Box-leak the refcon so the
+    // C side has a stable observer pointer; reclaim it after the run
+    // loop exits.
+    let unlock_ctx = Box::into_raw(Box::new(UnlockObserverCtx {
+        tap_mach_port: Arc::clone(&tap_mach_port),
+    }));
+    let unlock_name = unsafe {
+        let cstr = CString::new("com.apple.screenIsUnlocked").unwrap();
+        CFStringCreateWithCString(
+            kCFAllocatorDefault,
+            cstr.as_ptr() as *const c_char,
+            kCFStringEncodingUTF8,
+        )
+    };
+    unsafe {
+        // CFNotificationSuspensionBehaviorDeliverImmediately — the
+        // observer's thread run loop is always running here, but
+        // deliver-immediately also covers the brief window around a
+        // lock/unlock transition.
+        const DELIVER_IMMEDIATELY: isize = 4;
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDistributedCenter(),
+            unlock_ctx as *const c_void,
+            screen_unlocked_callback,
+            unlock_name,
+            std::ptr::null(),
+            DELIVER_IMMEDIATELY,
+        );
+    }
 
     // Register a Quartz display-reconfiguration callback so the
     // capture state's bounds get refreshed when the user plugs in a
@@ -759,6 +845,15 @@ fn event_tap_thread(
         drop(Box::from_raw(
             display_user_info as *mut Sender<ProducerEvent>,
         ));
+
+        // Tear down the screen-unlock observer and reclaim its
+        // refcon Box, mirroring the display-callback cleanup above.
+        CFNotificationCenterRemoveEveryObserver(
+            CFNotificationCenterGetDistributedCenter(),
+            unlock_ctx as *const c_void,
+        );
+        drop(Box::from_raw(unlock_ctx));
+        CFRelease(unlock_name as *const c_void);
 
         if power_notifier_object != 0 {
             let _ = IODeregisterForSystemPower(&mut power_notifier_object);
@@ -888,6 +983,46 @@ extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_i
     }
 }
 
+/// Refcon for the screen-unlock distributed-notification observer.
+/// Holds the tap's mach-port slot so the callback can re-enable a
+/// tap that the lock screen's secure-input mode disabled. Built on
+/// the event-tap thread, used only by the callback on the same
+/// thread's run loop — never crosses threads after construction.
+struct UnlockObserverCtx {
+    tap_mach_port: Arc<OnceLock<usize>>,
+}
+
+/// CFNotificationCenter callback for `com.apple.screenIsUnlocked`.
+/// When the host screen locks, its password field enables secure
+/// event input, which disables our session event tap. macOS does
+/// not re-enable the tap on unlock — we must, or the daemon keeps
+/// running but captures nothing. Re-enabling an already-enabled tap
+/// is a documented no-op, so calling this is safe even on the rare
+/// unlock where the tap rode through the lock intact.
+extern "C" fn screen_unlocked_callback(
+    _center: *mut c_void,
+    observer: *mut c_void,
+    _name: CFStringRef,
+    _object: *const c_void,
+    _user_info: CFDictionaryRef,
+) {
+    if observer.is_null() {
+        return;
+    }
+    // SAFETY: `observer` is the `Box::into_raw(Box::new(UnlockObserverCtx))`
+    // owned by `event_tap_thread`; valid until the run loop exits and
+    // the observer is removed. The callback only fires while the run
+    // loop runs on that thread, so the box is live here.
+    let ctx = unsafe { &*(observer as *const UnlockObserverCtx) };
+    match ctx.tap_mach_port.get() {
+        Some(&port) => {
+            log::info!("screen unlocked — re-enabling CGEventTap");
+            unsafe { CGEventTapEnable(port as *mut c_void, true) };
+        }
+        None => log::warn!("screen unlocked but tap mach port not yet stored — cannot re-enable"),
+    }
+}
+
 pub struct MacOSInputCapture {
     event_rx: Receiver<(Position, CaptureEvent)>,
     notify_tx: Sender<ProducerEvent>,
@@ -899,7 +1034,13 @@ impl MacOSInputCapture {
         request_macos_capture_permissions()?;
 
         let state = Arc::new(Mutex::new(InputCaptureState::new()?));
-        let (event_tx, event_rx) = mpsc::channel(32);
+        // Generously sized: the event-tap callback feeds this from
+        // the kernel's input thread and only drops/blocks once it's
+        // full (see the try_send path in `create_event_tap`). A deep
+        // buffer rides out brief consumer stalls — a slow DTLS send,
+        // a GC-like tokio scheduling gap — without dropping motion
+        // samples or blocking the callback.
+        let (event_tx, event_rx) = mpsc::channel(1024);
         let (notify_tx, mut notify_rx) = mpsc::channel(32);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tap_exit_tx, mut tap_exit_rx) = oneshot::channel();
@@ -1109,6 +1250,29 @@ extern "C" {
 extern "C" {
     fn CFDictionaryGetValue(dict: CFDictionaryRef, key: *const c_void) -> *const c_void;
     fn CFBooleanGetValue(boolean: CFBooleanRef) -> bool;
+
+    /// The system-wide distributed notification center. Carries
+    /// cross-process notifications such as `com.apple.screenIsLocked`
+    /// and `com.apple.screenIsUnlocked`.
+    fn CFNotificationCenterGetDistributedCenter() -> *mut c_void;
+    /// Register `callback` for `name`, delivered on the run loop of
+    /// the registering thread. `observer` is an opaque key reused by
+    /// the removal call and handed back to the callback.
+    fn CFNotificationCenterAddObserver(
+        center: *mut c_void,
+        observer: *const c_void,
+        callback: extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            CFStringRef,
+            *const c_void,
+            CFDictionaryRef,
+        ),
+        name: CFStringRef,
+        object: *const c_void,
+        suspension_behavior: isize,
+    );
+    fn CFNotificationCenterRemoveEveryObserver(center: *mut c_void, observer: *const c_void);
 }
 
 extern "C" {
