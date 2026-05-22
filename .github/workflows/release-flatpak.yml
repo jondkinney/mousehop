@@ -1,16 +1,19 @@
 name: release-flatpak
 
-# Build the Flatpak bundle for mousehop on every published Release
-# and attach it as a Release asset. Split out from release.yml
-# (which still builds Linux tarballs, Windows ZIP, macOS DMGs)
-# so:
-#  - a Flatpak failure doesn't fail-fast the macOS signing chain
-#  - workflow_dispatch can validate a manifest change against
-#    `ref=main` without rebuilding every platform
+# Build the Flatpak bundle on every published Release and attach it as
+# a Release asset. Split from release.yml so a Flatpak failure doesn't
+# sink the platform builds, and so workflow_dispatch can validate a
+# manifest change against an arbitrary ref without cutting a release.
 #
-# Manifest lives at build-aux/com.mousehop.Mousehop.yml.
-# Mirrors release-flatpak.yml in jondkinney/vernier and
-# jondkinney/tensaku.
+# The build container's runtime (gnome-XX / freedesktop-XX) must match
+# the manifest's declared runtime, so it comes from the per-repo
+# FLATPAK_CI_IMAGE repository variable. Everything else is derived.
+#
+# SHARED WORKFLOW — this file is byte-identical across
+# jondkinney/{mousehop,tensaku,vernier}. Every per-repo value is
+# derived from the github context or the FLATPAK_CI_IMAGE variable; do
+# not hardcode anything repo-specific. A drift-check guards the three
+# copies.
 
 on:
   release:
@@ -18,15 +21,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to build (e.g. v0.12.0)'
+        description: 'Release tag to build (e.g. v1.2.3)'
         required: true
         type: string
       ref:
-        # Validation knob: when set (e.g. `main`), the build comes
-        # from that ref instead of the tag, and the resulting bundle
-        # is NOT attached to the Release. Use this to verify a
-        # manifest change before cutting a release. Leave blank for
-        # the normal backfill-an-old-tag path.
+        # Validation knob: when set (e.g. `main`), the build comes from
+        # that ref instead of the tag, and the resulting bundle is NOT
+        # attached to the Release. Use this to verify a manifest change
+        # before cutting a release. Leave blank for the normal path.
         description: 'Git ref to build from (default: the tag itself). Set to a branch (e.g. main) to validate without attaching to the Release.'
         required: false
         type: string
@@ -39,7 +41,10 @@ jobs:
       # gh release upload writes to the release assets.
       contents: write
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      # Per-repo runtime, kept in a repository variable so this file
+      # stays identical across repos. Fallback covers a fresh fork that
+      # hasn't set the variable yet.
+      image: ghcr.io/flathub-infra/flatpak-github-actions:${{ vars.FLATPAK_CI_IMAGE || 'gnome-48' }}
       options: --privileged
     steps:
       - name: Resolve target tag
@@ -54,31 +59,51 @@ jobs:
           echo "Building Flatpak for $TAG"
 
       - name: Checkout source
-        # Falls through to the tag on release events (where
-        # inputs.ref is empty) and on dispatches that leave `ref`
-        # blank. Only an explicit override changes the source.
+        # Falls through to the tag on release events (where inputs.ref
+        # is empty) and on dispatches that leave `ref` blank. Only an
+        # explicit override changes the source.
         uses: actions/checkout@v6
         with:
           ref: ${{ inputs.ref || steps.tag.outputs.tag }}
 
+      - name: Locate the Flatpak manifest
+        # The manifest sits beside the AppStream metainfo and shares
+        # its app-id basename (com.X.Y.metainfo.xml -> com.X.Y.yml).
+        # Discovered, not hardcoded, so this file stays identical
+        # across repos. `find` rather than `git ls-files` — the build
+        # container's checkout isn't guaranteed to carry a .git dir.
+        run: |
+          METAINFO=$(find . -name '*.metainfo.xml' -not -path './.git/*' | head -1)
+          if [ -z "$METAINFO" ]; then
+            echo "no *.metainfo.xml found in this repo" >&2
+            exit 1
+          fi
+          MANIFEST="${METAINFO%.metainfo.xml}.yml"
+          MANIFEST="${MANIFEST#./}"
+          if [ ! -f "$MANIFEST" ]; then
+            echo "expected manifest $MANIFEST not found" >&2
+            exit 1
+          fi
+          echo "Manifest: $MANIFEST"
+          echo "MANIFEST=$MANIFEST" >> "$GITHUB_ENV"
+
       - name: Build bundle
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
-          bundle: mousehop.flatpak
-          manifest-path: build-aux/com.mousehop.Mousehop.yml
+          bundle: ${{ github.event.repository.name }}.flatpak
+          manifest-path: ${{ env.MANIFEST }}
           cache-key: flatpak-builder-${{ github.sha }}
 
       - name: Upload bundle to GitHub Release
-        # Skip the upload when this is a validation run (inputs.ref
-        # is set). The bundle is still preserved as a GH Actions
-        # artifact by the flatpak-builder action above, so it can
-        # be downloaded for inspection without polluting Release
-        # assets.
+        # Skip the upload when this is a validation run (inputs.ref is
+        # set). The bundle is still kept as a GH Actions artifact by
+        # the flatpak-builder action above, so it can be downloaded for
+        # inspection without polluting the Release assets.
         if: inputs.ref == ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ steps.tag.outputs.tag }}" \
-            mousehop.flatpak \
+            "${{ github.event.repository.name }}.flatpak" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber

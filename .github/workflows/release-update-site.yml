@@ -1,15 +1,19 @@
 name: release-update-site
 
-# Push the new release tag onto the mousehop.app landing page so
-# the eyebrow chip ('v<semver> · GPL-3.0') reflects the release
-# that just published. Uses an SSH deploy key scoped to the
-# mousehop-site repo (`MOUSEHOP_SITE_DEPLOY_KEY` secret) rather
-# than a PAT — the key has no expiry, can't read or write anything
-# outside this one repo, and lives entirely on the
-# mousehop ↔ mousehop-site axis.
+# Push the new release version onto the project's landing page so the
+# version chip reflects the release that just published. Uses an SSH
+# deploy key (SITE_DEPLOY_KEY) scoped to the <repo>-site repo rather
+# than a PAT — no expiry, and it can't read or write anything outside
+# that one repo.
 #
-# Mirrors release-update-site.yml in jondkinney/vernier; see that
-# file for the full design notes.
+# The landing page must wrap its version string in
+#   <span data-<repo>-version>v<semver></span>
+# as a stable anchor; reword the surrounding copy freely.
+#
+# SHARED WORKFLOW — this file is byte-identical across
+# jondkinney/{mousehop,tensaku,vernier}. Every per-repo value is
+# derived from the github context at runtime; do not hardcode anything
+# repo-specific. A drift-check guards the three copies.
 
 on:
   release:
@@ -17,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to sync (e.g. v0.12.0)'
+        description: 'Release tag to sync (e.g. v1.2.3)'
         required: true
         type: string
 
@@ -38,36 +42,35 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Syncing landing page to $TAG (version $VERSION)"
 
-      - name: Set up SSH agent with mousehop-site deploy key
+      - name: Set up SSH agent with the site deploy key
         # webfactory/ssh-agent loads the key into an in-memory
-        # ssh-agent, scopes it to one host (github.com), and tears
-        # the agent down at job end. Avoids the "private key on
-        # disk" footgun that comes with naive `mkdir ~/.ssh && cat
-        # > id_ed25519` patterns.
+        # ssh-agent, scopes it to github.com, and tears the agent down
+        # at job end — avoids the "private key on disk" footgun.
         uses: webfactory/ssh-agent@v0.9.0
         with:
-          ssh-private-key: ${{ secrets.MOUSEHOP_SITE_DEPLOY_KEY }}
+          ssh-private-key: ${{ secrets.SITE_DEPLOY_KEY }}
 
-      - name: Clone mousehop-site over SSH
+      - name: Clone the site repo over SSH
+        env:
+          SITE_REPO: ${{ github.repository }}-site
         run: |
-          git clone git@github.com:jondkinney/mousehop-site.git site
+          git clone "git@github.com:${SITE_REPO}.git" site
           cd site && git log --oneline -1
 
       - name: Patch version in index.html
         id: patch
         working-directory: site
+        env:
+          ANCHOR: data-${{ github.event.repository.name }}-version
         run: |
           new="${{ steps.tag.outputs.version }}"
-          # The version is wrapped in <span data-mousehop-version>...</span>
-          # so we don't have to anchor on any surrounding copy. Reword
-          # the eyebrow chip however you like — as long as that span
-          # stays wrapped around the v<semver> string, this workflow
-          # keeps working.
-          old=$(grep -oE '<span data-mousehop-version>v[0-9]+\.[0-9]+\.[0-9]+</span>' index.html \
+          # The version is wrapped in <span ${ANCHOR}>...</span> so we
+          # don't have to anchor on any surrounding copy.
+          old=$(grep -oE "<span ${ANCHOR}>v[0-9]+\.[0-9]+\.[0-9]+</span>" index.html \
                 | head -1 \
                 | sed -E 's|.*>v([0-9.]+)</span>|\1|')
           if [ -z "$old" ]; then
-            echo "couldn't find <span data-mousehop-version> in index.html" >&2
+            echo "couldn't find <span ${ANCHOR}> in index.html" >&2
             exit 1
           fi
           echo "site is at $old; release is $new"
@@ -76,16 +79,15 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          sed -i "s|<span data-mousehop-version>v${old}</span>|<span data-mousehop-version>v${new}</span>|g" index.html
+          sed -i "s|<span ${ANCHOR}>v${old}</span>|<span ${ANCHOR}>v${new}</span>|g" index.html
           echo "changed=true" >> "$GITHUB_OUTPUT"
-          echo "old=$old"     >> "$GITHUB_OUTPUT"
 
       - name: Commit + push
         if: steps.patch.outputs.changed == 'true'
         working-directory: site
         run: |
-          git config user.name  "mousehop-release-bot"
-          git config user.email "mousehop-release-bot@users.noreply.github.com"
+          git config user.name  "${{ github.event.repository.name }}-release-bot"
+          git config user.email "${{ github.event.repository.name }}-release-bot@users.noreply.github.com"
           git add index.html
           git commit -m "Bump landing-page version to v${{ steps.tag.outputs.version }}"
-          git push origin main
+          git push origin HEAD

@@ -1,13 +1,18 @@
 name: AUR publish
 
 # Publishes all three AUR variants after release-plz cuts a Release:
-#   - mousehop      (source build from the GitHub source tarball)
-#   - mousehop-bin  (prebuilt binaries from the Release assets)
-#   - mousehop-git  (tracks main; pkgver() generated at build time)
+#   - <repo>      (source build from the GitHub source tarball)
+#   - <repo>-bin  (prebuilt binaries from the Release tarball assets)
+#   - <repo>-git  (tracks the repo; pkgver() generated at build time)
 #
 # packaging/{aur,aur-bin,aur-git}/PKGBUILD are the source of truth.
 # This workflow pins per-release fields (pkgver, pkgrel, sha256sums),
 # regenerates .SRCINFO, and pushes to the matching AUR repo.
+#
+# SHARED WORKFLOW — this file is byte-identical across
+# jondkinney/{mousehop,tensaku,vernier}. Every per-repo value is
+# derived from the github context at runtime; do not hardcode anything
+# repo-specific. A drift-check guards the three copies.
 
 on:
   release:
@@ -15,32 +20,34 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to publish to the AUR (e.g. v0.12.0)'
+        description: 'Release tag to publish to the AUR (e.g. v1.2.3)'
         required: true
+        type: string
 
 jobs:
   aur:
-    name: Publish ${{ matrix.aur_pkg }} to the AUR
+    name: Publish ${{ github.event.repository.name }}${{ matrix.suffix }} to the AUR
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     strategy:
       fail-fast: false
       matrix:
         include:
-          - aur_pkg: mousehop
+          - suffix: ''
             pkgbuild_dir: aur
             kind: source
-          - aur_pkg: mousehop-bin
+          - suffix: '-bin'
             pkgbuild_dir: aur-bin
             kind: bin
-          - aur_pkg: mousehop-git
+          - suffix: '-git'
             pkgbuild_dir: aur-git
             kind: git
     env:
-      AUR_PKG: ${{ matrix.aur_pkg }}
+      AUR_PKG: ${{ github.event.repository.name }}${{ matrix.suffix }}
       PKGBUILD_DIR: ${{ matrix.pkgbuild_dir }}
       VARIANT_KIND: ${{ matrix.kind }}
-      GH_REPO: jondkinney/mousehop
+      GH_REPO: ${{ github.repository }}
+      APP: ${{ github.event.repository.name }}
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
       - name: Install tooling
@@ -54,8 +61,8 @@ jobs:
           ver="${TAG#v}"
 
           # SSH access to the AUR. Inline -o flags via GIT_SSH_COMMAND
-          # so we don't depend on ~/.ssh/config being honored — accept-new
-          # TOFUs the AUR's host key on first connect.
+          # so we don't depend on ~/.ssh/config being honored —
+          # accept-new TOFUs the AUR's host key on first connect.
           install -dm700 /root/.ssh
           echo "$AUR_SSH_KEY" > /root/.ssh/id_aur
           chmod 600 /root/.ssh/id_aur
@@ -75,55 +82,53 @@ jobs:
           # Drop in the variant's PKGBUILD.
           cp "app/packaging/${PKGBUILD_DIR}/PKGBUILD" aur/PKGBUILD
 
-          # Variant-specific version pin + tarball wait.
+          # Pin the version. source/bin reset pkgrel to 1; git's static
+          # pkgver= line is metadata only (pkgver() regenerates it at
+          # build time), so it keeps its pkgrel.
           case "$VARIANT_KIND" in
-            source)
-              sed -i "s/^pkgver=.*/pkgver=$ver/;s/^pkgrel=.*/pkgrel=1/" aur/PKGBUILD
-              ;;
-            bin)
-              # Multi-arch tarballs built in parallel by the
-              # linux-x86_64 / linux-arm64 jobs in release.yml. Wait
-              # up to ~30 min for both to land on the GitHub Release
-              # before updpkgsums tries to fetch them.
-              sed -i "s/^pkgver=.*/pkgver=$ver/;s/^pkgrel=.*/pkgrel=1/" aur/PKGBUILD
-              x86_url="https://github.com/${GH_REPO}/releases/download/${TAG}/mousehop-${ver}-x86_64.tar.gz"
-              arm_url="https://github.com/${GH_REPO}/releases/download/${TAG}/mousehop-${ver}-aarch64.tar.gz"
-              for i in $(seq 1 90); do
-                if curl -sfIL -o /dev/null "$x86_url" && curl -sfIL -o /dev/null "$arm_url"; then
-                  echo "both binary tarballs present"
-                  break
-                fi
-                echo "waiting for binary tarballs (attempt $i/90)..."
-                sleep 20
-              done
-              ;;
-            git)
-              # Static pkgver= line is metadata only — the pkgver()
-              # function regenerates it at build time. Bump it to the
-              # new tag so the AUR page shows the current version.
-              # sha256sums=('SKIP'), so no updpkgsums needed.
-              sed -i "s/^pkgver=.*/pkgver=$ver/" aur/PKGBUILD
-              ;;
+            source|bin) sed -i "s/^pkgver=.*/pkgver=$ver/;s/^pkgrel=.*/pkgrel=1/" aur/PKGBUILD ;;
+            git)        sed -i "s/^pkgver=.*/pkgver=$ver/" aur/PKGBUILD ;;
           esac
 
           # makepkg / updpkgsums refuse to run as root.
           useradd -m builder
           chown -R builder:builder aur
 
+          # The bin variant installs the prebuilt release tarballs. Its
+          # PKGBUILD's source URLs point at assets that release.yml
+          # builds in parallel with this workflow — wait (up to ~30
+          # min) for each to land before updpkgsums tries to hash them.
+          # URLs are read out of the PKGBUILD via printsrcinfo, so this
+          # workflow doesn't hardcode the per-repo tarball naming.
+          if [ "$VARIANT_KIND" = bin ]; then
+            urls=$(sudo -H -u builder bash -c 'cd aur && makepkg --printsrcinfo' \
+                   | awk -F' = ' '$1 ~ /source/ {print $2}' \
+                   | sed 's#.*::##' \
+                   | grep -E '^https?://' | sort -u)
+            for url in $urls; do
+              for i in $(seq 1 90); do
+                if curl -sfIL -o /dev/null "$url"; then
+                  echo "present: $url"
+                  break
+                fi
+                echo "waiting for $url (attempt $i/90)..."
+                sleep 20
+              done
+            done
+          fi
+
+          # Refresh sums (source/bin) and regenerate .SRCINFO. git's
+          # sha256sums are SKIP, so it only needs .SRCINFO.
           case "$VARIANT_KIND" in
-            source|bin)
-              sudo -H -u builder bash -c 'cd aur && updpkgsums && makepkg --printsrcinfo > .SRCINFO'
-              ;;
-            git)
-              sudo -H -u builder bash -c 'cd aur && makepkg --printsrcinfo > .SRCINFO'
-              ;;
+            source|bin) sudo -H -u builder bash -c 'cd aur && updpkgsums && makepkg --printsrcinfo > .SRCINFO' ;;
+            git)        sudo -H -u builder bash -c 'cd aur && makepkg --printsrcinfo > .SRCINFO' ;;
           esac
 
           # Commit + push (no-op if nothing changed).
           git config --global --add safe.directory "$PWD/aur"
           cd aur
-          git config user.name 'mousehop release'
-          git config user.email 'release@users.noreply.github.com'
+          git config user.name  "${APP}-release-bot"
+          git config user.email "${APP}-release-bot@users.noreply.github.com"
           git add PKGBUILD .SRCINFO
           git diff --cached --quiet || git commit -m "Update to $ver"
           git push --quiet -u origin master
