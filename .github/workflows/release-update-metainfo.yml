@@ -2,13 +2,16 @@ name: release-update-metainfo
 
 # Prepend a per-version <release><description> block to the Flatpak
 # metainfo XML whenever a new GitHub Release is published. The
-# description body is parsed from the matching CHANGELOG.md
-# section so Flathub's Version-history shows real notes instead
-# of an empty stub.
+# description body is parsed from the matching CHANGELOG.md section so
+# Flathub's Version-history shows real notes instead of an empty stub.
 #
-# Mirrors release-update-site.yml's "fire on release, mutate a
-# file in this repo, push back" shape. Idempotent: if the
-# metainfo already references the version, the run is a no-op.
+# Idempotent: if the metainfo already references the version, the run
+# is a no-op.
+#
+# SHARED WORKFLOW — this file is byte-identical across
+# jondkinney/{mousehop,tensaku,vernier}. Every per-repo value is
+# derived from the github context at runtime; do not hardcode anything
+# repo-specific. A drift-check guards the three copies.
 
 on:
   release:
@@ -16,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to record (e.g. v0.12.0)'
+        description: 'Release tag to record (e.g. v1.2.3)'
         required: true
         type: string
 
@@ -26,10 +29,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       # Needed so the default GITHUB_TOKEN can push the follow-up
-      # commit back to main.
+      # commit back to the default branch.
       contents: write
     env:
-      METAINFO: build-aux/com.mousehop.Mousehop.metainfo.xml
       CHANGELOG: CHANGELOG.md
     steps:
       - name: Resolve tag / version / date
@@ -45,11 +47,24 @@ jobs:
           echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "date=$DATE"       >> "$GITHUB_OUTPUT"
-          echo "Recording $TAG (version $VERSION, date $DATE) in $METAINFO"
+          echo "Recording $TAG (version $VERSION, date $DATE)"
 
       - uses: actions/checkout@v6
         with:
-          ref: main
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Locate the AppStream metainfo file
+        # Per-repo path (build-aux/com.X.Y.metainfo.xml, or root-level)
+        # — discovered, not hardcoded, so this file stays identical
+        # across repos.
+        run: |
+          METAINFO=$(git ls-files '*.metainfo.xml' | head -1)
+          if [ -z "$METAINFO" ]; then
+            echo "no *.metainfo.xml tracked in this repo" >&2
+            exit 1
+          fi
+          echo "Using metainfo: $METAINFO"
+          echo "METAINFO=$METAINFO" >> "$GITHUB_ENV"
 
       - name: Skip if metainfo already references this version
         id: idempotency
@@ -63,7 +78,6 @@ jobs:
 
       - name: Generate <release> XML block from CHANGELOG
         if: steps.idempotency.outputs.changed == 'true'
-        id: gen
         run: |
           python3 scripts/gen_appstream_release.py \
             "$CHANGELOG" \
@@ -76,8 +90,8 @@ jobs:
         if: steps.idempotency.outputs.changed == 'true'
         run: |
           # Python over sed to avoid escape pain with the multi-line
-          # block. Inserts the new <release> right after the
-          # <releases> opening tag with 4-space indentation.
+          # block. Inserts the new <release> right after the <releases>
+          # opening tag with 4-space indentation.
           python3 - "$METAINFO" /tmp/release.xml <<'PY'
           import pathlib, re, sys
           meta = pathlib.Path(sys.argv[1])
@@ -99,8 +113,8 @@ jobs:
       - name: Commit + push
         if: steps.idempotency.outputs.changed == 'true'
         run: |
-          git config user.name  "mousehop-release-bot"
-          git config user.email "mousehop-release-bot@users.noreply.github.com"
+          git config user.name  "${{ github.event.repository.name }}-release-bot"
+          git config user.email "${{ github.event.repository.name }}-release-bot@users.noreply.github.com"
           git add "$METAINFO"
           git commit -m "chore(metainfo): record release ${{ steps.meta.outputs.tag }}"
-          git push origin main
+          git push origin HEAD:${{ github.event.repository.default_branch }}
