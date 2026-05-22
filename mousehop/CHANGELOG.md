@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.6](https://github.com/jondkinney/mousehop/compare/v0.11.5...v0.11.6) - 2026-05-22
+
+### Fixed
+
+- *(emulation)* refresh display bounds when monitors change
+
 ## [0.11.5](https://github.com/jondkinney/mousehop/compare/v0.11.4...v0.11.5) - 2026-05-21
 
 ### Added
