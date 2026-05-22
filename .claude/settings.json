@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path // empty' | { read -r f; case \"$f\" in *.rs) root=$(git -C \"$(dirname \"$f\")\" rev-parse --show-toplevel 2>/dev/null) && cargo fmt --all --manifest-path \"$root/Cargo.toml\" ;; esac; } 2>/dev/null || true",
+            "statusMessage": "Running cargo fmt"
+          }
+        ]
+      }
+    ]
+  }
+}
