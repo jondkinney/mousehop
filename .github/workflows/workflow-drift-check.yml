@@ -1,0 +1,92 @@
+name: workflow-drift-check
+
+# Guards the SHARED release-pipeline workflows — the files deliberately
+# kept byte-identical across jondkinney/{mousehop,tensaku,vernier}
+# rather than factored into a reusable-workflow repo (see
+# release-pipeline-guide.md for the rationale).
+#
+# This job fetches each shared file from the other two repos and diffs
+# it against the local copy; any difference fails the run.
+#
+# It is NOT a per-PR gate: a PR check would red-flag the first repo of
+# a deliberate three-repo update. It runs post-merge (push to main) for
+# prompt detection, on a daily schedule as a backstop for drift from
+# direct pushes, and on demand. While you roll a shared-workflow change
+# through all three repos, expect this to be red until the last one
+# lands — that transient is the cost of vendoring over centralizing.
+#
+# SHARED WORKFLOW — this file is itself byte-identical across the three
+# repos and is included in the set it checks.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aur-publish.yml'
+      - '.github/workflows/release-flatpak.yml'
+      - '.github/workflows/release-update-metainfo.yml'
+      - '.github/workflows/release-update-site.yml'
+      - '.github/workflows/workflow-drift-check.yml'
+  schedule:
+    # Daily 07:17 UTC — backstop for drift introduced by a direct push
+    # that the path-filtered push trigger above somehow missed.
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: Check shared workflows for drift
+    runs-on: ubuntu-latest
+    env:
+      # Every repo that carries the shared workflows. This list is
+      # identical in all copies of this file; the running repo is
+      # skipped via github.repository.
+      COHORT: jondkinney/mousehop jondkinney/vernier jondkinney/tensaku
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Diff shared workflows against the rest of the cohort
+        run: |
+          set -uo pipefail
+
+          # Files that must stay byte-identical across the cohort.
+          shared=(
+            .github/workflows/aur-publish.yml
+            .github/workflows/release-flatpak.yml
+            .github/workflows/release-update-metainfo.yml
+            .github/workflows/release-update-site.yml
+            .github/workflows/workflow-drift-check.yml
+          )
+
+          status=0
+          for repo in $COHORT; do
+            [ "$repo" = "${{ github.repository }}" ] && continue
+            for f in "${shared[@]}"; do
+              peer="$(mktemp)"
+              url="https://raw.githubusercontent.com/$repo/main/$f"
+              if ! curl -fsSL -o "$peer" "$url"; then
+                echo "::error file=$f::cannot fetch $f from $repo — missing there?"
+                status=1
+                rm -f "$peer"
+                continue
+              fi
+              if ! diff -u --label "${{ github.repository }}/$f" "$f" \
+                          --label "$repo/$f" "$peer"; then
+                echo "::error file=$f::$f differs between ${{ github.repository }} and $repo"
+                status=1
+              fi
+              rm -f "$peer"
+            done
+          done
+
+          echo
+          if [ "$status" -ne 0 ]; then
+            echo "Shared release-pipeline workflows have DRIFTED."
+            echo "They must stay byte-identical across: $COHORT"
+            echo "Copy the intended version into every repo, then re-run."
+            exit 1
+          fi
+          echo "All shared workflows are in sync across the cohort."
