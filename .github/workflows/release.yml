@@ -15,6 +15,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Each build job attaches its own asset to the Release directly via
+# `gh release upload --clobber` (idempotent on re-run). This replaces a
+# trailing job that round-tripped every artifact through actions/
+# upload-artifact + download-artifact — a flaky platform now fails on
+# its own without blocking the others' uploads.
+permissions:
+  contents: write
+
 jobs:
   linux-release-build:
     runs-on: ubuntu-22.04
@@ -43,11 +51,11 @@ jobs:
            LICENSE NOTICE \
            "$stage/"
         tar -czf "${stage}.tar.gz" "$stage"
-    - name: Upload build artifact
-      uses: actions/upload-artifact@v6
-      with:
-        name: mousehop-linux-x86_64
-        path: mousehop-*-x86_64.tar.gz
+    - name: Attach tarball to the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      run: gh release upload "$TAG" mousehop-*-x86_64.tar.gz --clobber --repo "$GITHUB_REPOSITORY"
 
   linux-arm64-release-build:
     runs-on: ubuntu-22.04-arm
@@ -73,11 +81,11 @@ jobs:
            LICENSE NOTICE \
            "$stage/"
         tar -czf "${stage}.tar.gz" "$stage"
-    - name: Upload build artifact
-      uses: actions/upload-artifact@v6
-      with:
-        name: mousehop-linux-arm64
-        path: mousehop-*-aarch64.tar.gz
+    - name: Attach tarball to the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      run: gh release upload "$TAG" mousehop-*-aarch64.tar.gz --clobber --repo "$GITHUB_REPOSITORY"
 
   windows-release-build:
     runs-on: windows-latest
@@ -88,7 +96,7 @@ jobs:
     # needed for cache restore
     - name: create gtk dir
       run: mkdir C:\gtk-build\gtk\x64\release
-    - uses: actions/cache@v3
+    - uses: actions/cache@v4
       id: cache
       with:
         path: c:/gtk-build/gtk/x64/release/**
@@ -126,11 +134,11 @@ jobs:
         Get-Childitem -Path "C:\\gtk-build\\gtk\\x64\\release\\bin\\*.dll" -File -Recurse | Copy-Item -Destination "mousehop-windows"
         Copy-Item -Path "target\release\mousehop.exe" -Destination "mousehop-windows"
         Compress-Archive -Path "mousehop-windows\*" -DestinationPath mousehop-windows-x86_64.zip
-    - name: Upload build artifact
-      uses: actions/upload-artifact@v6
-      with:
-        name: mousehop-windows-x86_64
-        path: mousehop-windows-x86_64.zip
+    - name: Attach archive to the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      run: gh release upload "$env:TAG" mousehop-windows-x86_64.zip --clobber --repo "$env:GITHUB_REPOSITORY"
 
   macos-release-build:
     runs-on: macos-15-intel
@@ -185,11 +193,11 @@ jobs:
           --no-internet-enable \
           "$dmg" "$app"
         scripts/sign-and-notarize.sh --dmg "$dmg"
-    - name: Upload build artifact
-      uses: actions/upload-artifact@v6
-      with:
-        name: mousehop-macos-intel
-        path: target/release/bundle/osx/mousehop-macos-intel.dmg
+    - name: Attach DMG to the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      run: gh release upload "$TAG" target/release/bundle/osx/mousehop-macos-intel.dmg --clobber --repo "$GITHUB_REPOSITORY"
 
   macos-arm64-release-build:
     runs-on: macos-15
@@ -244,30 +252,11 @@ jobs:
           --no-internet-enable \
           "$dmg" "$app"
         scripts/sign-and-notarize.sh --dmg "$dmg"
-    - name: Upload build artifact
-      uses: actions/upload-artifact@v6
-      with:
-        name: mousehop-macos-arm64
-        path: target/release/bundle/osx/mousehop-macos-arm64.dmg
-
-  release:
-    name: "Attach binaries to the release"
-    needs: [windows-release-build, linux-release-build, linux-arm64-release-build, macos-release-build, macos-arm64-release-build]
-    runs-on: "ubuntu-latest"
-    steps:
-    - name: Download build artifacts
-      uses: actions/download-artifact@v4
-    - name: Upload binaries to the release
-      uses: softprops/action-gh-release@v2
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        tag_name: ${{ github.event.release.tag_name || inputs.tag }}
-        files: |
-          mousehop-linux-x86_64/*.tar.gz
-          mousehop-linux-arm64/*.tar.gz
-          mousehop-macos-intel/mousehop-macos-intel.dmg
-          mousehop-macos-arm64/mousehop-macos-arm64.dmg
-          mousehop-windows-x86_64/mousehop-windows-x86_64.zip
+    - name: Attach DMG to the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      run: gh release upload "$TAG" target/release/bundle/osx/mousehop-macos-arm64.dmg --clobber --repo "$GITHUB_REPOSITORY"
 
   # Flatpak bundle build + upload now lives in release-flatpak.yml,
   # gated on the same `release: published` trigger. The split lets a

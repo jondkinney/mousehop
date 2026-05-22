@@ -57,7 +57,7 @@ jobs:
         # Falls through to the tag on release events (where
         # inputs.ref is empty) and on dispatches that leave `ref`
         # blank. Only an explicit override changes the source.
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ inputs.ref || steps.tag.outputs.tag }}
 
