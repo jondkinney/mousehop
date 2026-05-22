@@ -153,7 +153,15 @@ jobs:
     - name: install dependencies
       run: |
         brew install gtk4 libadwaita imagemagick librsvg create-dmg
+    - name: Scope rust-cache to the runner image
+      # See ci.yml: keys the cache to the runner image so a Homebrew
+      # glib/gtk4 bump can't leave stale `-L .../Cellar/glib/<ver>`
+      # paths in cached build-script output.
+      shell: bash
+      run: echo "CACHE_IMAGE=${ImageOS:-}-${ImageVersion:-}" >> "$GITHUB_ENV"
     - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ env.CACHE_IMAGE }}
     - name: Release Build
       run: |
         cargo build --release
@@ -212,7 +220,15 @@ jobs:
     - name: install dependencies
       run: |
         brew install gtk4 libadwaita imagemagick librsvg create-dmg
+    - name: Scope rust-cache to the runner image
+      # See ci.yml: keys the cache to the runner image so a Homebrew
+      # glib/gtk4 bump can't leave stale `-L .../Cellar/glib/<ver>`
+      # paths in cached build-script output.
+      shell: bash
+      run: echo "CACHE_IMAGE=${ImageOS:-}-${ImageVersion:-}" >> "$GITHUB_ENV"
     - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ env.CACHE_IMAGE }}
     - name: Release Build
       run: |
         cargo build --release

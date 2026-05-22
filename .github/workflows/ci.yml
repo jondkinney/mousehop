@@ -44,7 +44,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Scope rust-cache to the runner image
+        # ImageVersion changes whenever GitHub refreshes the runner
+        # image — which is also when preinstalled / Homebrew libs
+        # (notably glib + gtk4) move. Folding it into the cache key
+        # stops a cached build script's baked-in `-L /opt/homebrew/
+        # Cellar/glib/<ver>/lib` from outliving the Cellar dir it
+        # points at (`ld: library 'gio-2.0' not found`).
+        shell: bash
+        run: echo "CACHE_IMAGE=${ImageOS:-}-${ImageVersion:-}" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.CACHE_IMAGE }}
 
       - name: Install Linux deps
         if: runner.os == 'Linux'
