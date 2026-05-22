@@ -47,7 +47,7 @@ jobs:
           echo "date=$DATE"       >> "$GITHUB_OUTPUT"
           echo "Recording $TAG (version $VERSION, date $DATE) in $METAINFO"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: main
 
