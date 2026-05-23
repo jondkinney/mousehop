@@ -137,19 +137,20 @@ impl MousehopListener {
         let conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>> =
             Rc::new(AsyncMutex::new(Vec::new()));
 
-        // Bind one listener per local IPv4 address (skip loopback +
-        // link-local) instead of a single 0.0.0.0:port listener. With
-        // a single 0.0.0.0 bind on a multi-homed host, replies use
-        // the kernel's preferred outbound interface as source IP —
-        // which may not match the IP the peer dialed, breaking QUIC
-        // 4-tuple matching. Per-IP binds make replies symmetric
-        // automatically: each listener's reply socket is bound to a
-        // specific IP, so the kernel uses *that* IP as source.
-        let initial_addrs = enumerate_listenable_ipv4();
+        // Bind one listener per local address (v4 + v6, skipping
+        // loopback / link-local / multicast) instead of a single
+        // wildcard listener. With a single 0.0.0.0 / [::] bind on a
+        // multi-homed host, replies use the kernel's preferred
+        // outbound interface as source IP — which may not match the
+        // IP the peer dialed, breaking DTLS 4-tuple matching.
+        // Per-IP binds make replies symmetric automatically: each
+        // listener's reply socket is bound to a specific IP, so the
+        // kernel uses *that* IP as source.
+        let initial_addrs = enumerate_listenable_addrs();
         if initial_addrs.is_empty() {
             // Fall back to 0.0.0.0 so we at least listen somewhere if
             // interface enumeration fails (very unusual).
-            log::warn!("no listenable IPv4 addresses found; falling back to 0.0.0.0");
+            log::warn!("no listenable IP addresses found; falling back to 0.0.0.0");
         }
         let mut listeners: HashMap<IpAddr, ListenerSlot> = HashMap::new();
         let mut bound_count = 0usize;
@@ -270,12 +271,32 @@ impl Stream for MousehopListener {
     }
 }
 
-/// Enumerate local IPv4 addresses suitable for binding a public
-/// listener: skip loopback (127.0.0.0/8) and link-local
-/// (169.254.0.0/16) since neither is reachable from a peer. IPv6
-/// is intentionally omitted — mousehop is IPv4-only on the wire
-/// today.
-fn enumerate_listenable_ipv4() -> Vec<IpAddr> {
+/// Whether an address is worth binding a DTLS listener to: a remote
+/// peer must be able to reach it. Excludes loopback, link-local
+/// (needs a scope id we don't carry), unspecified, and multicast.
+/// Used by both the initial enumeration and the live `IfEvent::Up`
+/// filter so the two stay in lockstep on what counts as listenable.
+fn is_listenable_addr(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                // fe80::/10 — link-local; reachable only with a
+                // scope id which neither our mDNS records nor the
+                // peer config carry, so a bind that succeeds still
+                // can't accept connections from a remote peer.
+                && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    }
+}
+
+/// Enumerate local addresses suitable for binding a DTLS listener.
+/// Returns both IPv4 and IPv6 addresses; `is_listenable_addr` drops
+/// the ones a remote peer cannot reach (loopback, link-local,
+/// unspecified, multicast).
+fn enumerate_listenable_addrs() -> Vec<IpAddr> {
     let ifaces = match if_addrs::get_if_addrs() {
         Ok(v) => v,
         Err(e) => {
@@ -285,12 +306,11 @@ fn enumerate_listenable_ipv4() -> Vec<IpAddr> {
     };
     ifaces
         .into_iter()
-        .filter_map(|iface| match iface.addr {
-            if_addrs::IfAddr::V4(v4) => Some(v4.ip),
-            if_addrs::IfAddr::V6(_) => None,
+        .map(|iface| match iface.addr {
+            if_addrs::IfAddr::V4(v4) => IpAddr::V4(v4.ip),
+            if_addrs::IfAddr::V6(v6) => IpAddr::V6(v6.ip),
         })
-        .filter(|ip| !ip.is_loopback() && !ip.is_link_local())
-        .map(IpAddr::V4)
+        .filter(|ip| is_listenable_addr(*ip))
         .collect()
 }
 
@@ -413,7 +433,7 @@ fn spawn_supervisor_task(
             tokio::select! {
                 _ = reconcile_tick.tick() => {
                     let current_ips: HashSet<IpAddr> =
-                        enumerate_listenable_ipv4().into_iter().collect();
+                        enumerate_listenable_addrs().into_iter().collect();
                     let to_drop: Vec<IpAddr> = listeners
                         .keys()
                         .filter(|ip| !current_ips.contains(*ip))
@@ -468,12 +488,7 @@ fn spawn_supervisor_task(
                 } => match ev {
                     Ok(if_watch::IfEvent::Up(net)) => {
                         let ip = net.addr();
-                        let usable = if let IpAddr::V4(v4) = ip {
-                            !v4.is_loopback() && !v4.is_link_local()
-                        } else {
-                            false
-                        };
-                        if usable && !listeners.contains_key(&ip) {
+                        if is_listenable_addr(ip) && !listeners.contains_key(&ip) {
                             match try_bind_listener(ip, port, &cfg).await {
                                 Ok(l) => {
                                     let task = spawn_accept_task(
@@ -501,7 +516,7 @@ fn spawn_supervisor_task(
                     let new_port = p.expect("channel closed");
                     listeners.clear(); // Drop aborts each accept task
                     let mut bound = 0usize;
-                    let addrs = enumerate_listenable_ipv4();
+                    let addrs = enumerate_listenable_addrs();
                     for ip in &addrs {
                         match try_bind_listener(*ip, new_port, &cfg).await {
                             Ok(l) => {
