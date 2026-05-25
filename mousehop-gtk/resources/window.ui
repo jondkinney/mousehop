@@ -347,6 +347,48 @@
                         </child>
                       </object>
                     </child>
+                    <child>
+                      <object class="AdwPreferencesGroup">
+                        <property name="title" translatable="yes">About</property>
+                        <child>
+                          <object class="AdwActionRow" id="about_version_row">
+                            <property name="title" translatable="yes">Version</property>
+                            <property name="subtitle">—</property>
+                            <child type="suffix">
+                              <object class="GtkButton" id="about_copy_button">
+                                <property name="icon-name">edit-copy-symbolic</property>
+                                <property name="valign">center</property>
+                                <property name="tooltip-text" translatable="yes">Copy full version details</property>
+                                <signal name="clicked" handler="handle_copy_version" swapped="true"/>
+                                <style>
+                                  <class name="flat"/>
+                                </style>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwActionRow" id="about_build_row">
+                            <property name="title" translatable="yes">Built</property>
+                            <property name="subtitle">—</property>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwActionRow" id="about_source_row">
+                            <property name="title" translatable="yes">Source</property>
+                            <property name="subtitle">—</property>
+                            <property name="activatable">true</property>
+                            <signal name="activated" handler="handle_open_source" swapped="true"/>
+                            <child type="suffix">
+                              <object class="GtkImage">
+                                <property name="icon-name">external-link-symbolic</property>
+                                <property name="valign">center</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
                     </object>
                   </property>
                   </object>

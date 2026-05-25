@@ -37,6 +37,34 @@ pub(crate) fn local_commit_str() -> String {
         .to_string()
 }
 
+/// Build-time facts surfaced in the preferences window's About
+/// section. The main binary is the one that pulls in `shadow-rs`,
+/// so it constructs this and hands it off to [`run`] — that way
+/// the GTK crate doesn't need its own `build.rs` or a parallel
+/// `shadow!` macro invocation.
+pub struct BuildInfo {
+    /// 8-byte ASCII short commit; used both for the peer-version
+    /// mismatch indicator and the About section.
+    pub local_commit: [u8; 8],
+    /// Workspace package version, e.g. `"0.11.7"`.
+    pub version: &'static str,
+    /// Human-readable build timestamp, e.g. `"2026-05-22 15:33:42 +00:00"`.
+    pub build_time: &'static str,
+    /// Compiler banner, e.g. `"rustc 1.95.0 (59807616e 2026-04-14)"`.
+    pub rust_version: &'static str,
+    /// Upstream source URL, opened when the About → Source row is
+    /// activated.
+    pub source_url: &'static str,
+}
+
+pub(crate) static BUILD_INFO: OnceLock<BuildInfo> = OnceLock::new();
+
+/// Accessor for the About section. Returns `None` only during the
+/// brief window between process start and [`run`] storing the info.
+pub(crate) fn build_info() -> Option<&'static BuildInfo> {
+    BUILD_INFO.get()
+}
+
 use mousehop_ipc::FrontendEvent;
 
 use adw::Application;
@@ -90,11 +118,12 @@ pub(crate) fn request_quit_with_backstop(app: &adw::Application) {
     app.quit();
 }
 
-pub fn run(local_commit: [u8; 8]) -> Result<(), GtkError> {
+pub fn run(info: BuildInfo) -> Result<(), GtkError> {
     log::debug!("running gtk frontend");
     LOCAL_COMMIT
-        .set(local_commit)
+        .set(info.local_commit)
         .expect("local_commit set once");
+    BUILD_INFO.set(info).ok().expect("BUILD_INFO set once");
 
     // Refuse to open a second preferences window. Held until `run`
     // returns — i.e. for the whole GUI lifetime, including the joined

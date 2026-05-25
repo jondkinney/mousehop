@@ -92,7 +92,13 @@ fn run() -> Result<(), MousehopError> {
             #[cfg(feature = "gtk")]
             {
                 let mut service = start_service()?;
-                let res = mousehop_gtk::run(config::local_commit());
+                let res = mousehop_gtk::run(mousehop_gtk::BuildInfo {
+                    local_commit: config::local_commit(),
+                    version: config::build::PKG_VERSION,
+                    build_time: config::build::BUILD_TIME,
+                    rust_version: config::build::RUST_VERSION,
+                    source_url: "https://github.com/jondkinney/mousehop",
+                });
 
                 // Bound the daemon-child cleanup so a wedged daemon
                 // (CGEventTap stuck on macOS, hung syscall, etc.)
