@@ -63,6 +63,15 @@ pub(crate) struct MousehopListener {
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
     request_port_change: Sender<u16>,
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
+    /// macOS-only: held for its `Drop` side effect (stops the
+    /// CFRunLoop in the power-observer thread). The observer sends
+    /// `()` into the wake channel on system-wake; the supervisor
+    /// task drains that channel and force-closes peer conns so
+    /// reconnect happens immediately after a screensaver/sleep
+    /// dismissal instead of waiting out `RECV_IDLE_TIMEOUT`.
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    power_observer: crate::macos_power::PowerObserver,
 }
 
 type VerifyPeerCertificateFn = Arc<
@@ -191,6 +200,18 @@ impl MousehopListener {
             }
         }
 
+        // macOS wake → force-close-all-conns plumbing. On non-macOS
+        // the receiver is `None` and the supervisor's wake arm stays
+        // permanently pending — no behavior change there.
+        #[cfg(target_os = "macos")]
+        let (power_observer, wake_rx) = {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let observer = crate::macos_power::PowerObserver::spawn(tx).await;
+            (observer, Some(rx))
+        };
+        #[cfg(not(target_os = "macos"))]
+        let wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>> = None;
+
         let listen_task = spawn_supervisor_task(
             port,
             cfg,
@@ -200,6 +221,7 @@ impl MousehopListener {
             connection_attempts,
             request_port_change_rx,
             port_changed_tx,
+            wake_rx,
         );
 
         Ok(Self {
@@ -209,6 +231,8 @@ impl MousehopListener {
             listen_task,
             port_changed,
             request_port_change,
+            #[cfg(target_os = "macos")]
+            power_observer,
         })
     }
 
@@ -401,6 +425,7 @@ fn spawn_supervisor_task(
     connection_attempts: Arc<Mutex<VecDeque<String>>>,
     mut request_port_change_rx: Receiver<u16>,
     port_changed_tx: Sender<Result<u16, ListenerCreationError>>,
+    mut wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
 ) -> JoinHandle<()> {
     spawn_local(async move {
         let mut port = initial_port;
@@ -512,6 +537,43 @@ fn spawn_supervisor_task(
                     }
                     Err(e) => log::debug!("if_watch error: {e}"),
                 },
+                wake = async {
+                    match wake_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // `None` would mean the wake-sender was dropped;
+                    // treat that as observer-gone, ignore further
+                    // wakes by stripping the receiver. `Some(())` is
+                    // the post-wake signal — force-close every
+                    // accepted DTLS slot. Each `read_loop`'s `recv`
+                    // errors out and the existing exit path removes
+                    // the slot, so a peer reconnect lands on a clean
+                    // accept instead of stacking on top of a stale
+                    // session for up to `RECV_IDLE_TIMEOUT`.
+                    match wake {
+                        Some(()) => {
+                            let g = conns.lock().await;
+                            log::info!(
+                                "supervisor: post-wake — closing {} peer conn(s) \
+                                 to force fresh reconnect",
+                                g.len()
+                            );
+                            for (a, c) in g.iter() {
+                                log::debug!("post-wake close: {a}");
+                                let _ = c.close().await;
+                            }
+                        }
+                        None => {
+                            log::debug!(
+                                "supervisor: wake channel closed; \
+                                 power observer no longer signaling"
+                            );
+                            wake_rx = None;
+                        }
+                    }
+                }
                 p = request_port_change_rx.recv() => {
                     let new_port = p.expect("channel closed");
                     listeners.clear(); // Drop aborts each accept task
@@ -548,6 +610,19 @@ fn spawn_supervisor_task(
     })
 }
 
+/// Max silence on an accepted DTLS session before it's torn down.
+/// DTLS rides UDP, which carries no FIN — a peer that goes silent
+/// (asleep, network-partitioned, daemon killed) leaves an otherwise-
+/// blocked `recv` waiting forever, and the slot in `conns` becomes
+/// a zombie that nothing else evicts. The connector side sends a
+/// `Ping` cycle roughly every 2s, so under healthy operation we see
+/// traffic well within this window; any longer gap means the path
+/// is broken in a way our reply attempts won't recover from. Set
+/// generously (3–5× the connector's natural cadence) so a paused
+/// peer process during e.g. a stop-the-world GC isn't mistaken for
+/// a dead connection.
+const RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(8);
+
 async fn read_loop(
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
     addr: SocketAddr,
@@ -568,7 +643,18 @@ async fn read_loop(
     let hello_ok = Rc::new(Cell::new(false));
     spawn_local(hello_watchdog(addr, conn.clone(), hello_ok.clone()));
 
-    while let Ok(n) = conn.recv(&mut b).await {
+    loop {
+        let n = match tokio::time::timeout(RECV_IDLE_TIMEOUT, conn.recv(&mut b)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => break,
+            Err(_) => {
+                log::warn!(
+                    "{addr}: no datagram in {RECV_IDLE_TIMEOUT:?} — closing stale connection"
+                );
+                let _ = conn.close().await;
+                break;
+            }
+        };
         if n == 0 {
             continue;
         }
