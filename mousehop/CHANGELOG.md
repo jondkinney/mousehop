@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.8](https://github.com/jondkinney/mousehop/compare/v0.11.7...v0.11.8) - 2026-05-26
+
+### Added
+
+- *(gtk)* About preferences group with copyable build info
+- *(macos)* wake-aware listener teardown for DTLS reconnect
+- *(network)* IPv6 dual-stack support
+
 ## [0.11.7](https://github.com/jondkinney/mousehop/compare/v0.11.6...v0.11.7) - 2026-05-22
 
 ### Other
