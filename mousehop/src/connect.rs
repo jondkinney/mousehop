@@ -105,8 +105,16 @@ async fn connect(
     cert: Certificate,
 ) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, MousehopConnectionError)> {
     log::info!("connecting to {addr} ...");
+    // Bind family must match the target's: a 0.0.0.0 socket fails
+    // `connect()` to a v6 peer with EAFNOSUPPORT, and vice versa.
+    // On a v4-only kernel the `[::]:0` bind itself errors out and
+    // the caller treats it as a normal per-address connect failure.
+    let bind_addr: &str = match addr {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
     let conn = Arc::new(
-        UdpSocket::bind("0.0.0.0:0")
+        UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| (addr, e.into()))?,
     );

@@ -63,6 +63,14 @@ pub struct Window {
     pub clipboard_privacy_row: TemplateChild<ActionRow>,
     #[template_child]
     pub clipboard_privacy_button: TemplateChild<Button>,
+    #[template_child]
+    pub about_version_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub about_build_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub about_source_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub about_copy_button: TemplateChild<Button>,
     pub clients: RefCell<Option<gio::ListStore>>,
     pub authorized: RefCell<Option<gio::ListStore>>,
     pub frontend_request_writer: RefCell<Option<FrontendRequestWriter>>,
@@ -208,6 +216,49 @@ impl Window {
         self.obj().open_fingerprint_dialog(None);
     }
 
+    #[template_callback]
+    fn handle_copy_version(&self, button: &Button) {
+        // Mirror the `mousehop --version` layout so a copy-paste into
+        // a bug report is self-describing.
+        let detail = match crate::build_info() {
+            Some(info) => {
+                let commit = crate::local_commit_str();
+                format!(
+                    "mousehop {ver}\ncommit: {commit}\nbuilt: {time}\nrust: {rust}",
+                    ver = info.version,
+                    time = info.build_time,
+                    rust = info.rust_version,
+                )
+            }
+            None => "mousehop (version info unavailable)".to_string(),
+        };
+        let display = gdk::Display::default().unwrap();
+        let clipboard = display.clipboard();
+        clipboard.set_text(&detail);
+        button.set_icon_name("emblem-ok-symbolic");
+        button.set_css_classes(&["success"]);
+        glib::spawn_future_local(clone!(
+            #[weak]
+            button,
+            async move {
+                glib::timeout_future_seconds(1).await;
+                button.set_icon_name("edit-copy-symbolic");
+                button.set_css_classes(&[]);
+            }
+        ));
+    }
+
+    #[template_callback]
+    fn handle_open_source(&self, _row: &ActionRow) {
+        let Some(url) = crate::build_info().map(|i| i.source_url) else {
+            return;
+        };
+        // `gtk::show_uri` covers our `v4_6` feature floor (UriLauncher
+        // is 4.10+). xdg-open on Linux, NSWorkspace on macOS,
+        // ShellExecute on Windows. Timestamp 0 ⇒ "now".
+        gtk::show_uri(Some(self.obj().as_ref()), url, 0);
+    }
+
     pub fn set_port(&self, port: u16) {
         self.port.set(port);
         if port == DEFAULT_PORT {
@@ -318,6 +369,41 @@ impl ObjectImpl for Window {
                 window.open_clipboard_privacy_window();
             }
         ));
+
+        // About section — populate from the build info `run()` stored.
+        // The template ships placeholder em-dashes for these subtitles
+        // so the rows look reasonable even if BUILD_INFO is somehow
+        // unset (programmer error: `run()` always sets it first).
+        if let Some(info) = crate::build_info() {
+            let commit = crate::local_commit_str();
+            self.about_version_row
+                .set_subtitle(&format!("{} · build {commit}", info.version));
+            // Render the build timestamp as `YYYY-MM-DD` (the shadow
+            // string also carries a clock + TZ that's noise here) and
+            // pair it with just the `rustc X.Y.Z` head of the compiler
+            // banner — the full banner has a git hash + date that
+            // adds clutter for no real diagnostic value in-app.
+            let built_date = info
+                .build_time
+                .split_whitespace()
+                .next()
+                .unwrap_or(info.build_time);
+            let rust_short = info
+                .rust_version
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.about_build_row
+                .set_subtitle(&format!("{built_date} · {rust_short}"));
+            // Strip the scheme for visual brevity; the activation
+            // handler still opens the full URL.
+            let pretty_url = info
+                .source_url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://");
+            self.about_source_row.set_subtitle(pretty_url);
+        }
     }
 }
 

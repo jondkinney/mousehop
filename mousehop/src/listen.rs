@@ -63,6 +63,15 @@ pub(crate) struct MousehopListener {
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
     request_port_change: Sender<u16>,
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
+    /// macOS-only: held for its `Drop` side effect (stops the
+    /// CFRunLoop in the power-observer thread). The observer sends
+    /// `()` into the wake channel on system-wake; the supervisor
+    /// task drains that channel and force-closes peer conns so
+    /// reconnect happens immediately after a screensaver/sleep
+    /// dismissal instead of waiting out `RECV_IDLE_TIMEOUT`.
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    power_observer: crate::macos_power::PowerObserver,
 }
 
 type VerifyPeerCertificateFn = Arc<
@@ -137,19 +146,20 @@ impl MousehopListener {
         let conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>> =
             Rc::new(AsyncMutex::new(Vec::new()));
 
-        // Bind one listener per local IPv4 address (skip loopback +
-        // link-local) instead of a single 0.0.0.0:port listener. With
-        // a single 0.0.0.0 bind on a multi-homed host, replies use
-        // the kernel's preferred outbound interface as source IP —
-        // which may not match the IP the peer dialed, breaking QUIC
-        // 4-tuple matching. Per-IP binds make replies symmetric
-        // automatically: each listener's reply socket is bound to a
-        // specific IP, so the kernel uses *that* IP as source.
-        let initial_addrs = enumerate_listenable_ipv4();
+        // Bind one listener per local address (v4 + v6, skipping
+        // loopback / link-local / multicast) instead of a single
+        // wildcard listener. With a single 0.0.0.0 / [::] bind on a
+        // multi-homed host, replies use the kernel's preferred
+        // outbound interface as source IP — which may not match the
+        // IP the peer dialed, breaking DTLS 4-tuple matching.
+        // Per-IP binds make replies symmetric automatically: each
+        // listener's reply socket is bound to a specific IP, so the
+        // kernel uses *that* IP as source.
+        let initial_addrs = enumerate_listenable_addrs();
         if initial_addrs.is_empty() {
             // Fall back to 0.0.0.0 so we at least listen somewhere if
             // interface enumeration fails (very unusual).
-            log::warn!("no listenable IPv4 addresses found; falling back to 0.0.0.0");
+            log::warn!("no listenable IP addresses found; falling back to 0.0.0.0");
         }
         let mut listeners: HashMap<IpAddr, ListenerSlot> = HashMap::new();
         let mut bound_count = 0usize;
@@ -190,6 +200,18 @@ impl MousehopListener {
             }
         }
 
+        // macOS wake → force-close-all-conns plumbing. On non-macOS
+        // the receiver is `None` and the supervisor's wake arm stays
+        // permanently pending — no behavior change there.
+        #[cfg(target_os = "macos")]
+        let (power_observer, wake_rx) = {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let observer = crate::macos_power::PowerObserver::spawn(tx).await;
+            (observer, Some(rx))
+        };
+        #[cfg(not(target_os = "macos"))]
+        let wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>> = None;
+
         let listen_task = spawn_supervisor_task(
             port,
             cfg,
@@ -199,6 +221,7 @@ impl MousehopListener {
             connection_attempts,
             request_port_change_rx,
             port_changed_tx,
+            wake_rx,
         );
 
         Ok(Self {
@@ -208,6 +231,8 @@ impl MousehopListener {
             listen_task,
             port_changed,
             request_port_change,
+            #[cfg(target_os = "macos")]
+            power_observer,
         })
     }
 
@@ -270,12 +295,32 @@ impl Stream for MousehopListener {
     }
 }
 
-/// Enumerate local IPv4 addresses suitable for binding a public
-/// listener: skip loopback (127.0.0.0/8) and link-local
-/// (169.254.0.0/16) since neither is reachable from a peer. IPv6
-/// is intentionally omitted — mousehop is IPv4-only on the wire
-/// today.
-fn enumerate_listenable_ipv4() -> Vec<IpAddr> {
+/// Whether an address is worth binding a DTLS listener to: a remote
+/// peer must be able to reach it. Excludes loopback, link-local
+/// (needs a scope id we don't carry), unspecified, and multicast.
+/// Used by both the initial enumeration and the live `IfEvent::Up`
+/// filter so the two stay in lockstep on what counts as listenable.
+fn is_listenable_addr(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                // fe80::/10 — link-local; reachable only with a
+                // scope id which neither our mDNS records nor the
+                // peer config carry, so a bind that succeeds still
+                // can't accept connections from a remote peer.
+                && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    }
+}
+
+/// Enumerate local addresses suitable for binding a DTLS listener.
+/// Returns both IPv4 and IPv6 addresses; `is_listenable_addr` drops
+/// the ones a remote peer cannot reach (loopback, link-local,
+/// unspecified, multicast).
+fn enumerate_listenable_addrs() -> Vec<IpAddr> {
     let ifaces = match if_addrs::get_if_addrs() {
         Ok(v) => v,
         Err(e) => {
@@ -285,12 +330,11 @@ fn enumerate_listenable_ipv4() -> Vec<IpAddr> {
     };
     ifaces
         .into_iter()
-        .filter_map(|iface| match iface.addr {
-            if_addrs::IfAddr::V4(v4) => Some(v4.ip),
-            if_addrs::IfAddr::V6(_) => None,
+        .map(|iface| match iface.addr {
+            if_addrs::IfAddr::V4(v4) => IpAddr::V4(v4.ip),
+            if_addrs::IfAddr::V6(v6) => IpAddr::V6(v6.ip),
         })
-        .filter(|ip| !ip.is_loopback() && !ip.is_link_local())
-        .map(IpAddr::V4)
+        .filter(|ip| is_listenable_addr(*ip))
         .collect()
 }
 
@@ -381,6 +425,7 @@ fn spawn_supervisor_task(
     connection_attempts: Arc<Mutex<VecDeque<String>>>,
     mut request_port_change_rx: Receiver<u16>,
     port_changed_tx: Sender<Result<u16, ListenerCreationError>>,
+    mut wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
 ) -> JoinHandle<()> {
     spawn_local(async move {
         let mut port = initial_port;
@@ -413,7 +458,7 @@ fn spawn_supervisor_task(
             tokio::select! {
                 _ = reconcile_tick.tick() => {
                     let current_ips: HashSet<IpAddr> =
-                        enumerate_listenable_ipv4().into_iter().collect();
+                        enumerate_listenable_addrs().into_iter().collect();
                     let to_drop: Vec<IpAddr> = listeners
                         .keys()
                         .filter(|ip| !current_ips.contains(*ip))
@@ -468,12 +513,7 @@ fn spawn_supervisor_task(
                 } => match ev {
                     Ok(if_watch::IfEvent::Up(net)) => {
                         let ip = net.addr();
-                        let usable = if let IpAddr::V4(v4) = ip {
-                            !v4.is_loopback() && !v4.is_link_local()
-                        } else {
-                            false
-                        };
-                        if usable && !listeners.contains_key(&ip) {
+                        if is_listenable_addr(ip) && !listeners.contains_key(&ip) {
                             match try_bind_listener(ip, port, &cfg).await {
                                 Ok(l) => {
                                     let task = spawn_accept_task(
@@ -497,11 +537,48 @@ fn spawn_supervisor_task(
                     }
                     Err(e) => log::debug!("if_watch error: {e}"),
                 },
+                wake = async {
+                    match wake_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // `None` would mean the wake-sender was dropped;
+                    // treat that as observer-gone, ignore further
+                    // wakes by stripping the receiver. `Some(())` is
+                    // the post-wake signal — force-close every
+                    // accepted DTLS slot. Each `read_loop`'s `recv`
+                    // errors out and the existing exit path removes
+                    // the slot, so a peer reconnect lands on a clean
+                    // accept instead of stacking on top of a stale
+                    // session for up to `RECV_IDLE_TIMEOUT`.
+                    match wake {
+                        Some(()) => {
+                            let g = conns.lock().await;
+                            log::info!(
+                                "supervisor: post-wake — closing {} peer conn(s) \
+                                 to force fresh reconnect",
+                                g.len()
+                            );
+                            for (a, c) in g.iter() {
+                                log::debug!("post-wake close: {a}");
+                                let _ = c.close().await;
+                            }
+                        }
+                        None => {
+                            log::debug!(
+                                "supervisor: wake channel closed; \
+                                 power observer no longer signaling"
+                            );
+                            wake_rx = None;
+                        }
+                    }
+                }
                 p = request_port_change_rx.recv() => {
                     let new_port = p.expect("channel closed");
                     listeners.clear(); // Drop aborts each accept task
                     let mut bound = 0usize;
-                    let addrs = enumerate_listenable_ipv4();
+                    let addrs = enumerate_listenable_addrs();
                     for ip in &addrs {
                         match try_bind_listener(*ip, new_port, &cfg).await {
                             Ok(l) => {
@@ -533,6 +610,19 @@ fn spawn_supervisor_task(
     })
 }
 
+/// Max silence on an accepted DTLS session before it's torn down.
+/// DTLS rides UDP, which carries no FIN — a peer that goes silent
+/// (asleep, network-partitioned, daemon killed) leaves an otherwise-
+/// blocked `recv` waiting forever, and the slot in `conns` becomes
+/// a zombie that nothing else evicts. The connector side sends a
+/// `Ping` cycle roughly every 2s, so under healthy operation we see
+/// traffic well within this window; any longer gap means the path
+/// is broken in a way our reply attempts won't recover from. Set
+/// generously (3–5× the connector's natural cadence) so a paused
+/// peer process during e.g. a stop-the-world GC isn't mistaken for
+/// a dead connection.
+const RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(8);
+
 async fn read_loop(
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
     addr: SocketAddr,
@@ -553,7 +643,18 @@ async fn read_loop(
     let hello_ok = Rc::new(Cell::new(false));
     spawn_local(hello_watchdog(addr, conn.clone(), hello_ok.clone()));
 
-    while let Ok(n) = conn.recv(&mut b).await {
+    loop {
+        let n = match tokio::time::timeout(RECV_IDLE_TIMEOUT, conn.recv(&mut b)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => break,
+            Err(_) => {
+                log::warn!(
+                    "{addr}: no datagram in {RECV_IDLE_TIMEOUT:?} — closing stale connection"
+                );
+                let _ = conn.close().await;
+                break;
+            }
+        };
         if n == 0 {
             continue;
         }
