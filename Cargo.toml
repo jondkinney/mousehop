@@ -12,16 +12,16 @@ members = [
 ]
 
 [workspace.package]
-version = "0.11.7"
+version = "0.11.8"
 
 [workspace.dependencies]
-input-event = { package = "mousehop-input-event", path = "input-event", version = "0.11.7" }
-input-capture = { package = "mousehop-input-capture", path = "input-capture", version = "0.11.7" }
-input-emulation = { package = "mousehop-input-emulation", path = "input-emulation", version = "0.11.7" }
-mousehop-proto = { path = "mousehop-proto", version = "0.11.7" }
-mousehop-ipc = { path = "mousehop-ipc", version = "0.11.7" }
-mousehop-cli = { path = "mousehop-cli", version = "0.11.7" }
-mousehop-gtk = { path = "mousehop-gtk", version = "0.11.7" }
+input-event = { package = "mousehop-input-event", path = "input-event", version = "0.11.8" }
+input-capture = { package = "mousehop-input-capture", path = "input-capture", version = "0.11.8" }
+input-emulation = { package = "mousehop-input-emulation", path = "input-emulation", version = "0.11.8" }
+mousehop-proto = { path = "mousehop-proto", version = "0.11.8" }
+mousehop-ipc = { path = "mousehop-ipc", version = "0.11.8" }
+mousehop-cli = { path = "mousehop-cli", version = "0.11.8" }
+mousehop-gtk = { path = "mousehop-gtk", version = "0.11.8" }
 
 [profile.release]
 codegen-units = 1
