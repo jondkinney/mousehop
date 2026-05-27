@@ -1,22 +1,23 @@
 name: workflow-drift-check
 
 # Guards the SHARED release-pipeline workflows — the files deliberately
-# kept byte-identical across jondkinney/{mousehop,tensaku,vernier}
+# kept byte-identical across
+# jondkinney/{hyprcorrect,mousehop,tensaku,vernier}
 # rather than factored into a reusable-workflow repo (see
 # release-pipeline-guide.md for the rationale).
 #
-# This job fetches each shared file from the other two repos and diffs
-# it against the local copy; any difference fails the run.
+# This job fetches each shared file from the other repos and diffs it
+# against the local copy; any difference fails the run.
 #
 # It is NOT a per-PR gate: a PR check would red-flag the first repo of
-# a deliberate three-repo update. It runs post-merge (push to main) for
-# prompt detection, on a daily schedule as a backstop for drift from
-# direct pushes, and on demand. While you roll a shared-workflow change
-# through all three repos, expect this to be red until the last one
+# a deliberate cohort-wide update. It runs post-merge (push to main)
+# for prompt detection, on a daily schedule as a backstop for drift
+# from direct pushes, and on demand. While you roll a shared-workflow
+# change through every repo, expect this to be red until the last one
 # lands — that transient is the cost of vendoring over centralizing.
 #
-# SHARED WORKFLOW — this file is itself byte-identical across the three
-# repos and is included in the set it checks.
+# SHARED WORKFLOW — this file is itself byte-identical across the
+# cohort and is included in the set it checks.
 
 on:
   push:
@@ -44,7 +45,7 @@ jobs:
       # Every repo that carries the shared workflows. This list is
       # identical in all copies of this file; the running repo is
       # skipped via github.repository.
-      COHORT: jondkinney/mousehop jondkinney/vernier jondkinney/tensaku
+      COHORT: jondkinney/hyprcorrect jondkinney/mousehop jondkinney/vernier jondkinney/tensaku
     steps:
       - uses: actions/checkout@v6
 

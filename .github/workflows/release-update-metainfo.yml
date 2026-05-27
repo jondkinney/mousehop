@@ -9,7 +9,7 @@ name: release-update-metainfo
 # is a no-op.
 #
 # SHARED WORKFLOW — this file is byte-identical across
-# jondkinney/{mousehop,tensaku,vernier}. Every per-repo value is
+# jondkinney/{hyprcorrect,mousehop,tensaku,vernier}. Every per-repo value is
 # derived from the github context at runtime; do not hardcode anything
 # repo-specific. A drift-check guards the three copies.
 

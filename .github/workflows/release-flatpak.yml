@@ -10,7 +10,7 @@ name: release-flatpak
 # FLATPAK_CI_IMAGE repository variable. Everything else is derived.
 #
 # SHARED WORKFLOW — this file is byte-identical across
-# jondkinney/{mousehop,tensaku,vernier}. Every per-repo value is
+# jondkinney/{hyprcorrect,mousehop,tensaku,vernier}. Every per-repo value is
 # derived from the github context or the FLATPAK_CI_IMAGE variable; do
 # not hardcode anything repo-specific. A drift-check guards the three
 # copies.
