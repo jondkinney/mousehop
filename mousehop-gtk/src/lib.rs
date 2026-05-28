@@ -3,6 +3,7 @@ mod client_object;
 mod client_row;
 mod clipboard_privacy_window;
 mod fingerprint_window;
+mod glyph_font;
 mod key_object;
 mod key_row;
 #[cfg(target_os = "linux")]
@@ -12,6 +13,7 @@ mod macos_privacy;
 #[cfg(target_os = "macos")]
 mod macos_status_item;
 mod modal_keys;
+mod release_shortcut;
 mod running_app_object;
 mod single_instance;
 mod window;
@@ -202,6 +204,12 @@ fn gtk_main() -> glib::ExitCode {
 
     app.connect_startup(|app| {
         load_icons();
+        configure_text_rendering();
+        // Register the bundled chord-chip faces with fontconfig before
+        // any window — and so any text layout — is built, so Pango's
+        // font map resolves the "omarchy"/"Adwaita Sans" families on its
+        // first use.
+        glyph_font::install();
         setup_actions(app);
         setup_menu(app);
     });
@@ -283,6 +291,33 @@ fn load_icons() {
     let display = &Display::default().expect("Could not connect to a display.");
     let icon_theme = IconTheme::for_display(display);
     icon_theme.add_resource_path("/com/mousehop/Mousehop/icons");
+}
+
+/// Pin font rasterization to the egui/hyprcorrect-equivalent
+/// rendering pipeline so the release-shortcut chip — and incidentally
+/// the rest of the prefs UI — matches hyprcorrect's crispness.
+///
+/// GTK's defaults (`gtk-xft-hintstyle=slight` + subpixel positioning
+/// with `rgba=rgb` on most LCDs) hint glyph outlines to whole-pixel
+/// boundaries and use color-fringed subpixel rasterization. Egui
+/// skips both: it rasterizes glyphs straight from the bezier
+/// outlines, no hinting, grayscale AA. Match that here so the
+/// chord-chip's Omarchy logo + modifier glyphs come out edge-clean
+/// instead of fuzzy + tinted.
+///
+/// Scope is app-wide because GTK only exposes these as
+/// `GtkSettings` properties — there's no per-widget knob. The
+/// downside is mild: body text loses fontconfig's slight pixel-snap
+/// optimization. On the 2x-scale Omarchy displays this app actually
+/// runs on, snapping is mostly a no-op anyway since 1pt already
+/// rasterizes to 2 physical pixels.
+fn configure_text_rendering() {
+    let Some(settings) = gtk::Settings::default() else {
+        return;
+    };
+    settings.set_gtk_xft_hintstyle(Some("hintnone"));
+    settings.set_gtk_xft_rgba(Some("none"));
+    settings.set_gtk_xft_antialias(1);
 }
 
 // Add application actions
@@ -479,6 +514,9 @@ fn build_ui(app: &Application) {
                     }
                     FrontendEvent::ReleaseThreshold(threshold) => {
                         window.set_release_threshold(threshold);
+                    }
+                    FrontendEvent::ReleaseBind(chord) => {
+                        window.set_release_bind(chord);
                     }
                     FrontendEvent::MdnsDiscovery(enabled) => {
                         window.set_mdns_discovery(enabled);

@@ -334,6 +334,13 @@ impl Service {
                 self.notify_frontend(FrontendEvent::ReleaseThreshold(threshold));
                 self.save_config().await;
             }
+            FrontendRequest::SetReleaseBind(bind) => {
+                self.config.set_release_bind(bind);
+                let canonical = self.config.release_bind();
+                self.capture.set_release_bind(canonical.clone());
+                self.notify_frontend(FrontendEvent::ReleaseBind(canonical));
+                self.save_config().await;
+            }
             FrontendRequest::SetIncomingPeerNaturalScroll(fp, natural_scroll) => {
                 self.set_incoming_peer_natural_scroll(fp, natural_scroll);
                 self.save_config().await;
@@ -812,6 +819,7 @@ impl Service {
         self.notify_frontend(FrontendEvent::ReleaseThreshold(
             self.config.release_threshold_px(),
         ));
+        self.notify_frontend(FrontendEvent::ReleaseBind(self.config.release_bind()));
         self.notify_frontend(FrontendEvent::MdnsDiscovery(self.config.mdns_discovery()));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));

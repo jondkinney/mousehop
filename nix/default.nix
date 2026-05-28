@@ -11,6 +11,7 @@
   librsvg,
   git,
   dbus,
+  fontconfig,
 }:
 let
   # The workspace root is virtual (no [package]); the mousehop
@@ -41,6 +42,9 @@ rustPlatform.buildRustPackage {
     libX11
     libXtst
     dbus
+    # `glyph_font` links libfontconfig directly to register the bundled
+    # chord-chip faces; GTK propagates it, but declare it explicitly.
+    fontconfig
   ];
 
   src = builtins.path {

@@ -16,6 +16,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+pub use input_event::scancode;
+
 mod connect;
 mod connect_async;
 mod listen;
@@ -520,6 +522,11 @@ pub enum FrontendEvent {
     /// pixel threshold for the wall-press auto-release fallback.
     /// 0 means disabled.
     ReleaseThreshold(u32),
+    /// Modifier+key chord that, when held, releases the captured
+    /// cursor back to this host. Linux scancodes so the daemon can
+    /// match against its in-flight key state without a key-table
+    /// round-trip.
+    ReleaseBind(Vec<scancode::Linux>),
     /// whether mDNS-SD discovery is on. When true, mousehop
     /// advertises a `_mousehop._udp.local.` Bonjour service whose
     /// TXT record's `primary=` field hints at the OS-preferred
@@ -599,6 +606,9 @@ pub enum FrontendRequest {
     SaveConfiguration,
     /// set the wall-press auto-release pixel threshold (0 = disabled)
     SetReleaseThreshold(u32),
+    /// set the modifier+key chord that releases captured input. Empty
+    /// vec restores the built-in default (Ctrl+Shift+Alt+Meta).
+    SetReleaseBind(Vec<scancode::Linux>),
     /// set whether forwarded scroll events from a specific
     /// authorized peer should be sign-inverted on injection.
     /// Keyed on the peer's TLS certificate fingerprint.

@@ -488,6 +488,18 @@ impl Window {
         self.request(FrontendRequest::SetReleaseThreshold(threshold));
     }
 
+    pub(super) fn request_release_bind(&self, chord: Vec<mousehop_ipc::scancode::Linux>) {
+        self.request(FrontendRequest::SetReleaseBind(chord));
+    }
+
+    /// Update the release-shortcut chip in response to a daemon
+    /// `ReleaseBind` event (initial Sync or post-set echo).
+    pub(super) fn set_release_bind(&self, chord: Vec<mousehop_ipc::scancode::Linux>) {
+        if let Some(handle) = self.imp().release_shortcut_handle.borrow().as_ref() {
+            handle.set_chord(chord);
+        }
+    }
+
     pub(super) fn request_mdns_discovery(&self, enabled: bool) {
         self.request(FrontendRequest::SetMdnsDiscovery(enabled));
     }
