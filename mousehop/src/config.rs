@@ -535,6 +535,20 @@ impl Config {
             .unwrap_or(Vec::from_iter(DEFAULT_RELEASE_KEYS.iter().cloned()))
     }
 
+    /// Persist a new release-bind chord. An empty `bind` clears the
+    /// override so the built-in default applies again.
+    pub fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        let slot = &mut self.config_toml.as_mut().expect("config").release_bind;
+        if bind.is_empty() {
+            *slot = None;
+        } else {
+            *slot = Some(bind);
+        }
+    }
+
     /// Pixel threshold for the wall-press auto-release fallback.
     /// 0 disables it.
     pub fn release_threshold_px(&self) -> u32 {

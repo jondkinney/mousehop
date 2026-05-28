@@ -64,6 +64,12 @@ pub struct Window {
     #[template_child]
     pub clipboard_privacy_button: TemplateChild<Button>,
     #[template_child]
+    pub release_shortcut_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub release_shortcut_button: TemplateChild<Button>,
+    #[template_child]
+    pub release_shortcut_label: TemplateChild<Label>,
+    #[template_child]
     pub about_version_row: TemplateChild<ActionRow>,
     #[template_child]
     pub about_build_row: TemplateChild<ActionRow>,
@@ -92,6 +98,11 @@ pub struct Window {
     /// Latest server-confirmed host-OS suppression list. Cached so
     /// the main-window subtitle stays in sync without re-querying.
     pub suppressed_apps: RefCell<Vec<String>>,
+    /// Owns the chord-capture wiring on the release-shortcut button.
+    /// Holding it keeps the window-level `EventControllerKey`
+    /// installed for the GUI's lifetime; dropping it (only on window
+    /// finalize) removes the controller.
+    pub release_shortcut_handle: RefCell<Option<crate::release_shortcut::ShortcutCaptureHandle>>,
 }
 
 #[glib::object_subclass]
@@ -369,6 +380,22 @@ impl ObjectImpl for Window {
                 window.open_clipboard_privacy_window();
             }
         ));
+
+        // Release-shortcut chord chip. Wire up click-to-capture and a
+        // callback that forwards the captured chord to the daemon as
+        // a `SetReleaseBind` request. The handle holds the window-
+        // level key controller alive for the GUI's lifetime.
+        let window: gtk::Window = obj.clone().upcast();
+        let obj_for_cb = obj.clone();
+        let handle = crate::release_shortcut::bind_button(
+            &window,
+            &self.release_shortcut_label.get(),
+            &self.release_shortcut_button.get(),
+            move |chord| {
+                obj_for_cb.request_release_bind(chord);
+            },
+        );
+        self.release_shortcut_handle.replace(Some(handle));
 
         // About section — populate from the build info `run()` stored.
         // The template ships placeholder em-dashes for these subtitles

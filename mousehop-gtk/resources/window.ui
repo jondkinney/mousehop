@@ -349,6 +349,34 @@
                     </child>
                     <child>
                       <object class="AdwPreferencesGroup">
+                        <property name="title" translatable="yes">Release Shortcut</property>
+                        <property name="description" translatable="yes">Hold this chord to release the cursor back to this host while another peer has captured it. Click the chip and press a new combination to change it.</property>
+                        <child>
+                          <object class="AdwActionRow" id="release_shortcut_row">
+                            <property name="title" translatable="yes">Release Mouse</property>
+                            <property name="subtitle" translatable="yes">Default: Ctrl + Shift + Alt + Super.</property>
+                            <property name="activatable-widget">release_shortcut_button</property>
+                            <child type="suffix">
+                              <object class="GtkButton" id="release_shortcut_button">
+                                <property name="valign">center</property>
+                                <property name="tooltip-text" translatable="yes">Click and press a key combination to set the release chord. Escape cancels.</property>
+                                <child>
+                                  <object class="GtkLabel" id="release_shortcut_label">
+                                    <property name="use-markup">true</property>
+                                    <property name="label">…</property>
+                                  </object>
+                                </child>
+                                <style>
+                                  <class name="flat"/>
+                                </style>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwPreferencesGroup">
                         <property name="title" translatable="yes">About</property>
                         <child>
                           <object class="AdwActionRow" id="about_version_row">
