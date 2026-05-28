@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/jondkinney/mousehop/compare/v0.11.8...v0.12.0) - 2026-05-28
+
+### Added
+
+- *(gtk)* record the release shortcut from preferences
+- *(gtk)* raise the existing prefs window on a second launch
+
 ## [0.11.8](https://github.com/jondkinney/mousehop/compare/v0.11.7...v0.11.8) - 2026-05-26
 
 ### Added
