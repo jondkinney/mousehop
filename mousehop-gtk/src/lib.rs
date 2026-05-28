@@ -172,6 +172,34 @@ fn gtk_main() -> glib::ExitCode {
         .application_id("com.mousehop.Mousehop")
         .build();
 
+    // Cross-thread bridge for "raise the existing window" pings from
+    // sibling `mousehop` launches. The listener thread (installed by
+    // `single_instance::acquire()` in `run()`) is not on the GTK
+    // main thread and can't touch widgets, so it just nudges this
+    // channel; the async task below runs in the main loop and
+    // actually presents the window.
+    let (present_tx, present_rx) = async_channel::bounded::<()>(8);
+    single_instance::set_present_callback(move || {
+        // try_send is fine — coalescing pings to "at least one" is
+        // exactly the right semantics for "raise the window".
+        let _ = present_tx.try_send(());
+    });
+    let app_for_present = app.clone();
+    glib::spawn_future_local(async move {
+        while present_rx.recv().await.is_ok() {
+            log::info!("sibling launch detected — raising prefs window");
+            if let Some(window) = app_for_present.windows().into_iter().next() {
+                window.present();
+            } else {
+                // No window yet — `activate` will build one. Trigger
+                // it so a sibling launch during startup also wakes
+                // the UI up rather than racing past window
+                // creation.
+                app_for_present.activate();
+            }
+        }
+    });
+
     app.connect_startup(|app| {
         load_icons();
         setup_actions(app);
