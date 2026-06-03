@@ -159,6 +159,11 @@ pub enum Command {
     Cli(CliArgs),
     /// run in daemon mode
     Daemon,
+    /// Add (or, with --remove, delete) a host-firewall rule allowing
+    /// mousehop's UDP port inbound — for the detected firewall
+    /// (ufw/firewalld/nftables/iptables on Linux, Windows Firewall).
+    /// Run with sudo / as administrator.
+    Firewall(FirewallArgs),
     /// macOS-only: probe Accessibility permission in a fresh process
     /// (which bypasses the cached TCC trust state in already-running
     /// processes). Exits with status 0 if granted, 1 if not. Used by
@@ -167,6 +172,16 @@ pub enum Command {
     /// cached-true even after the entry is removed.
     #[cfg(target_os = "macos")]
     AxProbe,
+}
+
+#[derive(clap::Args, Clone, Debug, Eq, PartialEq)]
+pub struct FirewallArgs {
+    /// Remove the rule instead of adding it.
+    #[arg(long)]
+    pub remove: bool,
+    /// Print the commands that would run, without executing them.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]

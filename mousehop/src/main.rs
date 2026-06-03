@@ -74,6 +74,10 @@ fn run() -> Result<(), MousehopError> {
                     r => r?,
                 }
             }
+            Command::Firewall(args) => {
+                let code = mousehop::firewall::run(config.port(), args.remove, args.dry_run);
+                process::exit(code);
+            }
             #[cfg(target_os = "macos")]
             Command::AxProbe => {
                 // Fresh-process probe of TCC Accessibility state. Spawned

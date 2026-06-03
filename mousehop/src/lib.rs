@@ -10,6 +10,7 @@ mod discovery;
 mod dns;
 mod emulation;
 pub mod emulation_test;
+pub mod firewall;
 mod latency;
 mod listen;
 #[cfg(target_os = "macos")]
