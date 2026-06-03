@@ -6,10 +6,10 @@ use glib::{Binding, subclass::InitializingObject};
 use gtk::glib::subclass::Signal;
 use gtk::glib::{SignalHandlerId, clone};
 use gtk::{Button, CompositeTemplate, Entry, Switch, glib};
-use mousehop_ipc::Position;
+use mousehop_ipc::{ConnectionMode, Position};
 use std::sync::OnceLock;
 
-use crate::client_object::ClientObject;
+use crate::client_object::{AddrEntry, ClientObject, LatencyState, format_latency, iface_label};
 
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/com/mousehop/Mousehop/client_row.ui")]
@@ -27,6 +27,8 @@ pub struct ClientRow {
     #[template_child]
     pub position: TemplateChild<ComboRow>,
     #[template_child]
+    pub address_select: TemplateChild<ComboRow>,
+    #[template_child]
     pub delete_row: TemplateChild<ActionRow>,
     #[template_child]
     pub delete_button: TemplateChild<gtk::Button>,
@@ -39,6 +41,15 @@ pub struct ClientRow {
     position_change_handler: RefCell<Option<SignalHandlerId>>,
     set_state_handler: RefCell<Option<SignalHandlerId>>,
     pub clipboard_send_handler: RefCell<Option<SignalHandlerId>>,
+    address_select_handler: RefCell<Option<SignalHandlerId>>,
+    /// Maps a non-"Auto" dropdown index (i.e. `selected - 1`) to the
+    /// candidate IP string it represents.
+    address_select_ips: RefCell<Vec<String>>,
+    /// Signature of the last-rendered dropdown (labels + selection).
+    /// Lets [`Self::set_addresses`] skip a model rebuild when nothing
+    /// visible changed, so a 5-second latency refresh never snaps an
+    /// open dropdown shut.
+    address_signature: RefCell<Option<String>>,
     pub client_object: RefCell<Option<ClientObject>>,
 }
 
@@ -118,6 +129,37 @@ impl ObjectImpl for ClientRow {
             }
         ));
         self.clipboard_send_handler.replace(Some(handler));
+        let handler = self.address_select.connect_selected_notify(clone!(
+            #[weak(rename_to = row)]
+            self,
+            move |combo| {
+                // Index 0 = "Auto", 1 = "Fastest", and every later index
+                // maps to `address_select_ips[index - 2]`. Emit a single
+                // string the window turns into the right request:
+                // "auto" / "fastest" / "<ip>".
+                let idx = combo.selected();
+                let choice = match idx {
+                    0 => "auto".to_string(),
+                    1 => "fastest".to_string(),
+                    _ => row
+                        .address_select_ips
+                        .borrow()
+                        .get(idx as usize - 2)
+                        .cloned()
+                        .unwrap_or_else(|| "auto".to_string()),
+                };
+                row.obj()
+                    .emit_by_name::<()>("request-connection-choice", &[&choice]);
+            }
+        ));
+        self.address_select_handler.replace(Some(handler));
+        // The default AdwComboRow popup factory ellipsizes long
+        // labels, which truncates IPv6 candidate addresses (and the
+        // latency that follows them). Give the popup a factory whose
+        // label never ellipsizes so the full "<ip> — <latency>" is
+        // always readable; the popup widens to fit.
+        self.address_select
+            .set_list_factory(Some(&non_ellipsizing_factory()));
     }
 
     fn signals() -> &'static [glib::subclass::Signal] {
@@ -140,6 +182,11 @@ impl ObjectImpl for ClientRow {
                     .build(),
                 Signal::builder("request-clipboard-send-change")
                     .param_types([bool::static_type()])
+                    .build(),
+                // Carries the connection choice: "auto", "fastest", or
+                // a specific candidate IP (= lock on the current net).
+                Signal::builder("request-connection-choice")
+                    .param_types([String::static_type()])
                     .build(),
             ]
         })
@@ -256,6 +303,113 @@ impl ClientRow {
             .set_clipboard_send(value);
         self.clipboard_send_switch.unblock_signal(handler);
     }
+
+    /// Rebuild the connection-address dropdown from the candidate list,
+    /// base mode and current-network lock. Entries are: `Auto`,
+    /// `Fastest`, then `<ip> — [<kind> · ]<latency>` per candidate (the
+    /// active address bulleted). A lock that has dropped out of the
+    /// candidate set is appended so the user can still see/release it.
+    /// The selection is set without firing the user signal, and the
+    /// rebuild is skipped when nothing visible changed (see
+    /// `address_signature`) so periodic latency refreshes don't disturb
+    /// an open dropdown.
+    pub(super) fn set_addresses(
+        &self,
+        entries: Vec<AddrEntry>,
+        mode: ConnectionMode,
+        locked: Option<String>,
+    ) {
+        // Fixed leading options. Keep these indices in sync with the
+        // selection handler in `constructed`.
+        let mut labels: Vec<String> = vec!["Auto".to_string(), "Fastest".to_string()];
+        let lead = labels.len();
+        let mut ips: Vec<String> = Vec::with_capacity(entries.len());
+        for e in &entries {
+            let marker = if e.active { "● " } else { "" };
+            // Build the trailing detail cleanly so we never render a
+            // dangling separator (e.g. "<ip> — —"): with an interface
+            // kind it's "Wired · <lat>"; without a kind we only append a
+            // real measured latency; otherwise just show the address.
+            let detail = match iface_label(e.kind) {
+                Some(kind) => format!("{kind} · {}", format_latency(&e.latency)),
+                None => match e.latency {
+                    LatencyState::Rtt(_) => format_latency(&e.latency),
+                    _ => String::new(),
+                },
+            };
+            if detail.is_empty() {
+                labels.push(format!("{marker}{}", e.ip));
+            } else {
+                labels.push(format!("{marker}{} — {detail}", e.ip));
+            }
+            ips.push(e.ip.clone());
+        }
+        // Keep a locked-but-no-longer-a-candidate address visible.
+        if let Some(ip) = locked.as_ref() {
+            if !ips.iter().any(|x| x == ip) {
+                labels.push(format!("{ip} — locked"));
+                ips.push(ip.clone());
+            }
+        }
+        let selected = match locked.as_ref() {
+            // A pinned address takes precedence in the display.
+            Some(ip) => ips
+                .iter()
+                .position(|x| x == ip)
+                .map(|i| (i + lead) as u32)
+                .unwrap_or(0),
+            None => match mode {
+                ConnectionMode::Auto => 0,
+                ConnectionMode::Fastest => 1,
+            },
+        };
+
+        let signature = format!("{selected}\u{1f}{}", labels.join("\u{1e}"));
+        if self.address_signature.borrow().as_deref() == Some(signature.as_str()) {
+            return;
+        }
+        self.address_signature.replace(Some(signature));
+        self.address_select_ips.replace(ips);
+
+        let handler = self.address_select_handler.borrow();
+        let handler = handler.as_ref().expect("signal handler");
+        self.address_select.block_signal(handler);
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let model = gtk::StringList::new(&label_refs);
+        self.address_select.set_model(Some(&model));
+        self.address_select.set_selected(selected);
+        self.address_select.unblock_signal(handler);
+    }
+}
+
+/// A list-item factory whose label never ellipsizes — used for the
+/// address-selector popup so long (IPv6) addresses and their latency
+/// stay fully visible instead of being cut off with "…".
+fn non_ellipsizing_factory() -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let label = gtk::Label::new(None);
+        label.set_xalign(0.0);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::None);
+        item.set_child(Some(&label));
+    });
+    factory.connect_bind(|_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let text = item
+            .item()
+            .and_downcast::<gtk::StringObject>()
+            .map(|s| s.string())
+            .unwrap_or_default();
+        if let Some(label) = item.child().and_downcast::<gtk::Label>() {
+            label.set_text(&text);
+        }
+    });
+    factory
 }
 
 impl WidgetImpl for ClientRow {}

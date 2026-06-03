@@ -390,13 +390,43 @@ position = "left"
 # The hostname is optional: When no hostname is specified,
 # at least one ip address needs to be specified.
 hostname = "thorium"
-# ips for ethernet and wifi
-ips = ["192.168.178.189", "192.168.178.172"]
+# ips are optional: peers running mousehop advertise every interface
+# over mDNS, so a hostname alone discovers them all
 # optional port
 port = 4252
+# optional base policy: "auto" (default) or "fastest"
+mode = "fastest"
 ```
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
+
+### Multi-homed peers (interfaces, latency, locking)
+
+A peer with more than one address — e.g. a laptop wired *and* on Wi-Fi
+at the same time — advertises **every interface's** address over mDNS,
+so mousehop discovers them all without you pinning anything. By default
+it races them and uses whichever connects first, which can flap onto a
+slow Wi-Fi path. The GUI's **Connection Address** dropdown lists every
+candidate as `<ip> — Wired/Wi-Fi · <latency>` (the interface kind is
+advertised by the peer; latency is a lightweight background probe), and
+offers:
+
+- **Auto** (default): race all candidates, biased toward the
+  mDNS-advertised primary interface.
+- **Fastest**: prefer the lowest-latency reachable candidate and stay
+  on it (sticky). It only switches when the active path dies or another
+  is *sustainedly and substantially* faster, so it never flaps. Fully
+  portable — works on any network with no configuration.
+- **A specific address**: pin the connection to that IP **on the
+  current network only**. The pin is sticky (no silent failover) and is
+  scoped by a network fingerprint (the default-gateway MAC), so a pin
+  set at home doesn't break connectivity on a different LAN — there,
+  mousehop falls back to the base `mode`.
+
+`mode` persists on the `[[clients]]` entry; per-network pins persist
+under a `network_locks` table (keyed by network fingerprint, numeric
+IPs only). Discovered addresses, latency, and interface labels are live
+runtime state and are not persisted.
 
 ## Clipboard Sync
 

@@ -72,6 +72,20 @@
 				</property>
 			</object>
 		</child>
+		<!-- connection address selector (multi-homed peers) -->
+		<child>
+			<object class="AdwComboRow" id="address_select">
+				<property name="title" translatable="yes">Connection Address</property>
+				<property name="subtitle" translatable="yes">Auto races all addresses; Fastest sticks to the lowest-latency one; or pin a specific address on this network.</property>
+				<property name="model">
+					<object class="GtkStringList">
+						<items>
+							<item translatable="yes">Auto</item>
+						</items>
+					</object>
+				</property>
+			</object>
+		</child>
 		<!-- clipboard send toggle -->
 		<child>
 			<object class="AdwActionRow">

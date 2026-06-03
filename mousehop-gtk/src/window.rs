@@ -11,8 +11,8 @@ use gtk::{
 };
 
 use mousehop_ipc::{
-    ClientConfig, ClientHandle, ClientState, DEFAULT_PORT, FrontendRequest, FrontendRequestWriter,
-    Position,
+    ClientConfig, ClientHandle, ClientState, ConnectionMode, DEFAULT_PORT, FrontendRequest,
+    FrontendRequestWriter, Position,
 };
 
 use crate::{
@@ -307,6 +307,41 @@ impl Window {
                             }
                         ),
                     );
+                    row.connect_closure(
+                        "request-connection-choice",
+                        false,
+                        closure_local!(
+                            #[strong]
+                            window,
+                            move |row: ClientRow, choice: String| {
+                                let Some(client) = window.client_by_idx(row.index() as u32) else {
+                                    return;
+                                };
+                                let handle = client.handle();
+                                // "auto"/"fastest" set the base policy;
+                                // anything else is a numeric IP to pin on
+                                // the current network (never a hostname).
+                                let request = match choice.as_str() {
+                                    "auto" => FrontendRequest::SetConnectionMode(
+                                        handle,
+                                        ConnectionMode::Auto,
+                                    ),
+                                    "fastest" => FrontendRequest::SetConnectionMode(
+                                        handle,
+                                        ConnectionMode::Fastest,
+                                    ),
+                                    ip => match ip.parse::<std::net::IpAddr>() {
+                                        Ok(addr) => FrontendRequest::SetNetworkLock(handle, addr),
+                                        Err(e) => {
+                                            log::warn!("ignoring invalid lock address {ip:?}: {e}");
+                                            return;
+                                        }
+                                    },
+                                };
+                                window.request(request);
+                            }
+                        ),
+                    );
                     row.upcast()
                 }
             ),
@@ -410,6 +445,10 @@ impl Window {
         row.set_port(client.port);
         row.set_position(client.pos);
         row.set_clipboard_send(client.clipboard_send);
+        if let Some(client_object) = self.client_object_for_handle(handle) {
+            client_object.set_mode(client.mode);
+            row.refresh_addresses(&client_object);
+        }
     }
 
     pub(super) fn update_client_state(&self, handle: ClientHandle, state: ClientState) {
@@ -429,6 +468,13 @@ impl Window {
         client_object.set_resolving(state.resolving);
 
         self.update_dns_state(handle, !state.ips.is_empty());
+
+        /* candidate addresses + per-address latency + interface kinds
+         * and the current-network lock (drive the connection-address
+         * dropdown). Build before `state.ips` is consumed below. */
+        client_object.set_addresses(crate::client_object::address_entries(&state));
+        client_object.set_active_lock(state.active_lock.map(|ip| ip.to_string()));
+
         let ips = state
             .ips
             .into_iter()
@@ -442,6 +488,7 @@ impl Window {
             crate::client_object::peer_commit_to_string(state.peer_commit),
         );
         row.refresh_version_status();
+        row.refresh_addresses(&client_object);
     }
 
     fn client_object_for_handle(&self, handle: ClientHandle) -> Option<ClientObject> {

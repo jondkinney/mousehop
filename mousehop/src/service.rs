@@ -4,19 +4,22 @@ use crate::{
     config::{Config, ConfigClient},
     connect::MousehopConnection,
     crypto,
-    discovery::{Discovery, PrimaryCache},
+    discovery::{Discovery, DiscoveryEvent, PrimaryCache},
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
+    latency::{LatencyProber, ProbeResult},
     listen::{ListenerCreationError, MousehopListener},
+    network::current_network_id,
 };
 use futures::StreamExt;
 use input_capture::clipboard::{ClipboardMonitor, SuppressionList};
 use input_capture::frontmost_app;
 use input_event::{ClipboardEvent, Event as InputEvent};
+use local_channel::mpsc::{Receiver, channel};
 use log;
 use mousehop_ipc::{
-    AppIdent, AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, HostKind,
-    IncomingPeerConfig, IpcError, IpcListenerCreationError, Position, Status,
+    AppIdent, AsyncFrontendListener, ClientHandle, ConnectionMode, FrontendEvent, FrontendRequest,
+    HostKind, IncomingPeerConfig, IpcError, IpcListenerCreationError, Position, Status,
 };
 use mousehop_proto::ProtoEvent;
 use std::{
@@ -51,6 +54,10 @@ pub struct Service {
     emulation: Emulation,
     /// dns resolver
     resolver: DnsResolver,
+    /// background per-address latency prober. Feeds the GUI's
+    /// per-candidate RTT display so the user can compare interfaces on
+    /// a multi-homed peer before locking one.
+    latency: LatencyProber,
     /// frontend listener
     frontend_listener: AsyncFrontendListener,
     /// authorized public key sha256 fingerprints
@@ -84,6 +91,15 @@ pub struct Service {
     /// shared `PrimaryCache` (read by `MousehopConnection`) from
     /// peer announcements.
     discovery: Discovery,
+    /// Stream of resolved peer advertisements from [`Discovery`]'s
+    /// browse task — folded into client candidate sets + interface
+    /// labels in the main loop.
+    discovery_event_rx: Receiver<DiscoveryEvent>,
+    /// Opaque fingerprint of the network the machine is currently on
+    /// (default-gateway MAC, or subnet fallback). Drives per-network
+    /// lock resolution; recomputed periodically and on interface
+    /// changes. `None` when undeterminable (locks then don't apply).
+    current_network: Option<String>,
     /// Outgoing connection handle to fan clipboard frames out from
     /// the capture / forwarding paths. Same handle Capture owns;
     /// cloned in `Service::new` so Service can call `send` directly
@@ -106,7 +122,17 @@ pub struct Service {
     /// `HashSet` take effect on the next clipboard poll without
     /// rebuilding the monitor.
     clipboard_suppression: SuppressionList,
+    /// Per-client count of consecutive probe observations where a
+    /// substantially-faster candidate beat the active path, gating the
+    /// `Fastest`-mode auto-upgrade so noise can't trigger a switch.
+    fastest_streak: HashMap<ClientHandle, u8>,
 }
+
+/// Consecutive probe observations a faster candidate must win before
+/// `Fastest` mode actually switches to it. With the ~5 s probe cadence
+/// this is ~15 s of sustained advantage — long enough that a transient
+/// latency dip never causes a flap.
+const FASTEST_UPGRADE_STREAK: u8 = 3;
 
 const RECENT_FORWARD_TTL: Duration = Duration::from_secs(1);
 
@@ -167,8 +193,26 @@ impl Service {
         // create dns resolver
         let resolver = DnsResolver::new()?;
 
+        // background latency prober — pulls candidate addresses from
+        // the (shared) client manager itself, so no targets need to be
+        // pushed in as clients/DNS change.
+        let latency = LatencyProber::new(client_manager.clone());
+
         let port = config.port();
-        let discovery = Discovery::new(port, config.mdns_discovery(), primary_cache.clone());
+        let (discovery_event_tx, discovery_event_rx) = channel();
+        let discovery = Discovery::new(
+            port,
+            config.mdns_discovery(),
+            primary_cache.clone(),
+            discovery_event_tx,
+        );
+        // Resolve the lock (if any) for the network we boot on, before
+        // the first dial, so a locked client connects on the right
+        // interface immediately.
+        let current_network = current_network_id();
+        for handle in client_manager.registered_clients() {
+            client_manager.recompute_active_lock(handle, current_network.as_deref());
+        }
         // ClipboardMonitor is best-effort: a headless CI environment
         // or a Wayland session without compositor support yields a
         // permanent error here. We log and proceed without clipboard
@@ -199,6 +243,7 @@ impl Service {
             emulation,
             frontend_listener,
             resolver,
+            latency,
             authorized_keys,
             primary_cache,
             public_key_fingerprint,
@@ -212,10 +257,13 @@ impl Service {
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
             discovery,
+            discovery_event_rx,
+            current_network,
             conn: conn_for_service,
             clipboard_monitor,
             recent_forwarded: HashMap::new(),
             clipboard_suppression,
+            fastest_streak: HashMap::new(),
         };
         Ok(service)
     }
@@ -253,8 +301,12 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event).await,
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                result = self.latency.event() => self.handle_probe_result(result).await,
+                event = recv_discovery(&mut self.discovery_event_rx) => {
+                    self.handle_discovery_event(event)
+                }
                 _ = self.config.changed() => self.handle_config_change(),
-                _ = discovery_refresh_tick.tick() => self.discovery.refresh(),
+                _ = discovery_refresh_tick.tick() => self.on_discovery_refresh().await,
                 event = recv_clipboard(&mut self.clipboard_monitor) => {
                     self.handle_local_clipboard_event(event).await;
                 }
@@ -269,6 +321,8 @@ impl Service {
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
+        log::debug!("terminating latency prober ...");
+        self.latency.terminate().await;
 
         Ok(())
     }
@@ -357,6 +411,42 @@ impl Service {
             }
             FrontendRequest::SetClientClipboardSend(handle, enabled) => {
                 if self.client_manager.set_clipboard_send(handle, enabled) {
+                    self.broadcast_client(handle);
+                    self.save_config().await;
+                }
+            }
+            FrontendRequest::SetConnectionMode(handle, mode) => {
+                // Resolve the live network first: the user is acting on a
+                // connected machine, so a stale cached `None` (from a
+                // transient blip) must not leave this network's lock in
+                // place to silently re-activate later.
+                self.refresh_network().await;
+                let net = self.current_network.clone();
+                if self.client_manager.set_mode(handle, mode, net.as_deref()) {
+                    // The mode change may have cleared this network's
+                    // lock; re-resolve and re-dial so the new policy
+                    // takes effect immediately.
+                    self.client_manager
+                        .recompute_active_lock(handle, net.as_deref());
+                    self.conn.reset_handle(handle).await;
+                    self.broadcast_client(handle);
+                    self.save_config().await;
+                }
+            }
+            FrontendRequest::SetNetworkLock(handle, ip) => {
+                // Resolve the live network first (see SetConnectionMode).
+                self.refresh_network().await;
+                let Some(net) = self.current_network.clone() else {
+                    log::warn!("cannot lock client {handle}: current network unknown");
+                    return;
+                };
+                if self.client_manager.set_network_lock(handle, &net, ip) {
+                    self.client_manager
+                        .recompute_active_lock(handle, Some(&net));
+                    // Drop any live connection so the lock takes effect
+                    // on the next event instead of waiting for the
+                    // current (possibly wrong-interface) path to drop.
+                    self.conn.reset_handle(handle).await;
                     self.broadcast_client(handle);
                     self.save_config().await;
                 }
@@ -525,6 +615,8 @@ impl Service {
                 pos: c.pos,
                 active: s.active,
                 enter_hook: c.cmd,
+                mode: c.mode,
+                network_locks: c.network_locks,
                 clipboard_send: c.clipboard_send,
             })
             .collect();
@@ -808,6 +900,123 @@ impl Service {
         }
     }
 
+    /// Apply a background latency sample and re-broadcast the client
+    /// only when the stored value actually moved. The reading is
+    /// quantized to 100 µs buckets so ordinary sub-microsecond jitter
+    /// on a stable link doesn't churn the frontend every probe cycle.
+    /// Also feeds the `Fastest`-mode convergence check.
+    async fn handle_probe_result(&mut self, result: ProbeResult) {
+        let ProbeResult {
+            handle,
+            ip,
+            rtt_micros,
+        } = result;
+        let bucketed = rtt_micros.map(|us| us - (us % 100));
+        if self.client_manager.set_latency(handle, ip, bucketed) {
+            self.broadcast_client(handle);
+        }
+        self.maybe_upgrade_fastest(handle).await;
+    }
+
+    /// In `Fastest` mode (and only when not locked), nudge the live
+    /// connection toward the lowest-latency candidate — but only once a
+    /// candidate has been *sustainedly and substantially* faster than
+    /// the active path (see [`ClientManager::fastest_upgrade_candidate`]
+    /// and [`FASTEST_UPGRADE_STREAK`]), so probe noise can't cause
+    /// flapping. Tearing down the connection makes the next send
+    /// re-dial, which picks the new fastest.
+    async fn maybe_upgrade_fastest(&mut self, handle: ClientHandle) {
+        let eligible = self.client_manager.get_active_lock(handle).is_none()
+            && self.client_manager.get_mode(handle) == ConnectionMode::Fastest;
+        if !eligible {
+            self.fastest_streak.remove(&handle);
+            return;
+        }
+        if self
+            .client_manager
+            .fastest_upgrade_candidate(handle)
+            .is_some()
+        {
+            let streak = self.fastest_streak.entry(handle).or_insert(0);
+            *streak += 1;
+            if *streak >= FASTEST_UPGRADE_STREAK {
+                self.fastest_streak.remove(&handle);
+                log::info!("client {handle}: switching to a sustainedly-faster interface");
+                self.conn.reset_handle(handle).await;
+            }
+        } else {
+            self.fastest_streak.remove(&handle);
+        }
+    }
+
+    /// Fold a resolved peer advertisement into every client whose
+    /// configured hostname matches the mDNS instance: add the
+    /// discovered addresses to the candidate set and record per-address
+    /// interface kinds. Re-broadcasts only the clients that changed.
+    fn handle_discovery_event(&mut self, event: DiscoveryEvent) {
+        let DiscoveryEvent::Resolved {
+            instance,
+            addresses,
+            interfaces,
+        } = event;
+        for handle in self.client_manager.registered_clients() {
+            let matches = self
+                .client_manager
+                .get_hostname(handle)
+                .is_some_and(|h| crate::discovery::normalize_mdns_name(&h) == instance);
+            if !matches {
+                continue;
+            }
+            // Discovered ips must land before interface labels so the
+            // label filter (which keeps only current candidates) sees
+            // the freshly-added addresses.
+            let discovered_changed = self
+                .client_manager
+                .set_discovered_ips(handle, addresses.clone());
+            let interfaces_changed = self
+                .client_manager
+                .set_interfaces(handle, interfaces.clone());
+            if discovered_changed {
+                // The candidate set moved, so any in-progress
+                // Fastest-upgrade streak no longer describes the
+                // current candidates — start it fresh.
+                self.fastest_streak.remove(&handle);
+            }
+            if discovered_changed || interfaces_changed {
+                self.broadcast_client(handle);
+            }
+        }
+    }
+
+    /// Periodic discovery housekeeping: re-publish our advertisement
+    /// (primary interface may have changed) and re-evaluate which
+    /// network we're on for per-network lock resolution.
+    async fn on_discovery_refresh(&mut self) {
+        self.discovery.refresh();
+        self.refresh_network().await;
+    }
+
+    /// Recompute the current-network fingerprint. On change, re-resolve
+    /// every client's active lock and re-dial those whose lock moved so
+    /// the new network's pin (or its absence) takes effect at once.
+    async fn refresh_network(&mut self) {
+        let net = current_network_id();
+        if net == self.current_network {
+            return;
+        }
+        log::info!("network changed: {:?} -> {:?}", self.current_network, net);
+        self.current_network = net;
+        for handle in self.client_manager.registered_clients() {
+            if self
+                .client_manager
+                .recompute_active_lock(handle, self.current_network.as_deref())
+            {
+                self.conn.reset_handle(handle).await;
+                self.broadcast_client(handle);
+            }
+        }
+    }
+
     fn sync_frontend(&mut self) {
         self.enumerate();
         self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
@@ -1067,6 +1276,16 @@ async fn recv_clipboard(
 ) -> Option<input_capture::CaptureEvent> {
     match monitor.as_mut() {
         Some(m) => m.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// `tokio::select!` arm helper for the discovery event stream. Pends
+/// forever once the channel is closed so the `select!` doesn't
+/// busy-spin during shutdown.
+async fn recv_discovery(rx: &mut Receiver<DiscoveryEvent>) -> DiscoveryEvent {
+    match rx.recv().await {
+        Some(event) => event,
         None => std::future::pending().await,
     }
 }
