@@ -102,6 +102,7 @@ fn shell_join(cmd: &[String]) -> String {
         .join(" ")
 }
 
+#[cfg(target_os = "linux")]
 fn s(v: &str) -> String {
     v.to_string()
 }
@@ -268,7 +269,7 @@ fn service_active(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "linux")]
 fn command_exists(name: &str) -> bool {
     Command::new(name)
         .arg("--version")
@@ -283,7 +284,7 @@ fn command_exists(name: &str) -> bool {
         })
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "linux")]
 fn which(name: &str) -> bool {
     Command::new("sh")
         .args(["-c", &format!("command -v {name}")])
