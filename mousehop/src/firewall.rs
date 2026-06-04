@@ -102,7 +102,7 @@ fn shell_join(cmd: &[String]) -> String {
         .join(" ")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn s(v: &str) -> String {
     v.to_string()
 }
