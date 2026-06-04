@@ -173,6 +173,11 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
+    // Windows Defender Firewall on hosted runners silently drops SYN
+    // to port 1 instead of returning RST, so the probe times out and
+    // the assertion would mis-fire. The production matching of
+    // `ConnectionRefused` still works on Windows.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn refused_connection_counts_as_reachable() {
         // Port 1 on loopback is effectively always closed, so the
