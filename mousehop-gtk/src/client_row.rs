@@ -168,6 +168,11 @@ impl ClientRow {
         // changes are pushed by `Window::update_client_state` calling
         // `refresh_version_status` after writing the new property.
         self.refresh_version_status();
+
+        // Seed the address-selector dropdown from the object's cached
+        // candidate list + lock. Live updates arrive via
+        // `Window::update_client_state` / `update_client_config`.
+        self.refresh_addresses(client_object);
     }
 
     pub fn unbind(&self) {
@@ -203,6 +208,16 @@ impl ClientRow {
 
     pub fn set_clipboard_send(&self, value: bool) {
         self.imp().set_clipboard_send(value);
+    }
+
+    /// Rebuild the address-selector dropdown from the object's cached
+    /// candidate addresses, mode and lock. Called whenever any change.
+    pub fn refresh_addresses(&self, client_object: &ClientObject) {
+        self.imp().set_addresses(
+            client_object.addresses(),
+            client_object.mode(),
+            client_object.active_lock(),
+        );
     }
 
     /// Recompute the collapsed subtitle (Pango markup) based on the

@@ -16,7 +16,9 @@ use toml;
 use toml_edit::{self, DocumentMut};
 
 use mousehop_cli::CliArgs;
-use mousehop_ipc::{ClipboardSuppression, DEFAULT_PORT, IncomingPeerConfig, Position};
+use mousehop_ipc::{
+    ClipboardSuppression, ConnectionMode, DEFAULT_PORT, IncomingPeerConfig, Position,
+};
 
 use input_event::scancode::{
     self,
@@ -98,6 +100,14 @@ struct TomlClient {
     position: Option<Position>,
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
+    /// Base connection policy (`auto` | `fastest`). Absent in legacy
+    /// configs → `Auto`. See [`mousehop_ipc::ConnectionMode`].
+    #[serde(default)]
+    mode: Option<ConnectionMode>,
+    /// Per-network address locks, keyed by network fingerprint. Absent
+    /// in legacy configs. See [`mousehop_ipc::ClientConfig::network_locks`].
+    #[serde(default)]
+    network_locks: Option<HashMap<String, IpAddr>>,
     /// Per-pair clipboard send gate. Absent in legacy configs;
     /// defaults to `false` so existing pairs don't start
     /// transmitting clipboard text on upgrade.
@@ -149,6 +159,11 @@ pub enum Command {
     Cli(CliArgs),
     /// run in daemon mode
     Daemon,
+    /// Add (or, with --remove, delete) a host-firewall rule allowing
+    /// mousehop's UDP port inbound — for the detected firewall
+    /// (ufw/firewalld/nftables/iptables on Linux, Windows Firewall).
+    /// Run with sudo / as administrator.
+    Firewall(FirewallArgs),
     /// macOS-only: probe Accessibility permission in a fresh process
     /// (which bypasses the cached TCC trust state in already-running
     /// processes). Exits with status 0 if granted, 1 if not. Used by
@@ -157,6 +172,16 @@ pub enum Command {
     /// cached-true even after the entry is removed.
     #[cfg(target_os = "macos")]
     AxProbe,
+}
+
+#[derive(clap::Args, Clone, Debug, Eq, PartialEq)]
+pub struct FirewallArgs {
+    /// Remove the rule instead of adding it.
+    #[arg(long)]
+    pub remove: bool,
+    /// Print the commands that would run, without executing them.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
@@ -305,6 +330,8 @@ pub struct ConfigClient {
     pub pos: Position,
     pub active: bool,
     pub enter_hook: Option<String>,
+    pub mode: ConnectionMode,
+    pub network_locks: HashMap<String, IpAddr>,
     pub clipboard_send: bool,
 }
 
@@ -316,6 +343,8 @@ impl From<TomlClient> for ConfigClient {
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
         let port = toml.port.unwrap_or(DEFAULT_PORT);
         let pos = toml.position.unwrap_or_default();
+        let mode = toml.mode.unwrap_or_default();
+        let network_locks = toml.network_locks.unwrap_or_default();
         let clipboard_send = toml.clipboard_send.unwrap_or(false);
         Self {
             ips,
@@ -324,6 +353,8 @@ impl From<TomlClient> for ConfigClient {
             pos,
             active,
             enter_hook,
+            mode,
+            network_locks,
             clipboard_send,
         }
     }
@@ -352,6 +383,11 @@ impl From<ConfigClient> for TomlClient {
         } else {
             None
         };
+        // Persist the mode only when it diverges from the default, and
+        // the lock map only when non-empty, so untouched configs don't
+        // sprout new keys on every save.
+        let mode = (client.mode != ConnectionMode::default()).then_some(client.mode);
+        let network_locks = (!client.network_locks.is_empty()).then_some(client.network_locks);
         Self {
             hostname,
             host_name,
@@ -360,6 +396,8 @@ impl From<ConfigClient> for TomlClient {
             position,
             activate_on_startup,
             enter_hook,
+            mode,
+            network_locks,
             clipboard_send,
         }
     }
@@ -698,5 +736,65 @@ impl Config {
         let _ = self.watch();
 
         res
+    }
+}
+
+#[cfg(test)]
+mod connection_mode_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn client_with(mode: ConnectionMode, locks: HashMap<String, IpAddr>) -> ConfigClient {
+        ConfigClient {
+            ips: Default::default(),
+            hostname: Some("host.local".into()),
+            port: DEFAULT_PORT,
+            pos: Position::Left,
+            active: true,
+            enter_hook: None,
+            mode,
+            network_locks: locks,
+            clipboard_send: false,
+        }
+    }
+
+    #[test]
+    fn mode_and_network_locks_roundtrip_through_toml() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 153));
+        let mut locks = HashMap::new();
+        locks.insert("gw:aa:bb:cc:dd:ee:ff".to_string(), ip);
+        // Use a non-default mode so it's actually persisted.
+        let toml: TomlClient = client_with(ConnectionMode::Auto, locks.clone()).into();
+        assert_eq!(toml.mode, Some(ConnectionMode::Auto));
+        assert_eq!(toml.network_locks.as_ref(), Some(&locks));
+        let back: ConfigClient = toml.into();
+        assert_eq!(back.mode, ConnectionMode::Auto);
+        assert_eq!(back.network_locks.get("gw:aa:bb:cc:dd:ee:ff"), Some(&ip));
+    }
+
+    #[test]
+    fn defaults_stay_implicit_in_toml() {
+        // The default mode + empty locks shouldn't write new keys on save.
+        let toml: TomlClient = client_with(ConnectionMode::default(), HashMap::new()).into();
+        assert_eq!(toml.mode, None);
+        assert_eq!(toml.network_locks, None);
+        // A non-default mode IS persisted.
+        let toml: TomlClient = client_with(ConnectionMode::Auto, HashMap::new()).into();
+        assert_eq!(toml.mode, Some(ConnectionMode::Auto));
+    }
+
+    #[test]
+    fn legacy_toml_without_mode_uses_default() {
+        let parsed: TomlClient = toml::from_str(
+            r#"
+            hostname = "host.local"
+            port = 4252
+            "#,
+        )
+        .expect("parse legacy client");
+        assert_eq!(parsed.mode, None);
+        let cc: ConfigClient = parsed.into();
+        assert_eq!(cc.mode, ConnectionMode::default());
+        assert!(cc.network_locks.is_empty());
     }
 }

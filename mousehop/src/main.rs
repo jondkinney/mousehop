@@ -74,6 +74,10 @@ fn run() -> Result<(), MousehopError> {
                     r => r?,
                 }
             }
+            Command::Firewall(args) => {
+                let code = mousehop::firewall::run(config.port(), args.remove, args.dry_run);
+                process::exit(code);
+            }
             #[cfg(target_os = "macos")]
             Command::AxProbe => {
                 // Fresh-process probe of TCC Accessibility state. Spawned
@@ -188,8 +192,16 @@ async fn run_service(config: Config) -> Result<(), ServiceError> {
     // existing in-process AXIsProcessTrusted polling in the GUI only
     // catches the toggle-off case; the remove case leaves the cached
     // trust state stuck at true forever. See `macos_tcc_watch`.
+    //
+    // `MOUSEHOP_DISABLE_TCC_WATCH` opts out: an unsigned dev/headless
+    // build has no Accessibility grant, so the watcher would exit the
+    // daemon immediately. Setting this keeps it alive for advertising-
+    // /network-only runs (input capture/emulation still no-op without
+    // the grant).
     #[cfg(target_os = "macos")]
-    mousehop::macos_tcc_watch::spawn();
+    if std::env::var_os("MOUSEHOP_DISABLE_TCC_WATCH").is_none() {
+        mousehop::macos_tcc_watch::spawn();
+    }
 
     service.run().await?;
     log::info!("service exited!");

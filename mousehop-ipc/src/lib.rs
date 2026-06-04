@@ -307,6 +307,41 @@ impl TryFrom<&str> for Position {
     }
 }
 
+/// Base outbound-connection policy for a peer. Portable — it applies
+/// on every network, and is the fallback whenever the current network
+/// has no explicit lock in [`ClientConfig::network_locks`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectionMode {
+    /// Race every candidate address; first DTLS handshake wins
+    /// (biased toward the mDNS-advertised primary interface). The
+    /// historical behavior — predictable and never auto-switches,
+    /// but doesn't account for measured latency.
+    Auto,
+    /// Prefer the lowest-latency reachable candidate and stay on it
+    /// (sticky). Only re-evaluates when the active path dies or
+    /// another candidate is *sustainedly and substantially* faster.
+    /// The default: for latency-sensitive input it's a strict
+    /// improvement on Auto, and portable (no hand-pinned IPs).
+    #[default]
+    Fastest,
+}
+
+/// Physical kind of the network interface an address lives on, as
+/// classified by the *advertising* peer (interface type is invisible
+/// from L3, so the peer publishes it via mDNS TXT). Used purely for a
+/// human-readable label in the address picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IfaceKind {
+    /// Ethernet / wired.
+    Wired,
+    /// Wi-Fi (802.11).
+    WiFi,
+    /// Anything else — VPN/tunnel, cellular, bridge, unknown.
+    Other,
+}
+
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     /// hostname of this client
@@ -319,6 +354,23 @@ pub struct ClientConfig {
     pub pos: Position,
     /// enter hook
     pub cmd: Option<String>,
+    /// Base connection policy (see [`ConnectionMode`]). Used on any
+    /// network without an explicit per-network lock. Defaults to
+    /// `Auto`.
+    #[serde(default)]
+    pub mode: ConnectionMode,
+    /// Per-network address locks for a multi-homed peer, keyed by an
+    /// opaque network fingerprint (default-gateway MAC, or a subnet
+    /// fallback — see the daemon's `network` module). When the
+    /// machine is on a network present in this map, the dialer
+    /// connects *only* to the mapped IP — the lever to stop a
+    /// dual-homed peer from flapping, scoped so it doesn't break
+    /// connectivity on other networks (a different LAN simply isn't
+    /// in the map → falls back to `mode`). Sticky: a locked address
+    /// that goes unreachable does *not* silently fail over. Empty in
+    /// legacy configs and by default.
+    #[serde(default)]
+    pub network_locks: HashMap<String, IpAddr>,
     /// Whether changes to this device's clipboard should be
     /// propagated to this peer. Per-pair gate on the *send* side;
     /// the receiving peer's `IncomingPeerConfig::clipboard_receive`
@@ -337,6 +389,8 @@ impl Default for ClientConfig {
             fix_ips: Default::default(),
             pos: Default::default(),
             cmd: None,
+            mode: ConnectionMode::default(),
+            network_locks: HashMap::new(),
             clipboard_send: false,
         }
     }
@@ -462,10 +516,39 @@ pub struct ClientState {
     pub alive: bool,
     /// ips from dns
     pub dns_ips: Vec<IpAddr>,
+    /// Addresses learned from the peer's mDNS service advertisement
+    /// (it publishes every interface's address, so a dual-homed peer
+    /// surfaces all of them without the user pinning anything). Folded
+    /// into [`Self::ips`] alongside `fix_ips`/`dns_ips`.
+    #[serde(default)]
+    pub discovered_ips: Vec<IpAddr>,
     /// all ip addresses associated with a particular client
     /// e.g. Laptops usually have at least an ethernet and a wifi port
     /// which have different ip addresses
     pub ips: HashSet<IpAddr>,
+    /// Per-address interface kind (Wired/Wi-Fi/Other) as advertised by
+    /// the peer over mDNS TXT. Display-only: drives the label next to
+    /// each address in the picker. Absent for peers that don't
+    /// advertise it (older builds, mDNS off).
+    #[serde(default)]
+    pub interfaces: HashMap<IpAddr, IfaceKind>,
+    /// The lock that applies on the machine's *current* network,
+    /// resolved by the daemon from [`ClientConfig::network_locks`].
+    /// `Some` means the dialer is pinned to this IP here; `None` means
+    /// the base [`ClientConfig::mode`] is in effect. Exposed so the
+    /// GUI can show which address (if any) is pinned on this network.
+    #[serde(default)]
+    pub active_lock: Option<IpAddr>,
+    /// Most-recent round-trip latency probe per candidate address, in
+    /// microseconds. Surfaced in the GUI next to each address so the
+    /// user can pick which interface to lock on a multi-homed peer.
+    /// A value of `Some(us)` is a reachable address measured at `us`
+    /// microseconds; `None` is an address whose last probe timed out
+    /// or was unreachable; an *absent* key means "not probed yet".
+    /// Populated by the daemon's background latency prober; defaults
+    /// to empty and is never persisted (live runtime state only).
+    #[serde(default)]
+    pub latencies: HashMap<IpAddr, Option<u32>>,
     /// client has pressed keys
     pub has_pressed_keys: bool,
     /// dns resolving in progress
@@ -622,6 +705,16 @@ pub enum FrontendRequest {
     /// Toggle whether clipboard changes on this device propagate to
     /// the given outgoing client. Per-pair send-side gate.
     SetClientClipboardSend(ClientHandle, bool),
+    /// Set the base connection policy ([`ConnectionMode`]) for a
+    /// client, and clear any explicit lock on the *current* network
+    /// (so picking "Auto"/"Fastest" in the GUI releases a pin set
+    /// here). Other networks' locks are untouched.
+    SetConnectionMode(ClientHandle, ConnectionMode),
+    /// Pin the outbound address to `ip` on the machine's *current*
+    /// network. The daemon computes the network fingerprint, so the
+    /// GUI only sends the chosen IP. Numeric only (never a hostname)
+    /// so re-resolution can't repoint the lock. Persisted; sticky.
+    SetNetworkLock(ClientHandle, IpAddr),
     /// Toggle whether clipboard text from the given authorized peer
     /// is applied to this device's clipboard. Per-pair receive-side
     /// gate, keyed on the peer's TLS certificate fingerprint.

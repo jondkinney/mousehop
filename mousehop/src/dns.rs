@@ -123,5 +123,44 @@ impl DnsTask {
 /// connection time.
 async fn resolve_hostname(hostname: &str) -> io::Result<Vec<IpAddr>> {
     let addrs = lookup_host((hostname, 0)).await?;
-    Ok(addrs.map(|sa| sa.ip()).collect())
+    Ok(addrs
+        .map(|sa| sa.ip())
+        .filter(|ip| !is_unusable_candidate(ip))
+        .collect())
+}
+
+/// IPv6 link-local addresses (`fe80::/10`) can't be dialed without a
+/// scope/zone id (the `%interface` suffix), which neither the resolver
+/// nor mousehop's config carries — so they are never usable connection
+/// candidates. Drop them at resolution time so they don't pollute the
+/// candidate set, get probed (always "unreachable"), join the connect
+/// race, or clutter the GUI's address picker.
+fn is_unusable_candidate(ip: &IpAddr) -> bool {
+    match ip {
+        // top 10 bits == 1111111010 -> fe80::/10
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+        IpAddr::V4(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn link_local_v6_is_filtered_but_routable_addrs_kept() {
+        // fe80::/10 link-local -> unusable
+        assert!(is_unusable_candidate(&IpAddr::V6(
+            "fe80::49e:d8c6:6411:f9de".parse::<Ipv6Addr>().unwrap()
+        )));
+        // a routable ULA (fd00::/8) stays a candidate
+        assert!(!is_unusable_candidate(&IpAddr::V6(
+            "fdb7:7db7:2cc4:4c2d::1".parse::<Ipv6Addr>().unwrap()
+        )));
+        // ordinary IPv4 stays a candidate
+        assert!(!is_unusable_candidate(&IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 153
+        ))));
+    }
 }

@@ -2,7 +2,7 @@ use crate::client::ClientManager;
 use crate::config::local_commit;
 use crate::discovery::{PrimaryCache, normalize_mdns_name};
 use local_channel::mpsc::{Receiver, Sender, channel};
-use mousehop_ipc::{ClientHandle, DEFAULT_PORT};
+use mousehop_ipc::{ClientHandle, ConnectionMode, DEFAULT_PORT};
 use mousehop_proto::{
     MAX_CLIPBOARD_SIZE, MAX_EVENT_SIZE, PROTOCOL_MAGIC, ProtoEvent, decode_clipboard_event,
     encode_clipboard_event,
@@ -196,6 +196,13 @@ pub(crate) struct MousehopConnection {
     recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
     recv_tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    /// Send timestamp of the most-recent keepalive ping per active
+    /// address. `receive_loop` subtracts it on `Pong` to get the live
+    /// round-trip latency of the *active* connection — measured over
+    /// the real DTLS/UDP path, so it's accurate and works even where a
+    /// host firewall drops the TCP probe (the active address is then
+    /// excluded from TCP probing; see [`ClientManager::probe_targets`]).
+    ping_sent_at: Rc<RefCell<HashMap<SocketAddr, Instant>>>,
     /// Map of `peer_hostname -> primary_ipv4` populated by the
     /// `Discovery` mDNS browse task. Read on every `connect_to_handle`
     /// to bias which address gets the handshake head-start. Empty
@@ -225,6 +232,7 @@ impl MousehopConnection {
             recv_rx,
             recv_tx,
             ping_response: Default::default(),
+            ping_sent_at: Default::default(),
             primary_hints,
             retry_state: Default::default(),
         }
@@ -249,6 +257,7 @@ impl MousehopConnection {
             recv_rx: dead_rx,
             recv_tx: self.recv_tx.clone(),
             ping_response: self.ping_response.clone(),
+            ping_sent_at: self.ping_sent_at.clone(),
             primary_hints: self.primary_hints.clone(),
             retry_state: self.retry_state.clone(),
         }
@@ -317,11 +326,30 @@ impl MousehopConnection {
                 self.connecting.clone(),
                 self.recv_tx.clone(),
                 self.ping_response.clone(),
+                self.ping_sent_at.clone(),
                 self.primary_hints.clone(),
                 self.retry_state.clone(),
             ));
         }
         Err(MousehopConnectionError::NotConnected)
+    }
+
+    /// Tear down any live connection for `handle` and clear its retry
+    /// gate so the next send re-dials from scratch. Called when the
+    /// user changes the locked address: the path we're on may be the
+    /// wrong interface now, so we drop it and let `connect_to_handle`
+    /// re-evaluate (honoring the new lock) on the next event. Closing
+    /// the connection unblocks its `receive_loop`/`ping_pong` tasks,
+    /// which run the normal `disconnect` teardown.
+    pub(crate) async fn reset_handle(&self, handle: ClientHandle) {
+        if let Some(addr) = self.client_manager.active_addr(handle) {
+            let conn = self.conns.lock().await.remove(&addr);
+            if let Some(conn) = conn {
+                let _ = conn.close().await;
+            }
+            self.client_manager.set_active_addr(handle, None);
+        }
+        self.retry_state.borrow_mut().remove(&handle);
     }
 
     /// Decide whether to spawn another `connect_to_handle` for `handle`.
@@ -363,6 +391,7 @@ async fn connect_to_handle(
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    ping_sent_at: Rc<RefCell<HashMap<SocketAddr, Instant>>>,
     primary_hints: PrimaryCache,
     retry_state: Rc<RefCell<HashMap<ClientHandle, RetryState>>>,
 ) -> Result<(), MousehopConnectionError> {
@@ -384,7 +413,32 @@ async fn connect_to_handle(
             let key = normalize_mdns_name(&h);
             primary_hints.borrow().get(&key).copied()
         });
-        let preferred = primary_ip.map(|ip| SocketAddr::new(ip, port));
+        let primary_preferred = primary_ip.map(|ip| SocketAddr::new(ip, port));
+        // Resolve the connection policy for this peer:
+        //  * a per-network lock (already resolved against the current
+        //    LAN in `active_lock`) pins the dial set to one address, so
+        //    a dual-homed peer stops flapping between interfaces. Sticky
+        //    — an unreachable locked address fails rather than silently
+        //    falling back to another interface.
+        //  * otherwise the base mode decides: `Auto` races every
+        //    candidate biased to the mDNS primary; `Fastest` biases the
+        //    head-start toward the lowest-latency reachable candidate
+        //    (falling back to the mDNS primary before any probe lands).
+        let (addrs, preferred) = match client_manager.get_active_lock(handle) {
+            Some(ip) => {
+                let sa = SocketAddr::new(ip, port);
+                (vec![sa], Some(sa))
+            }
+            None => match client_manager.get_mode(handle) {
+                ConnectionMode::Auto => (addrs, primary_preferred),
+                ConnectionMode::Fastest => {
+                    let fastest = client_manager
+                        .lowest_latency_addr(handle)
+                        .map(|ip| SocketAddr::new(ip, port));
+                    (addrs, fastest.or(primary_preferred))
+                }
+            },
+        };
         log::info!("client ({handle}) connecting ... (ips: {addrs:?}, preferred: {preferred:?})");
         if addrs.is_empty() && preferred.is_none() {
             // Nothing to dial. Bump backoff and bail without spawning
@@ -421,7 +475,12 @@ async fn connect_to_handle(
         spawn_local(hello_handshake(addr, conn.clone(), hello_ok.clone()));
 
         // poll connection for active
-        spawn_local(ping_pong(addr, conn.clone(), ping_response.clone()));
+        spawn_local(ping_pong(
+            addr,
+            conn.clone(),
+            ping_response.clone(),
+            ping_sent_at.clone(),
+        ));
 
         // receiver
         spawn_local(receive_loop(
@@ -432,6 +491,7 @@ async fn connect_to_handle(
             conns,
             tx,
             ping_response.clone(),
+            ping_sent_at,
             hello_ok,
         ));
         return Ok(());
@@ -484,12 +544,18 @@ async fn ping_pong(
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    ping_sent_at: Rc<RefCell<HashMap<SocketAddr, Instant>>>,
 ) {
     loop {
         let (buf, len) = ProtoEvent::Ping.into();
 
         // send 4 pings, at least one must be answered
         for _ in 0..4 {
+            // Stamp the send time so `receive_loop` can derive the live
+            // RTT from the matching Pong. On a LAN the Pong returns well
+            // within the 500 ms inter-ping gap, so the most-recent stamp
+            // is the one being answered.
+            ping_sent_at.borrow_mut().insert(addr, Instant::now());
             if let Err(e) = conn.send(&buf[..len]).await {
                 log::warn!("{addr}: send error `{e}`, closing connection");
                 let _ = conn.close().await;
@@ -517,6 +583,7 @@ async fn receive_loop(
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    ping_sent_at: Rc<RefCell<HashMap<SocketAddr, Instant>>>,
     hello_ok: Rc<Cell<bool>>,
 ) {
     // Buffer sized for the largest legal clipboard frame so a single
@@ -546,6 +613,13 @@ async fn receive_loop(
                 client_manager.set_active_addr(handle, Some(addr));
                 client_manager.set_alive(handle, b);
                 ping_response.borrow_mut().insert(addr);
+                // Live RTT of the active connection over the real DTLS
+                // path — accurate and firewall-proof (unlike the TCP
+                // probe). Quantize to 100 µs to match the prober.
+                if let Some(sent) = ping_sent_at.borrow_mut().remove(&addr) {
+                    let us = sent.elapsed().as_micros().min(u32::MAX as u128) as u32;
+                    client_manager.set_latency(handle, addr.ip(), Some(us - (us % 100)));
+                }
             }
             ProtoEvent::Hello { magic, commit } => {
                 if magic != PROTOCOL_MAGIC {

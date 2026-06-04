@@ -1,13 +1,13 @@
 use std::{
     cell::RefCell,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     rc::Rc,
 };
 
 use slab::Slab;
 
-use mousehop_ipc::{ClientConfig, ClientHandle, ClientState, Position};
+use mousehop_ipc::{ClientConfig, ClientHandle, ClientState, ConnectionMode, IfaceKind, Position};
 
 use crate::config::ConfigClient;
 
@@ -33,6 +33,8 @@ impl ClientManager {
             port: config_client.port,
             pos: config_client.pos,
             cmd: config_client.enter_hook,
+            mode: config_client.mode,
+            network_locks: config_client.network_locks,
             clipboard_send: config_client.clipboard_send,
         };
         let state = ClientState {
@@ -195,7 +197,14 @@ impl ClientManager {
                 .iter()
                 .cloned()
                 .chain(s.dns_ips.iter().cloned())
+                .chain(s.discovered_ips.iter().cloned())
                 .collect::<HashSet<_>>();
+            // Drop per-address metadata for addresses that are no longer
+            // candidates so the GUI never shows a stale RTT / label next
+            // to an IP that has since disappeared from DNS / discovery /
+            // the fix list.
+            s.latencies.retain(|ip, _| s.ips.contains(ip));
+            s.interfaces.retain(|ip, _| s.ips.contains(ip));
         }
     }
 
@@ -345,6 +354,210 @@ impl ClientManager {
         }
     }
 
+    pub(crate) fn get_mode(&self, handle: ClientHandle) -> ConnectionMode {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(c, _)| c.mode)
+            .unwrap_or_default()
+    }
+
+    /// Set the base connection policy *and* drop any explicit lock for
+    /// the current network (picking Auto/Fastest releases a pin set on
+    /// this LAN). Returns `true` if anything changed.
+    pub(crate) fn set_mode(
+        &self,
+        handle: ClientHandle,
+        mode: ConnectionMode,
+        current_network: Option<&str>,
+    ) -> bool {
+        let mut clients = self.clients.borrow_mut();
+        let Some((c, _)) = clients.get_mut(handle as usize) else {
+            return false;
+        };
+        let mut changed = c.mode != mode;
+        c.mode = mode;
+        if let Some(net) = current_network {
+            changed |= c.network_locks.remove(net).is_some();
+        }
+        changed
+    }
+
+    /// Pin `ip` for `current_network`. Returns `true` if the stored
+    /// lock for this network changed.
+    pub(crate) fn set_network_lock(
+        &self,
+        handle: ClientHandle,
+        current_network: &str,
+        ip: IpAddr,
+    ) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((c, _)) if c.network_locks.get(current_network) != Some(&ip) => {
+                c.network_locks.insert(current_network.to_string(), ip);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Resolve the lock that applies on `current_network` into
+    /// `ClientState::active_lock`. Returns `true` if it changed, so the
+    /// caller re-broadcasts / re-dials only on real moves.
+    pub(crate) fn recompute_active_lock(
+        &self,
+        handle: ClientHandle,
+        current_network: Option<&str>,
+    ) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((c, s)) => {
+                let lock = current_network
+                    .and_then(|net| c.network_locks.get(net))
+                    .copied();
+                if s.active_lock != lock {
+                    s.active_lock = lock;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// The lock currently in force (already resolved against the active
+    /// network by [`Self::recompute_active_lock`]).
+    pub(crate) fn get_active_lock(&self, handle: ClientHandle) -> Option<IpAddr> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .and_then(|(_, s)| s.active_lock)
+    }
+
+    /// Lowest-latency *reachable* candidate, for `ConnectionMode::Fastest`.
+    /// `None` when nothing has a usable measurement yet.
+    pub(crate) fn lowest_latency_addr(&self, handle: ClientHandle) -> Option<IpAddr> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .and_then(|(_, s)| {
+                s.latencies
+                    .iter()
+                    .filter_map(|(ip, rtt)| rtt.map(|us| (us, *ip)))
+                    .min()
+                    .map(|(_, ip)| ip)
+            })
+    }
+
+    /// For `Fastest` mode: the candidate that is *substantially* faster
+    /// than the currently-active address — at least 2× and 15 ms better
+    /// — or `None` if the active path is already (near-)fastest or we
+    /// lack measurements. The hysteresis margin keeps a marginally-
+    /// faster path from triggering a switch.
+    pub(crate) fn fastest_upgrade_candidate(&self, handle: ClientHandle) -> Option<IpAddr> {
+        const MIN_ABSOLUTE_GAIN_US: u32 = 15_000;
+        let clients = self.clients.borrow();
+        let (_, s) = clients.get(handle as usize)?;
+        let active = s.active_addr?.ip();
+        let active_us = s.latencies.get(&active).copied().flatten()?;
+        let (best_us, best_ip) = s
+            .latencies
+            .iter()
+            .filter_map(|(ip, rtt)| rtt.map(|us| (us, *ip)))
+            .min()?;
+        let substantial = best_us.saturating_mul(2) < active_us
+            && active_us.saturating_sub(best_us) >= MIN_ABSOLUTE_GAIN_US;
+        (best_ip != active && substantial).then_some(best_ip)
+    }
+
+    /// Replace the mDNS-discovered address set for a client and refold
+    /// the candidate set. Returns `true` if the discovered set changed.
+    pub(crate) fn set_discovered_ips(&self, handle: ClientHandle, discovered: Vec<IpAddr>) -> bool {
+        let changed = match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((_, s)) if s.discovered_ips != discovered => {
+                s.discovered_ips = discovered;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.update_ips(handle);
+        }
+        changed
+    }
+
+    /// Merge per-address interface kinds advertised by the peer. Only
+    /// keeps entries for current candidate addresses. Returns `true`
+    /// if the stored map changed.
+    pub(crate) fn set_interfaces(
+        &self,
+        handle: ClientHandle,
+        interfaces: HashMap<IpAddr, IfaceKind>,
+    ) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((_, s)) => {
+                let filtered: HashMap<IpAddr, IfaceKind> = interfaces
+                    .into_iter()
+                    .filter(|(ip, _)| s.ips.contains(ip))
+                    .collect();
+                if s.interfaces != filtered {
+                    s.interfaces = filtered;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// Record the latest round-trip probe for one candidate address
+    /// (`Some(micros)` reachable, `None` unreachable/timeout). Ignored
+    /// if the address is no longer a candidate (it may have just been
+    /// pruned by [`Self::update_ips`]). Returns `true` when the stored
+    /// value changed, so the caller only re-broadcasts on real moves.
+    pub(crate) fn set_latency(
+        &self,
+        handle: ClientHandle,
+        ip: IpAddr,
+        rtt_micros: Option<u32>,
+    ) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((_, s)) if s.ips.contains(&ip) => match s.latencies.get(&ip) {
+                Some(prev) if *prev == rtt_micros => false,
+                _ => {
+                    s.latencies.insert(ip, rtt_micros);
+                    true
+                }
+            },
+            _ => false,
+        }
+    }
+
+    /// Snapshot of `(handle, port, candidate ips)` for every
+    /// registered client, for the background latency prober. The
+    /// *active* address is excluded — its latency comes from the live
+    /// connection's ping/pong RTT (accurate, and works through a
+    /// firewall that drops the TCP probe), so probing it would only
+    /// risk overwriting that with a TCP timeout. Clients left with no
+    /// inactive candidates are dropped. Takes an owned copy so the
+    /// prober never holds the borrow across its async probes.
+    pub(crate) fn probe_targets(&self) -> Vec<(ClientHandle, u16, Vec<IpAddr>)> {
+        self.clients
+            .borrow()
+            .iter()
+            .filter_map(|(k, (c, s))| {
+                let active = s.active_addr.map(|a| a.ip());
+                let ips: Vec<IpAddr> = s
+                    .ips
+                    .iter()
+                    .copied()
+                    .filter(|ip| Some(*ip) != active)
+                    .collect();
+                (!ips.is_empty()).then_some((k as ClientHandle, c.port, ips))
+            })
+            .collect()
+    }
+
     /// Snapshot of every client whose `clipboard_send` is true and
     /// whose state is `active`. Used by Service to fan-out a local
     /// clipboard change without holding the manager's borrow across
@@ -356,5 +569,129 @@ impl ClientManager {
             .filter(|(_, (c, s))| c.clipboard_send && s.active)
             .map(|(k, _)| k as ClientHandle)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ConfigClient;
+    use std::net::Ipv4Addr;
+
+    fn ip(a: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, a))
+    }
+
+    fn manager_with_ips(ips: &[IpAddr]) -> (ClientManager, ClientHandle) {
+        let cm = ClientManager::default();
+        let handle = cm.add_with_config(ConfigClient {
+            ips: ips.iter().copied().collect(),
+            hostname: None,
+            port: 4252,
+            pos: Default::default(),
+            active: false,
+            enter_hook: None,
+            mode: ConnectionMode::Auto,
+            network_locks: HashMap::new(),
+            clipboard_send: false,
+        });
+        (cm, handle)
+    }
+
+    const NET_A: &str = "gw:aa:bb:cc:dd:ee:01";
+    const NET_B: &str = "gw:aa:bb:cc:dd:ee:02";
+
+    #[test]
+    fn network_lock_only_applies_on_its_own_network() {
+        let (cm, h) = manager_with_ips(&[ip(10), ip(20)]);
+        // lock .10 on network A
+        assert!(cm.set_network_lock(h, NET_A, ip(10)));
+        // on network A the lock resolves
+        assert!(cm.recompute_active_lock(h, Some(NET_A)));
+        assert_eq!(cm.get_active_lock(h), Some(ip(10)));
+        // on a different network there's no lock -> falls back to Auto
+        assert!(cm.recompute_active_lock(h, Some(NET_B)));
+        assert_eq!(cm.get_active_lock(h), None);
+        // back on A it resolves again
+        assert!(cm.recompute_active_lock(h, Some(NET_A)));
+        assert_eq!(cm.get_active_lock(h), Some(ip(10)));
+    }
+
+    #[test]
+    fn setting_mode_clears_current_network_lock_only() {
+        let (cm, h) = manager_with_ips(&[ip(10)]);
+        cm.set_network_lock(h, NET_A, ip(10));
+        cm.set_network_lock(h, NET_B, ip(10));
+        // switching to Fastest on network A clears A's lock, keeps B's
+        assert!(cm.set_mode(h, ConnectionMode::Fastest, Some(NET_A)));
+        assert_eq!(cm.get_mode(h), ConnectionMode::Fastest);
+        cm.recompute_active_lock(h, Some(NET_A));
+        assert_eq!(cm.get_active_lock(h), None);
+        cm.recompute_active_lock(h, Some(NET_B));
+        assert_eq!(cm.get_active_lock(h), Some(ip(10)));
+    }
+
+    #[test]
+    fn lowest_latency_addr_picks_min_reachable() {
+        let (cm, h) = manager_with_ips(&[ip(10), ip(20), ip(30)]);
+        cm.set_latency(h, ip(10), Some(5000));
+        cm.set_latency(h, ip(20), Some(900));
+        cm.set_latency(h, ip(30), None); // unreachable -> ignored
+        assert_eq!(cm.lowest_latency_addr(h), Some(ip(20)));
+    }
+
+    #[test]
+    fn discovered_ips_fold_into_candidates() {
+        let (cm, h) = manager_with_ips(&[ip(10)]);
+        assert!(cm.set_discovered_ips(h, vec![ip(20), ip(30)]));
+        let (_, state) = cm.get_state(h).unwrap();
+        assert!(state.ips.contains(&ip(10))); // fix ip kept
+        assert!(state.ips.contains(&ip(20))); // discovered folded in
+        assert!(state.ips.contains(&ip(30)));
+    }
+
+    #[test]
+    fn set_latency_only_for_known_addresses() {
+        let (cm, h) = manager_with_ips(&[ip(10), ip(20)]);
+        // a candidate address stores and reports a change
+        assert!(cm.set_latency(h, ip(10), Some(800)));
+        // re-storing the same value is not a change
+        assert!(!cm.set_latency(h, ip(10), Some(800)));
+        // a different value is a change
+        assert!(cm.set_latency(h, ip(10), Some(900)));
+        // an address that isn't a candidate is ignored
+        assert!(!cm.set_latency(h, ip(99), Some(100)));
+        let (_, state) = cm.get_state(h).unwrap();
+        assert_eq!(state.latencies.get(&ip(10)), Some(&Some(900)));
+        assert_eq!(state.latencies.get(&ip(99)), None);
+    }
+
+    #[test]
+    fn update_ips_prunes_stale_latencies() {
+        let (cm, h) = manager_with_ips(&[ip(10), ip(20)]);
+        cm.set_latency(h, ip(10), Some(800));
+        cm.set_latency(h, ip(20), None);
+        // drop .20 from the candidate set
+        cm.set_fix_ips(h, vec![ip(10)]);
+        let (_, state) = cm.get_state(h).unwrap();
+        assert!(state.latencies.contains_key(&ip(10)));
+        assert!(
+            !state.latencies.contains_key(&ip(20)),
+            "latency for a removed address must be pruned"
+        );
+    }
+
+    #[test]
+    fn probe_targets_skips_clients_without_candidates() {
+        let (cm, with) = manager_with_ips(&[ip(10), ip(20)]);
+        let empty = cm.add_client(); // no candidate ips
+        let targets = cm.probe_targets();
+        let with_entry = targets.iter().find(|(h, _, _)| *h == with).unwrap();
+        assert_eq!(with_entry.1, 4252);
+        assert_eq!(with_entry.2.len(), 2);
+        assert!(
+            !targets.iter().any(|(h, _, _)| *h == empty),
+            "a client with no candidate ips must not be a probe target"
+        );
     }
 }
