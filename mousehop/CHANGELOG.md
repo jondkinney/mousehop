@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/jondkinney/mousehop/compare/v0.12.0...v0.13.0) - 2026-06-04
+
+### Added
+
+- *(macos)* MOUSEHOP_DISABLE_TCC_WATCH to keep the daemon alive without an AX grant
+- `mousehop firewall` subcommand to open the LAN port
+- dual-homed peer connection support
+
+### Fixed
+
+- *(firewall)* re-include windows in the `s` helper's cfg gate
+- *(firewall)* gate Linux-only helpers to silence dead-code on other targets
+
+### Other
+
+- *(latency)* skip the refused-connect probe on windows
+
 ## [0.12.0](https://github.com/jondkinney/mousehop/compare/v0.11.8...v0.12.0) - 2026-05-28
 
 ### Added
