@@ -90,9 +90,11 @@ rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
 [package.metadata.bundle]
 name = "Mousehop"
-# Paths are relative to this manifest (mousehop/Cargo.toml).
-# `target/` and `build-aux/` live at the workspace root, so the
-# bundle's icon and resources sit one level up.
+# `target/` and `build-aux/` live at the workspace root. cargo-bundle
+# resolves these globs from the *current working directory* (not the
+# manifest), so the release workflow must `cd mousehop && cargo bundle`
+# — otherwise the icon, menu-bar template, and LSUIElement / TCC
+# usage-description plist are silently dropped from the .app.
 icon = ["../target/icon.icns"]
 identifier = "com.mousehop.Mousehop"
 osx_info_plist_exts = ["../build-aux/macos-lsui-element.plist"]

@@ -171,11 +171,13 @@ jobs:
     - name: Install cargo bundle
       run: cargo install cargo-bundle
     - name: Bundle
-      # -p mousehop is required since the root is a virtual workspace
-      # (PR #17); cargo bundle has no implicit root package to bundle.
-      # The [package.metadata.bundle] block lives in mousehop/Cargo.toml.
+      # Must run from mousehop/ so cargo-bundle's icon / resources /
+      # osx_info_plist_exts globs resolve against the manifest dir.
+      # The globs are evaluated from CWD (not the manifest), so running
+      # from the workspace root silently drops the icon, the menu-bar
+      # template PNG, and the LSUIElement / TCC usage-description plist.
       run: |
-        cargo bundle --release -p mousehop
+        (cd mousehop && cargo bundle --release)
         scripts/copy-macos-dylib.sh "target/release/bundle/osx/Mousehop.app/Contents/MacOS/mousehop"
     - name: Sign, notarize & package DMG
       env:
@@ -238,11 +240,13 @@ jobs:
     - name: Install cargo bundle
       run: cargo install cargo-bundle
     - name: Bundle
-      # -p mousehop is required since the root is a virtual workspace
-      # (PR #17); cargo bundle has no implicit root package to bundle.
-      # The [package.metadata.bundle] block lives in mousehop/Cargo.toml.
+      # Must run from mousehop/ so cargo-bundle's icon / resources /
+      # osx_info_plist_exts globs resolve against the manifest dir.
+      # The globs are evaluated from CWD (not the manifest), so running
+      # from the workspace root silently drops the icon, the menu-bar
+      # template PNG, and the LSUIElement / TCC usage-description plist.
       run: |
-        cargo bundle --release -p mousehop
+        (cd mousehop && cargo bundle --release)
         scripts/copy-macos-dylib.sh "target/release/bundle/osx/Mousehop.app/Contents/MacOS/mousehop"
     - name: Sign, notarize & package DMG
       env:
