@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::base::{CFRelease, kCFAllocatorDefault};
 use core_foundation::string::{CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8};
+use core_foundation_sys::number::{CFNumberGetValue, CFNumberRef, kCFNumberSInt64Type};
 use core_graphics::base::CGFloat;
 use core_graphics::display::{
     CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
@@ -27,9 +28,85 @@ use tokio::{sync::Notify, task::JoinHandle};
 
 use super::error::MacOSEmulationCreationError;
 
+/// Fallback initial key-repeat delay used only when the host's
+/// `InitialKeyRepeat` global preference can't be read (see
+/// [`read_key_repeat_prefs`]).
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
+/// Fallback key-repeat interval used only when the host's `KeyRepeat`
+/// global preference can't be read (see [`read_key_repeat_prefs`]).
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Reads this Mac's keyboard repeat settings and returns them as
+/// `(initial_delay, repeat_interval)`.
+///
+/// Synthetic `CGEvent`s posted by mousehop do **not** auto-repeat the
+/// way a physically held key does — macOS only generates auto-repeat
+/// for real HID input — so this sink synthesizes the repeat stream
+/// itself. Reading the host's own `InitialKeyRepeat` / `KeyRepeat`
+/// preferences (System Settings → Keyboard) here makes forwarded keys
+/// feel identical to typing directly on this machine, instead of being
+/// locked to a hardcoded rate.
+///
+/// Both values live in the global preferences domain
+/// (`NSGlobalDomain` / `.GlobalPreferences`) as integers expressed in
+/// units of 1/60 second — the historic 60 Hz tick the keyboard layer
+/// uses. When "Key Repeat" is set to "Off", macOS stores a very large
+/// value, which naturally yields an effectively infinite delay (a
+/// single press, no repeat). A missing key falls back to the
+/// `DEFAULT_*` constants above. We re-read on every press so changing
+/// the sliders takes effect without restarting mousehop.
+fn read_key_repeat_prefs() -> (Duration, Duration) {
+    let initial = read_global_int_pref("InitialKeyRepeat")
+        .map(ticks_to_duration)
+        .unwrap_or(DEFAULT_REPEAT_DELAY);
+    let interval = read_global_int_pref("KeyRepeat")
+        .map(ticks_to_duration)
+        .unwrap_or(DEFAULT_REPEAT_INTERVAL);
+    (initial, interval)
+}
+
+/// Converts a key-repeat preference value (1/60 second ticks) into a
+/// [`Duration`]. Negative/garbage values clamp to zero.
+fn ticks_to_duration(ticks: i64) -> Duration {
+    Duration::from_millis(ticks.max(0) as u64 * 1000 / 60)
+}
+
+/// Reads an integer key from the macOS global preferences domain,
+/// returning `None` when the key is absent or not a number. Mirrors the
+/// `CFPreferencesCopyAppValue` pattern already used on the capture side.
+fn read_global_int_pref(name: &str) -> Option<i64> {
+    unsafe {
+        let key_cstr = CString::new(name).ok()?;
+        let key = CFStringCreateWithCString(
+            kCFAllocatorDefault,
+            key_cstr.as_ptr() as *const c_char,
+            kCFStringEncodingUTF8,
+        );
+        if key.is_null() {
+            return None;
+        }
+        let value = CFPreferencesCopyAppValue(key, kCFPreferencesAnyApplication);
+        CFRelease(key as *const c_void);
+        if value.is_null() {
+            return None;
+        }
+        let mut out: i64 = 0;
+        let ok = CFNumberGetValue(
+            value as CFNumberRef,
+            kCFNumberSInt64Type,
+            &mut out as *mut i64 as *mut c_void,
+        );
+        CFRelease(value);
+        if ok { Some(out) } else { None }
+    }
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFPreferencesCopyAppValue(key: CFStringRef, application_id: CFStringRef) -> *const c_void;
+    static kCFPreferencesAnyApplication: CFStringRef;
+}
 
 pub(crate) struct MacOSEmulation {
     /// global event source for all events
@@ -132,20 +209,24 @@ impl MacOSEmulation {
         self.cancel_repeat_task().await;
         // initial key event
         key_event(self.event_source.clone(), key, 1, self.modifier_state.get());
+        // Use the host's own keyboard repeat settings so forwarded keys
+        // feel identical to typing directly on this Mac, rather than a
+        // fixed hardcoded rate.
+        let (repeat_delay, repeat_interval) = read_key_repeat_prefs();
         // repeat task
         let event_source = self.event_source.clone();
         let notify = self.notify_repeat_task.clone();
         let modifiers = self.modifier_state.clone();
         let repeat_task = tokio::task::spawn_local(async move {
             let stop = tokio::select! {
-                _ = tokio::time::sleep(DEFAULT_REPEAT_DELAY) => false,
+                _ = tokio::time::sleep(repeat_delay) => false,
                 _ = notify.notified() => true,
             };
             if !stop {
                 loop {
                     key_event(event_source.clone(), key, 1, modifiers.get());
                     tokio::select! {
-                        _ = tokio::time::sleep(DEFAULT_REPEAT_INTERVAL) => {},
+                        _ = tokio::time::sleep(repeat_interval) => {},
                         _ = notify.notified() => break,
                     }
                 }
