@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.3](https://github.com/jondkinney/mousehop/compare/v0.13.2...v0.13.3) - 2026-06-05
+
+### Added
+
+- *(input)* match host key-repeat settings for forwarded keys
+
 ## [0.13.2](https://github.com/jondkinney/mousehop/compare/v0.13.1...v0.13.2) - 2026-06-05
 
 ### Fixed
