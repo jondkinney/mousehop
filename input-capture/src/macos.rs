@@ -291,6 +291,16 @@ fn get_events(
 
     match ev_type {
         CGEventType::KeyDown => {
+            // Drop OS-generated auto-repeat KeyDowns. macOS streams a
+            // run of KeyDown events (this field set to 1) while a key is
+            // held; forwarding them would collide with the sink's own
+            // repeat generation — every sink (Linux compositors, and the
+            // macOS/Windows repeat tasks) synthesizes repeat from a
+            // single held key. Forward only the genuine initial press so
+            // the sink owns repeat timing.
+            if ev.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0 {
+                return Ok(());
+            }
             let k = map_key(ev)?;
             result.push(CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                 time: 0,

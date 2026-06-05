@@ -5,6 +5,7 @@ use input_event::{
 };
 
 use async_trait::async_trait;
+use std::ffi::c_void;
 use std::ops::BitOrAssign;
 use std::time::Duration;
 use tokio::task::AbortHandle;
@@ -18,13 +19,60 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_0, KEYEVENTF_EXTENDEDKEY, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, SendInput,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SetCursorPos, XBUTTON1, XBUTTON2,
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SPI_GETKEYBOARDDELAY,
+    SPI_GETKEYBOARDSPEED, SYSTEM_PARAMETERS_INFO_ACTION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SetCursorPos, SystemParametersInfoW, XBUTTON1, XBUTTON2,
 };
 
 use super::{Emulation, EmulationHandle};
 
+/// Fallback initial key-repeat delay used only when the keyboard delay
+/// can't be read from the OS (see [`read_key_repeat_settings`]).
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
+/// Fallback key-repeat interval used only when the keyboard speed can't
+/// be read from the OS (see [`read_key_repeat_settings`]).
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
+
+/// Reads this machine's keyboard repeat settings and returns them as
+/// `(initial_delay, repeat_interval)`.
+///
+/// `SendInput`-injected keystrokes don't auto-repeat on Windows, so this
+/// sink synthesizes the repeat stream itself. Reading the host's own
+/// settings (Control Panel → Keyboard) makes forwarded keys feel like
+/// typing directly on this machine instead of a hardcoded rate.
+///
+/// * `SPI_GETKEYBOARDDELAY` returns 0..=3, where each step is ~250 ms,
+///   so the delay is `(value + 1) * 250` ms.
+/// * `SPI_GETKEYBOARDSPEED` returns 0..=31, mapping roughly linearly
+///   from ~2.5 repeats/sec (0) to ~30 repeats/sec (31).
+fn read_key_repeat_settings() -> (Duration, Duration) {
+    let delay = read_spi_u32(SPI_GETKEYBOARDDELAY)
+        .map(|v| Duration::from_millis(u64::from(v.min(3) + 1) * 250))
+        .unwrap_or(DEFAULT_REPEAT_DELAY);
+    let interval = read_spi_u32(SPI_GETKEYBOARDSPEED)
+        .map(|v| {
+            let cps = 2.5 + f64::from(v.min(31)) * (30.0 - 2.5) / 31.0;
+            Duration::from_millis((1000.0 / cps) as u64)
+        })
+        .unwrap_or(DEFAULT_REPEAT_INTERVAL);
+    (delay, interval)
+}
+
+/// Reads a `SystemParametersInfoW` action that yields a single `u32`,
+/// returning `None` if the call fails.
+fn read_spi_u32(action: SYSTEM_PARAMETERS_INFO_ACTION) -> Option<u32> {
+    let mut value: u32 = 0;
+    unsafe {
+        SystemParametersInfoW(
+            action,
+            0,
+            Some(&mut value as *mut u32 as *mut c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .ok()?;
+    }
+    Some(value)
+}
 
 pub(crate) struct WindowsEmulation {
     repeat_task: Option<AbortHandle>,
@@ -114,11 +162,14 @@ impl WindowsEmulation {
         // there can only be one repeating key and it's
         // always the last to be pressed
         self.kill_repeat_task();
+        // Use the host's own keyboard repeat settings so forwarded keys
+        // feel identical to typing directly on this machine.
+        let (repeat_delay, repeat_interval) = read_key_repeat_settings();
         let repeat_task = tokio::task::spawn_local(async move {
-            tokio::time::sleep(DEFAULT_REPEAT_DELAY).await;
+            tokio::time::sleep(repeat_delay).await;
             loop {
                 key_event(key, 1);
-                tokio::time::sleep(DEFAULT_REPEAT_INTERVAL).await;
+                tokio::time::sleep(repeat_interval).await;
             }
         });
         self.repeat_task = Some(repeat_task.abort_handle());
