@@ -95,6 +95,11 @@ name = "Mousehop"
 # manifest), so the release workflow must `cd mousehop && cargo bundle`
 # — otherwise the icon, menu-bar template, and LSUIElement / TCC
 # usage-description plist are silently dropped from the .app.
+#
+# The `resources` glob's `..` segment is then rewritten to `_up_` by
+# cargo-bundle's resource_relpath, so `menubar-template.png` lands at
+# `Resources/_up_/target/...`. `scripts/copy-macos-dylib.sh` flattens
+# it back to the Resources root so NSBundle pathForResource: finds it.
 icon = ["../target/icon.icns"]
 identifier = "com.mousehop.Mousehop"
 osx_info_plist_exts = ["../build-aux/macos-lsui-element.plist"]
