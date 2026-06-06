@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.4](https://github.com/jondkinney/mousehop/compare/v0.13.3...v0.13.4) - 2026-06-06
+
+### Fixed
+
+- *(capture/macos)* recompute display bounds from scratch each refresh
+
 ## [0.13.3](https://github.com/jondkinney/mousehop/compare/v0.13.2...v0.13.3) - 2026-06-05
 
 ### Added
