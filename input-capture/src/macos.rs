@@ -112,13 +112,38 @@ impl InputCaptureState {
     fn update_bounds(&mut self) -> Result<(), MacosCaptureCreationError> {
         let active_ids =
             CGDisplay::active_displays().map_err(MacosCaptureCreationError::ActiveDisplays)?;
+
+        // Recompute from scratch every call. Folding into the previous
+        // `self.bounds` (the old behavior) meant `xmax`/`ymax` could
+        // only ever grow — so removing a large display (e.g. clamshell
+        // on a 6K external → lid-open built-in) left a stale, too-wide
+        // `xmax`, and the rightmost band of the real screen became an
+        // unreachable dead zone (`crossed`/`start_capture` clamp to it).
+        // Seeding with infinities lets the bounds shrink, and also fixes
+        // the first-call case for displays with a negative origin (the
+        // old `Bounds::default()` seed of 0.0 was wrong there too).
+        let mut bounds = Bounds {
+            xmin: f64::INFINITY,
+            xmax: f64::NEG_INFINITY,
+            ymin: f64::INFINITY,
+            ymax: f64::NEG_INFINITY,
+        };
         active_ids.iter().for_each(|d| {
-            let bounds = CGDisplay::new(*d).bounds();
-            self.bounds.xmin = self.bounds.xmin.min(bounds.origin.x);
-            self.bounds.xmax = self.bounds.xmax.max(bounds.origin.x + bounds.size.width);
-            self.bounds.ymin = self.bounds.ymin.min(bounds.origin.y);
-            self.bounds.ymax = self.bounds.ymax.max(bounds.origin.y + bounds.size.height);
+            let b = CGDisplay::new(*d).bounds();
+            bounds.xmin = bounds.xmin.min(b.origin.x);
+            bounds.xmax = bounds.xmax.max(b.origin.x + b.size.width);
+            bounds.ymin = bounds.ymin.min(b.origin.y);
+            bounds.ymax = bounds.ymax.max(b.origin.y + b.size.height);
         });
+
+        // Only commit if at least one display contributed. A transient
+        // zero-display snapshot mid-reconfiguration would otherwise
+        // leave ±infinity bounds; keep the previous bounds instead.
+        if bounds.xmax.is_finite() && bounds.ymax.is_finite() {
+            self.bounds = bounds;
+        } else {
+            log::warn!("update_bounds: no active displays; keeping previous bounds");
+        }
 
         log::debug!("Updated displays bounds: {0:?}", self.bounds);
         Ok(())
