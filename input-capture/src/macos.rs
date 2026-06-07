@@ -489,8 +489,7 @@ fn get_events(
                 // finger lifts. Flag it so a non-macOS sink can drop it (it
                 // would otherwise pin the sink's gap-inference kinetic scroll).
                 const SCROLL_WHEEL_EVENT_MOMENTUM_PHASE: u32 = 123;
-                let momentum =
-                    ev.get_integer_value_field(SCROLL_WHEEL_EVENT_MOMENTUM_PHASE) != 0;
+                let momentum = ev.get_integer_value_field(SCROLL_WHEEL_EVENT_MOMENTUM_PHASE) != 0;
                 let v = sign
                     * ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
                 let h = sign
@@ -501,6 +500,25 @@ fn get_events(
                         axis: 0, // Vertical
                         value: v as f64,
                         momentum,
+                    })));
+                }
+                // Rest-to-stop over the link. A cohort app stops its kinetic
+                // coast when fingers rest on the trackpad; locally that's the
+                // Wayland hold gesture, but no virtual-input backend can inject
+                // a pointer gesture, so it can't cross the KVM. macOS signals a
+                // finger touch-down as a CGScrollPhase Began(1)/MayBegin(128)
+                // event with no movement (and no momentum). Forward a 1px nudge
+                // on it so the sink cohort app's raw-delta re-touch path halts
+                // the fling. These are edge events (one per touch-down), so a
+                // motionless rest doesn't creep; a real scroll absorbs the 1px.
+                const SCROLL_WHEEL_EVENT_SCROLL_PHASE: u32 = 99;
+                let scroll_phase = ev.get_integer_value_field(SCROLL_WHEEL_EVENT_SCROLL_PHASE);
+                if !momentum && v == 0 && h == 0 && matches!(scroll_phase, 1 | 128) {
+                    result.push(CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
+                        time: 0,
+                        axis: 0, // Vertical — trips the sink's re-touch stop.
+                        value: 1.0,
+                        momentum: false,
                     })));
                 }
                 if h != 0 {

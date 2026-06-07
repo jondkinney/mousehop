@@ -93,7 +93,11 @@ impl Display for PointerEvent {
                 value,
                 momentum,
                 ..
-            } => write!(f, "scroll({axis}, {value}{})", if *momentum { ", momentum" } else { "" }),
+            } => write!(
+                f,
+                "scroll({axis}, {value}{})",
+                if *momentum { ", momentum" } else { "" }
+            ),
             PointerEvent::AxisDiscrete120 { axis, value } => {
                 write!(f, "scroll-120 ({axis}, {value})")
             }
