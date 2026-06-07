@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/jondkinney/mousehop/compare/v0.13.4...v0.14.0) - 2026-06-07
+
+### Added
+
+- *(scroll)* drop forwarded macOS momentum on non-mac sinks
+- *(scroll)* [**breaking**] stop a forwarded coast on a finger rest
+
 ## [0.13.4](https://github.com/jondkinney/mousehop/compare/v0.13.3...v0.13.4) - 2026-06-06
 
 ### Fixed
