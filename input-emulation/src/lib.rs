@@ -209,6 +209,19 @@ impl InputEmulation {
             .get(&handle)
             .copied()
             .unwrap_or_default();
+        // Drop the source OS's momentum-coast scroll on a non-macOS sink. This
+        // machine doesn't replay OS momentum for injected scroll, and a cohort
+        // app synthesises its own fling from the gesture — so replaying a
+        // forwarded macOS coast just feeds its gap-inference a gapless stream
+        // and pins it at the edges. A macOS sink keeps these (it replays the
+        // coast, so a Mac->Mac session still glides). See input_event docs.
+        #[cfg(not(target_os = "macos"))]
+        if matches!(
+            event,
+            Event::Pointer(PointerEvent::Axis { momentum: true, .. })
+        ) {
+            return Ok(());
+        }
         let event = match event {
             Event::Pointer(PointerEvent::Motion { time, dx, dy })
                 if pp.mouse_sensitivity != 1.0 =>
@@ -219,13 +232,17 @@ impl InputEmulation {
                     dy: dy * pp.mouse_sensitivity,
                 })
             }
-            Event::Pointer(PointerEvent::Axis { time, axis, value }) if pp.natural_scroll => {
-                Event::Pointer(PointerEvent::Axis {
-                    time,
-                    axis,
-                    value: -value,
-                })
-            }
+            Event::Pointer(PointerEvent::Axis {
+                time,
+                axis,
+                value,
+                momentum,
+            }) if pp.natural_scroll => Event::Pointer(PointerEvent::Axis {
+                time,
+                axis,
+                value: -value,
+                momentum,
+            }),
             Event::Pointer(PointerEvent::AxisDiscrete120 { axis, value }) if pp.natural_scroll => {
                 Event::Pointer(PointerEvent::AxisDiscrete120 {
                     axis,

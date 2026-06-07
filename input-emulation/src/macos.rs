@@ -530,11 +530,10 @@ impl Emulation for MacOSEmulation {
                         }
                         event.post(CGEventTapLocation::HID);
                     }
-                    PointerEvent::Axis {
-                        time: _,
-                        axis,
-                        value,
-                    } => {
+                    // A macOS sink replays the source's momentum coast verbatim
+                    // (so a Mac->Mac session still glides) — momentum is applied,
+                    // not dropped, hence the `..`.
+                    PointerEvent::Axis { axis, value, .. } => {
                         let value = value as i32;
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, value, 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)

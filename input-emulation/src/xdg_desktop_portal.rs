@@ -99,11 +99,7 @@ impl Emulation for DesktopPortalEmulation {
                         )
                         .await?;
                 }
-                PointerEvent::Axis {
-                    time: _,
-                    axis,
-                    value,
-                } => {
+                PointerEvent::Axis { axis, value, .. } => {
                     let axis = match axis {
                         0 => Axis::Vertical,
                         _ => Axis::Horizontal,

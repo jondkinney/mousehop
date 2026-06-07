@@ -848,6 +848,7 @@ impl Dispatch<WlPointer, ()> for State {
                             time,
                             axis: u32::from(axis) as u8,
                             value,
+                            momentum: false,
                         })),
                     ));
                 }

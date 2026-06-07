@@ -90,11 +90,13 @@ fn to_input_events(ei_event: EiEvent) -> Events {
                 time: 0,
                 axis: 0,
                 value: delta.dy as f64,
+                momentum: false,
             });
             let dx = Event::Pointer(PointerEvent::Axis {
                 time: 0,
                 axis: 1,
                 value: delta.dx as f64,
+                momentum: false,
             });
             if delta.dy != 0. && delta.dx != 0. {
                 Events::Two(dy, dx)
