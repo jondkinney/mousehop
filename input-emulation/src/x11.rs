@@ -113,11 +113,7 @@ impl Emulation for X11Emulation {
                 } => {
                     self.emulate_mouse_button(button, state);
                 }
-                PointerEvent::Axis {
-                    time: _,
-                    axis,
-                    value,
-                } => {
+                PointerEvent::Axis { axis, value, .. } => {
                     self.emulate_scroll(axis, value);
                 }
                 PointerEvent::AxisDiscrete120 { axis, value } => {

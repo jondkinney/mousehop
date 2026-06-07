@@ -483,6 +483,14 @@ fn get_events(
             // of the Mac's preference. Receivers can re-invert.
             let sign: i64 = if natural_scrolling_enabled() { 1 } else { -1 };
             if ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS) != 0 {
+                // kCGScrollWheelEventMomentumPhase (raw field 123 — core-graphics
+                // 0.25 has no named constant). Non-zero = an OS-synthesised
+                // momentum-coast delta the trackpad keeps emitting after the
+                // finger lifts. Flag it so a non-macOS sink can drop it (it
+                // would otherwise pin the sink's gap-inference kinetic scroll).
+                const SCROLL_WHEEL_EVENT_MOMENTUM_PHASE: u32 = 123;
+                let momentum =
+                    ev.get_integer_value_field(SCROLL_WHEEL_EVENT_MOMENTUM_PHASE) != 0;
                 let v = sign
                     * ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
                 let h = sign
@@ -492,6 +500,7 @@ fn get_events(
                         time: 0,
                         axis: 0, // Vertical
                         value: v as f64,
+                        momentum,
                     })));
                 }
                 if h != 0 {
@@ -499,6 +508,7 @@ fn get_events(
                         time: 0,
                         axis: 1, // Horizontal
                         value: h as f64,
+                        momentum,
                     })));
                 }
             } else {

@@ -294,6 +294,7 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 time: decode_u32(&mut buf)?,
                 axis: decode_u8(&mut buf)?,
                 value: decode_f64(&mut buf)?,
+                momentum: decode_u8(&mut buf)? != 0,
             }))),
             EventType::PointerAxisValue120 => Ok(Self::Input(InputEvent::Pointer(
                 PointerEvent::AxisDiscrete120 {
@@ -380,10 +381,16 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                             encode_u32(buf, len, button);
                             encode_u32(buf, len, state);
                         }
-                        PointerEvent::Axis { time, axis, value } => {
+                        PointerEvent::Axis {
+                            time,
+                            axis,
+                            value,
+                            momentum,
+                        } => {
                             encode_u32(buf, len, time);
                             encode_u8(buf, len, axis);
                             encode_f64(buf, len, value);
+                            encode_u8(buf, len, momentum as u8);
                         }
                         PointerEvent::AxisDiscrete120 { axis, value } => {
                             encode_u8(buf, len, axis);

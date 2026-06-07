@@ -97,11 +97,7 @@ impl Emulation for WindowsEmulation {
                     button,
                     state,
                 } => mouse_button(button, state),
-                PointerEvent::Axis {
-                    time: _,
-                    axis,
-                    value,
-                } => scroll(axis, value as i32),
+                PointerEvent::Axis { axis, value, .. } => scroll(axis, value as i32),
                 PointerEvent::AxisDiscrete120 { axis, value } => scroll(axis, value),
             },
             Event::Keyboard(keyboard_event) => match keyboard_event {

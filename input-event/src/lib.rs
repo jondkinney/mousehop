@@ -19,8 +19,19 @@ pub enum PointerEvent {
     Motion { time: u32, dx: f64, dy: f64 },
     /// mouse button event
     Button { time: u32, button: u32, state: u32 },
-    /// axis event, scroll event for touchpads
-    Axis { time: u32, axis: u8, value: f64 },
+    /// axis event, scroll event for touchpads.
+    ///
+    /// `momentum` is `true` for the source OS's synthesised momentum-coast
+    /// deltas (macOS keeps emitting these after the finger lifts). A sink that
+    /// doesn't replay OS momentum for injected scroll (everything but a macOS
+    /// sink) drops them, so a forwarded macOS coast doesn't pin a cohort app's
+    /// gap-inference kinetic scroll. Always `false` off macOS sources.
+    Axis {
+        time: u32,
+        axis: u8,
+        value: f64,
+        momentum: bool,
+    },
     /// discrete axis event, scroll event for mice - 120 = one scroll tick
     AxisDiscrete120 { axis: u8, value: i32 },
 }
@@ -78,10 +89,11 @@ impl Display for PointerEvent {
                 }
             }
             PointerEvent::Axis {
-                time: _,
                 axis,
                 value,
-            } => write!(f, "scroll({axis}, {value})"),
+                momentum,
+                ..
+            } => write!(f, "scroll({axis}, {value}{})", if *momentum { ", momentum" } else { "" }),
             PointerEvent::AxisDiscrete120 { axis, value } => {
                 write!(f, "scroll-120 ({axis}, {value})")
             }

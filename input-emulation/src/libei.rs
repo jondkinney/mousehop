@@ -203,11 +203,7 @@ impl Emulation for LibeiEmulation {
                         d.frame(self.conn.serial(), now);
                     }
                 }
-                PointerEvent::Axis {
-                    time: _,
-                    axis,
-                    value,
-                } => {
+                PointerEvent::Axis { axis, value, .. } => {
                     let scroll_device = self.devices.scroll.read().unwrap();
                     if let Some((d, s)) = scroll_device.as_ref() {
                         match axis {

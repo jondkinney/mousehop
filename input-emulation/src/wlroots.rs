@@ -332,11 +332,7 @@ impl VirtualInput {
                         let state: ButtonState = state.try_into()?;
                         self.pointer.button(time, button, state);
                     }
-                    PointerEvent::Axis {
-                        time: _,
-                        axis,
-                        value,
-                    } => {
+                    PointerEvent::Axis { axis, value, .. } => {
                         // wl_pointer requires `axis_source` to be sent
                         // alongside the axis event; without it many
                         // compositors (Hyprland, Sway, …) silently
