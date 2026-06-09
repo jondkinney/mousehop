@@ -38,7 +38,7 @@ use tokio::sync::{
     oneshot,
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 struct Bounds {
     xmin: f64,
     xmax: f64,
@@ -1129,6 +1129,21 @@ impl MacOSInputCapture {
         let run_loop = ready_rx.recv().expect("channel closed")?;
 
         let _tap_task: tokio::task::JoinHandle<()> = tokio::task::spawn_local(async move {
+            // Safety net for display-geometry changes the Quartz
+            // reconfiguration callback misses. That callback is
+            // registered on the event-tap thread's run loop (see
+            // `event_tap_thread`), but in practice it does not fire for
+            // some transitions — notably opening/closing the lid on a
+            // docked MacBook: the system stays awake (so the IOKit
+            // power-wake path can't cover it either), the callback never
+            // arrives, and `self.bounds` stays frozen at its startup
+            // value. `crossed`/`start_capture` then clamp to a stale
+            // rectangle — an unreachable dead band, or a too-early
+            // crossing onto a display that's no longer there. Re-derive
+            // the bounds on a short interval so a missed reconfiguration
+            // self-heals within a couple of seconds. Mirrors the
+            // emulation side's poll (EmulationTask::do_emulation_session).
+            let mut bounds_poll = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 tokio::select! {
                     producer_event = notify_rx.recv() => {
@@ -1139,6 +1154,18 @@ impl MacOSInputCapture {
                         state.handle_producer_event(producer_event).await.unwrap_or_else(|e| {
                             log::error!("Failed to handle producer event: {e}");
                         })
+                    }
+                    _ = bounds_poll.tick() => {
+                        let mut state = state.lock().await;
+                        let prev = state.bounds;
+                        match state.update_bounds() {
+                            Ok(()) if state.bounds != prev => log::info!(
+                                "display geometry changed (poll): {prev:?} -> {:?}",
+                                state.bounds,
+                            ),
+                            Ok(()) => {}
+                            Err(e) => log::warn!("periodic bounds refresh failed: {e}"),
+                        }
                     }
                     _ = &mut tap_exit_rx => break,
                 }
