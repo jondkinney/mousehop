@@ -5,8 +5,9 @@
     indigo tile. Self-contained: the SVG carries its own background and rounded
     corners (rx 230 of 1024 ≈ 22.5%, the macOS Big Sur squircle proportion), so
     it works as-is as a Linux app icon and scripts/makeicns.sh renders it
-    straight into the macOS squircle. The bolder, tile-less small-size mark is
-    the separate resources/icons/mousehop-tray.svg.
+    straight into the macOS squircle. The tile-less variant for trays and
+    menu bars — this same mark, no background — is
+    resources/icons/mousehop-tray.svg.
 
     Keep this docstring inside <svg> — GdkPixbuf's SVG sniffer reads
     only the first ~256 bytes looking for the <svg tag, and Flatpak's

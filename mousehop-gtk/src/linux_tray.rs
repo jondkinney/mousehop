@@ -64,14 +64,17 @@ impl Tray for MousehopTray {
         "Mousehop".into()
     }
 
-    // The icon name is still advertised so accessibility tools can
-    // identify the item, but the actual rendering happens via
-    // `icon_pixmap` below — we ship our own ARGB32 pixels so the icon
-    // doesn't depend on the icon theme being installed and so the
-    // glyph fills more of the host's tray slot than typical theme
-    // icons (which carry their own internal padding).
+    // Intentionally empty. We ship our own ARGB32 glyph via
+    // `icon_pixmap` below, and advertising a themed icon name here
+    // backfires: SNI hosts that prefer `IconName` over `IconPixmap`
+    // (notably waybar on Hyprland) resolve "com.mousehop.Mousehop" to
+    // the *desktop* app icon — the rounded purple tile — instead of our
+    // menu-bar glyph. Returning empty forces those hosts onto the
+    // pixmap, matching the macOS menu-bar glyph and the original intent
+    // (theme-independent, fills the slot). The item is still identified
+    // for accessibility via `title()` and its D-Bus object path.
     fn icon_name(&self) -> String {
-        "com.mousehop.Mousehop".into()
+        String::new()
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
