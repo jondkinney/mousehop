@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1](https://github.com/jondkinney/mousehop/compare/v0.14.0...v0.14.1) - 2026-06-10
+
+### Fixed
+
+- *(tray)* match the menu-bar/tray glyph to the app-icon mark
+- *(capture/macos)* poll display bounds to catch clamshell changes
+
 ## [0.14.0](https://github.com/jondkinney/mousehop/compare/v0.13.4...v0.14.0) - 2026-06-07
 
 ### Added
