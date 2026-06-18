@@ -369,9 +369,67 @@ fn setup_menu(app: &adw::Application) {
     app.set_menubar(Some(&menu))
 }
 
+/// A daemon-IPC pump message: a decoded event, or a signal that the
+/// reader ended (daemon died / socket closed) so the dispatch loop can
+/// try to reconnect to a supervisor-restarted daemon.
+enum IpcMsg {
+    // Boxed: `FrontendEvent` is large while `Disconnected` carries no
+    // data, so an unboxed variant bloats every channel slot (and trips
+    // `clippy::large_enum_variant`). These are infrequent UI events, so
+    // the per-event allocation is negligible.
+    Event(Box<FrontendEvent>),
+    Disconnected,
+}
+
+/// Pump daemon → frontend events off the blocking IPC reader into the
+/// async channel. On any read error or clean EOF it emits
+/// `IpcMsg::Disconnected` so the dispatch loop can reconnect. Spawned
+/// fresh on every (re)connection.
+fn spawn_ipc_reader(
+    mut reader: mousehop_ipc::FrontendEventReader,
+    sender: async_channel::Sender<IpcMsg>,
+) {
+    gio::spawn_blocking(move || {
+        while let Some(e) = reader.next_event() {
+            match e {
+                Ok(e) => {
+                    if sender.send_blocking(IpcMsg::Event(Box::new(e))).is_err() {
+                        return; // dispatch loop gone; stop pumping
+                    }
+                }
+                Err(e) => {
+                    log::warn!("daemon IPC read error: {e}");
+                    break;
+                }
+            }
+        }
+        let _ = sender.send_blocking(IpcMsg::Disconnected);
+    });
+}
+
+/// Reconnect to a daemon the supervisor is expected to have restarted.
+/// Polls the IPC socket for a bounded window; on success it swaps the
+/// window's request writer, restarts the reader pump, and returns
+/// `true`. Returns `false` if the daemon never came back (an
+/// intentional shutdown), so the caller exits the GUI as before.
+async fn reconnect_ipc(window: &Window, sender: &async_channel::Sender<IpcMsg>) -> bool {
+    const ATTEMPTS: u32 = 10; // ~10s, polled once per second
+    log::warn!("daemon IPC dropped — trying to reconnect to a restarted daemon");
+    for _ in 0..ATTEMPTS {
+        glib::timeout_future_seconds(1).await;
+        if let Ok((reader, writer)) = mousehop_ipc::connect() {
+            window.rebind_frontend(writer);
+            spawn_ipc_reader(reader, sender.clone());
+            log::info!("reconnected to daemon");
+            return true;
+        }
+    }
+    false
+}
+
 fn build_ui(app: &Application) {
     log::debug!("connecting to mousehop-socket");
-    let (mut frontend_rx, frontend_tx) = match mousehop_ipc::connect() {
+    let (reader, writer) = match mousehop_ipc::connect() {
         Ok(conn) => conn,
         Err(e) => {
             log::error!("{e}");
@@ -380,21 +438,16 @@ fn build_ui(app: &Application) {
     };
     log::debug!("connected to mousehop-socket");
 
-    let (sender, receiver) = async_channel::bounded(10);
+    // The reader pump feeds daemon events into this channel; the
+    // dispatch loop below holds the other end plus a `sender` clone, so
+    // the channel survives across daemon restarts. The pump emits
+    // `IpcMsg::Disconnected` when the daemon goes away, which drives the
+    // reconnect path (the daemon supervisor in the main binary restarts
+    // a crashed daemon).
+    let (sender, receiver) = async_channel::bounded::<IpcMsg>(10);
+    spawn_ipc_reader(reader, sender.clone());
 
-    gio::spawn_blocking(move || {
-        while let Some(e) = frontend_rx.next_event() {
-            match e {
-                Ok(e) => sender.send_blocking(e).unwrap(),
-                Err(e) => {
-                    log::error!("{e}");
-                    break;
-                }
-            }
-        }
-    });
-
-    let window = Window::new(app, frontend_tx);
+    let window = Window::new(app, writer);
     #[cfg(target_os = "linux")]
     {
         // Hide-on-close: the X button, GTK's `window.close` action
@@ -474,8 +527,24 @@ fn build_ui(app: &Application) {
         #[weak]
         window,
         async move {
+            // Hold `sender` so the channel stays open across daemon
+            // restarts (the reader pump's clone is dropped when it ends;
+            // `IpcMsg::Disconnected` is what drives the reconnect).
+            let pump_sender = sender;
             loop {
-                let notify = receiver.recv().await.unwrap_or_else(|_| process::exit(1));
+                let notify = match receiver.recv().await {
+                    Ok(IpcMsg::Event(notify)) => *notify,
+                    Ok(IpcMsg::Disconnected) => {
+                        if reconnect_ipc(&window, &pump_sender).await {
+                            continue;
+                        }
+                        log::error!("daemon did not return after restart window — exiting GUI");
+                        process::exit(1);
+                    }
+                    // Channel fully closed (no senders left) — nothing
+                    // can drive the UI anymore.
+                    Err(_) => process::exit(1),
+                };
                 match notify {
                     FrontendEvent::Created(handle, client, state) => {
                         window.new_client(handle, client, state)

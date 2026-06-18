@@ -695,11 +695,17 @@ async fn read_loop(
     }
     log::info!("dtls client disconnected {addr:?}");
     let mut conns = conns.lock().await;
-    let index = conns
-        .iter()
-        .position(|(a, _)| *a == addr)
-        .expect("connection not found");
-    conns.remove(index);
+    // A peer reconnecting on the same 4-tuple (common after a
+    // screensaver / sleep cycle) combined with the wake handler's
+    // close-all can leave this slot already evicted by the time the
+    // read loop unwinds. Tolerate a missing entry: a stray `.expect`
+    // here would panic, and `panic = "abort"` would take the whole
+    // daemon down.
+    if let Some(index) = conns.iter().position(|(a, _)| *a == addr) {
+        conns.remove(index);
+    } else {
+        log::debug!("dtls client {addr:?} already evicted from conns");
+    }
     Ok(())
 }
 

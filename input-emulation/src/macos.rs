@@ -504,7 +504,21 @@ impl Emulation for MacOSEmulation {
                         }
 
                         log::debug!("click_state: {}", self.button_click_state);
-                        let location = self.get_mouse_location().unwrap();
+                        // `get_mouse_location` returns `None` when
+                        // `CGEvent::new` fails — which it does once the
+                        // sink's screen is locked / the screensaver has
+                        // engaged secure event input. Mirror the motion
+                        // arm and drop the click instead of unwrapping:
+                        // an `.unwrap()` here panics, and `panic =
+                        // "abort"` would take the whole daemon down (the
+                        // screensaver-lockup crash).
+                        let location = match self.get_mouse_location() {
+                            Some(l) => l,
+                            None => {
+                                log::warn!("could not get mouse location!");
+                                return Ok(());
+                            }
+                        };
                         let event = match CGEvent::new_mouse_event(
                             self.event_source.clone(),
                             event_type,

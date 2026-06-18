@@ -702,6 +702,18 @@ impl Window {
         };
     }
 
+    /// Swap in a request writer for a freshly reconnected daemon (the
+    /// supervisor in the main binary restarts a crashed daemon), then
+    /// ask the new daemon to resync all state into the UI. Called from
+    /// the reconnect path in `mousehop_gtk::build_ui`.
+    pub(super) fn rebind_frontend(&self, conn: FrontendRequestWriter) {
+        self.imp()
+            .frontend_request_writer
+            .borrow_mut()
+            .replace(conn);
+        self.request(FrontendRequest::Sync);
+    }
+
     pub(super) fn show_toast(&self, msg: &str) {
         let toast = adw::Toast::new(msg);
         self.add_toast(toast);
