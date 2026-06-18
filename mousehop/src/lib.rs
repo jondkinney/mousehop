@@ -20,4 +20,5 @@ pub mod macos_tcc_probe;
 #[cfg(target_os = "macos")]
 pub mod macos_tcc_watch;
 mod network;
+pub mod panic_log;
 pub mod service;
