@@ -25,6 +25,7 @@ use std::{
     rc::Rc,
     sync::Arc,
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 use tokio::{
     sync::{
@@ -49,6 +50,22 @@ use super::{
 /* there is a bug in xdg-remote-desktop-portal-gnome / mutter that
  * prevents receiving further events after a session has been disabled once.
  * Therefore the session needs to be recreated when the barriers are updated */
+
+/// Minimum time to wait after closing a portal session before opening
+/// a new one.
+///
+/// Some compositors' EIS backends release the previous connection's
+/// `/run/user/<uid>/eis-N.lock` asynchronously with respect to the
+/// portal `Session::close()` call returning. Recreating a session
+/// (see the GNOME/mutter workaround above) faster than that teardown
+/// completes races the lockfile cleanup: the new EIS backend fails to
+/// acquire its lock, and at least one compositor (Hyprland, as of
+/// 0.56.0) treats that failure as a fatal assertion and aborts the
+/// whole process instead of returning an error — taking down the
+/// entire desktop session, not just this capture session. This
+/// cooldown gives the old backend time to finish tearing down before
+/// we ask for a new one.
+const SESSION_RECREATE_COOLDOWN: Duration = Duration::from_millis(300);
 
 /// events that necessitate restarting the capture session
 #[derive(Clone, Copy, Debug)]
@@ -261,6 +278,7 @@ async fn do_capture(
     let input_capture = unsafe { &*input_capture };
     let mut active_clients: Vec<Position> = vec![];
     let mut next_barrier_id = NonZeroU32::new(1).expect("id must be non-zero");
+    let mut last_session_close: Option<Instant> = None;
 
     let mut zones_changed = input_capture.receive_zones_changed().await?;
 
@@ -299,7 +317,22 @@ async fn do_capture(
             // create session
             let mut session = match session.take() {
                 Some(s) => s,
-                None => create_session(input_capture).await?.0,
+                None => {
+                    // Give the previous session's EIS backend time to
+                    // finish tearing down (see SESSION_RECREATE_COOLDOWN)
+                    // before asking the portal for a new one.
+                    if let Some(closed_at) = last_session_close {
+                        let elapsed = closed_at.elapsed();
+                        if elapsed < SESSION_RECREATE_COOLDOWN {
+                            let remaining = SESSION_RECREATE_COOLDOWN - elapsed;
+                            log::debug!(
+                                "session recreate cooldown: waiting {remaining:?} before opening a new EIS session"
+                            );
+                            tokio::time::sleep(remaining).await;
+                        }
+                    }
+                    create_session(input_capture).await?.0
+                }
             };
 
             let capture_session = do_capture_session(
@@ -323,6 +356,7 @@ async fn do_capture(
             if let Err(e) = session.close().await {
                 log::warn!("session.close(): {e}");
             }
+            last_session_close = Some(Instant::now());
 
             // propagate error from capture session
             capture_result?;
