@@ -45,3 +45,15 @@ the first run. Edit `depends`, `package()`, etc. in
 Each packaging workflow has a `workflow_dispatch` trigger with a `tag`
 input, so a failed binary build, Flatpak build, or AUR push can be
 re-run by hand against an existing release tag.
+
+## Recovering a skipped publish
+
+With `release_always = false`, release-plz publishes only when the latest
+commit came from a PR whose source branch starts with `release-plz-`. If a
+release PR must be prepared or repaired manually, keep that prefix (for
+example, `release-plz-fix-ci`) so merging it triggers publication.
+
+release-plz only opens a release PR when a Cargo-packaged file changes. Use
+`cargo package --list` to check that boundary. A change outside it can require
+a manual release PR; do not increment an already prepared version again when
+that version is still unpublished.
