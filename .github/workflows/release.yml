@@ -117,7 +117,10 @@ jobs:
         # choco install pkgconfiglite
         py -m venv .venv
         .venv\Scripts\activate.ps1
-        py -m pip install gvsbuild
+        # Keep this pin aligned with ci.yml. It includes the upstream fix that
+        # puts cargo-cbuild on librsvg's Meson PATH.
+        # https://github.com/wingtk/gvsbuild/pull/1803
+        py -m pip install git+https://github.com/wingtk/gvsbuild.git@6e67071890322a58d4d14ccd9fc4a61cc8494006
         # see https://github.com/wingtk/gvsbuild/pull/1004
         Move-Item "C:\Program Files\Git\usr\bin" "C:\Program Files\Git\usr\notbin"
         Move-Item "C:\Program Files\Git\bin" "C:\Program Files\Git\notbin"

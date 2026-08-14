@@ -92,13 +92,14 @@ jobs:
         run: |
           py -m venv .venv
           .venv\Scripts\activate.ps1
-          py -m pip install gvsbuild
+          # gvsbuild 2026.8.0 installs cargo-c outside the PATH used by
+          # librsvg's Meson build. Pin the merged upstream fix until it is
+          # included in a release: https://github.com/wingtk/gvsbuild/pull/1803
+          py -m pip install git+https://github.com/wingtk/gvsbuild.git@6e67071890322a58d4d14ccd9fc4a61cc8494006
           # windows-latest is now the VS2026 image; gvsbuild defaults to
           # vs2022 and can't find it ("Unable to find applicable Visual
-          # Studio"), so target VS2026 explicitly. librsvg is omitted: it's a
-          # runtime SVG loader (Linux/macOS CI build fine without it), not
-          # needed to compile/test, and gvsbuild can't currently build it on
-          # the VS2026 image (its cargo-c/cargo-cbuild handling is broken).
+          # Studio"), so target VS2026 explicitly. GTK4 pulls in librsvg,
+          # whose build exercises the pinned cargo-c fix above.
           gvsbuild build --vs-ver vs2026 --msys-dir=C:\msys64 gtk4 libadwaita
 
       - name: cargo clippy
