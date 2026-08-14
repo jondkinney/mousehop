@@ -742,7 +742,8 @@ fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {
     if depressed.contains(XMods::ControlMask) {
         flags |= CGEventFlags::CGEventFlagControl;
     }
-    if depressed.contains(XMods::Mod1Mask) {
+    // Mod5 is ISO_Level3_Shift (AltGr on Linux); treat it as macOS Option key
+    if depressed.contains(XMods::Mod1Mask) || depressed.contains(XMods::Mod5Mask) {
         flags |= CGEventFlags::CGEventFlagAlternate;
     }
     if depressed.contains(XMods::Mod4Mask) {
