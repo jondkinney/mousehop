@@ -1183,22 +1183,57 @@ impl MacOSInputCapture {
 }
 
 fn request_macos_capture_permissions() -> Result<(), MacosCaptureCreationError> {
-    // Call both request functions unconditionally so macOS surfaces both
-    // TCC prompts on the very first launch. TCC always returns `false` the
-    // first time a permission is requested (the grant only becomes visible
-    // on the next process launch), so returning early on the first failure
-    // would skip the second prompt and force the user through an extra
-    // relaunch just to see it.
-    let accessibility = request_accessibility_permission();
-    let input_monitoring = request_input_monitoring_permission();
+    check_macos_capture_permissions(
+        request_accessibility_permission,
+        request_input_monitoring_permission,
+    )
+}
 
-    if !accessibility {
+fn check_macos_capture_permissions<A, I>(
+    accessibility_granted: A,
+    input_monitoring_granted: I,
+) -> Result<(), MacosCaptureCreationError>
+where
+    A: FnOnce() -> bool,
+    I: FnOnce() -> bool,
+{
+    // The GUI owns the explicit user-visible Accessibility prompt. Do not touch
+    // the CoreGraphics permission API until Accessibility is present: on
+    // macOS it can route through the same authorization helper and queue an
+    // additional request alongside the GUI's intentional one.
+    if !accessibility_granted() {
         return Err(MacosCaptureCreationError::AccessibilityPermission);
     }
-    if !input_monitoring {
+    if !input_monitoring_granted() {
         return Err(MacosCaptureCreationError::InputMonitoringPermission);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn skips_input_monitoring_check_without_accessibility() {
+        let input_monitoring_checked = Cell::new(false);
+
+        let result = check_macos_capture_permissions(
+            || false,
+            || {
+                input_monitoring_checked.set(true);
+                true
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(MacosCaptureCreationError::AccessibilityPermission)
+        ));
+        assert!(!input_monitoring_checked.get());
+    }
 }
 
 fn request_accessibility_permission() -> bool {

@@ -417,7 +417,13 @@ async fn reconnect_ipc(window: &Window, sender: &async_channel::Sender<IpcMsg>) 
     log::warn!("daemon IPC dropped — trying to reconnect to a restarted daemon");
     for _ in 0..ATTEMPTS {
         glib::timeout_future_seconds(1).await;
-        if let Ok((reader, writer)) = mousehop_ipc::connect() {
+        // A single endpoint attempt can still block briefly at the OS level,
+        // so keep it off GTK's main thread. In particular, do not use
+        // `mousehop_ipc::connect()` here: that helper retries forever and
+        // would freeze the UI whenever an intentionally stopped daemon does
+        // not come back.
+        let connection = gio::spawn_blocking(mousehop_ipc::connect_once).await;
+        if let Ok(Ok((reader, writer))) = connection {
             window.rebind_frontend(writer);
             spawn_ipc_reader(reader, sender.clone());
             log::info!("reconnected to daemon");
@@ -496,8 +502,8 @@ fn build_ui(app: &Application) {
         macos_privacy::fire_initial_prompts();
         // Watch the Accessibility grant continuously for the lifetime
         // of the process. On a grant, swap the warning row into its
-        // "relaunch required" state (the daemon subprocess already
-        // bailed and can't recover without a restart) and present the
+        // "relaunch required" state (its capture/emulation backends were
+        // created without permission and need a restart) and present the
         // modal relaunch prompt — this transition is the one
         // unambiguous "relaunch needed" moment. On a REVOKE, quit
         // immediately — an active CGEventTap at HeadInsertEventTap can

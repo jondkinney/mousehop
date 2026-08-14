@@ -49,9 +49,20 @@ fn probe_ax_in_fresh_subprocess() -> Option<bool> {
     Some(status.success())
 }
 
-/// Spawn the watcher on the current tokio runtime. Must be called
-/// from inside a tokio runtime; runs forever until the daemon exits.
+/// Spawn the watcher on the current tokio runtime when Accessibility was
+/// granted at daemon startup. A daemon that starts without the grant must
+/// stay alive while the GUI guides the user through first-run authorization;
+/// the TCC database change caused by registering that initial prompt is not a
+/// revocation. The granted process starts a fresh daemon on relaunch, which
+/// then arms this watcher for future revocations.
 pub fn spawn() {
+    if !crate::macos_tcc_probe::is_accessibility_granted() {
+        log::info!(
+            "tcc_watch: Accessibility not granted at startup; not arming revocation watcher"
+        );
+        return;
+    }
+
     tokio::spawn(async move {
         let path = PathBuf::from(TCC_DB_PATH);
         let mut last_mtime = read_mtime(&path);

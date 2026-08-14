@@ -73,8 +73,8 @@ pub fn accessibility_granted() -> bool {
 
 pub enum AccessibilityChange {
     /// AX was missing at startup and the user has now granted it.
-    /// Capture/emulation still need a relaunch to take effect, since
-    /// the daemon subprocess already bailed.
+    /// Capture/emulation still need a relaunch because their backends
+    /// were created without permission and remain disabled.
     Granted,
     /// AX was granted and the user has now revoked it. Quit immediately
     /// — leaving the process alive with an active CGEventTap at

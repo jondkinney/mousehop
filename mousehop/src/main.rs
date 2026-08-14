@@ -312,11 +312,10 @@ async fn run_service(config: Config) -> Result<(), ServiceError> {
     // catches the toggle-off case; the remove case leaves the cached
     // trust state stuck at true forever. See `macos_tcc_watch`.
     //
-    // `MOUSEHOP_DISABLE_TCC_WATCH` opts out: an unsigned dev/headless
-    // build has no Accessibility grant, so the watcher would exit the
-    // daemon immediately. Setting this keeps it alive for advertising-
-    // /network-only runs (input capture/emulation still no-op without
-    // the grant).
+    // The watcher self-disables when Accessibility was not granted at
+    // startup, keeping first-run and unsigned/headless daemons alive with
+    // inactive capture/emulation backends. `MOUSEHOP_DISABLE_TCC_WATCH`
+    // remains an explicit debugging opt-out for otherwise trusted builds.
     #[cfg(target_os = "macos")]
     if std::env::var_os("MOUSEHOP_DISABLE_TCC_WATCH").is_none() {
         mousehop::macos_tcc_watch::spawn();

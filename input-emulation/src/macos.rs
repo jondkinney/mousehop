@@ -247,19 +247,54 @@ impl MacOSEmulation {
 }
 
 fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
-    // Request both permissions up front so the user sees both TCC prompts
-    // on the first launch. See the matching comment in input-capture/src/
-    // macos.rs::request_macos_capture_permissions for the rationale.
-    let accessibility = request_accessibility_permission();
-    let input_control = request_input_control_permission();
+    check_macos_emulation_permissions(
+        request_accessibility_permission,
+        request_input_control_permission,
+    )
+}
 
-    if !accessibility {
+fn check_macos_emulation_permissions<A, I>(
+    accessibility_granted: A,
+    input_control_granted: I,
+) -> Result<(), MacOSEmulationCreationError>
+where
+    A: FnOnce() -> bool,
+    I: FnOnce() -> bool,
+{
+    // The GUI owns the explicit user-visible Accessibility prompt. Checking the
+    // CoreGraphics permission while Accessibility is absent can route through
+    // the same authorization helper and queue an additional request.
+    if !accessibility_granted() {
         return Err(MacOSEmulationCreationError::AccessibilityPermission);
     }
-    if !input_control {
+    if !input_control_granted() {
         return Err(MacOSEmulationCreationError::InputControlPermission);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    fn skips_input_control_check_without_accessibility() {
+        let input_control_checked = Cell::new(false);
+
+        let result = check_macos_emulation_permissions(
+            || false,
+            || {
+                input_control_checked.set(true);
+                true
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(MacOSEmulationCreationError::AccessibilityPermission)
+        ));
+        assert!(!input_control_checked.get());
+    }
 }
 
 fn request_accessibility_permission() -> bool {

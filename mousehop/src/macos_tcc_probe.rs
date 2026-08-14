@@ -9,11 +9,14 @@
 //! process consults the current TCC state without inheriting the
 //! parent's cached trust. See `macos_tcc_watch` for the watcher loop.
 
+use std::ffi::c_uchar;
+
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
-    fn AXIsProcessTrusted() -> bool;
+    // ApplicationServices declares this legacy Boolean as unsigned char.
+    fn AXIsProcessTrusted() -> c_uchar;
 }
 
 pub fn is_accessibility_granted() -> bool {
-    unsafe { AXIsProcessTrusted() }
+    unsafe { AXIsProcessTrusted() != 0 }
 }

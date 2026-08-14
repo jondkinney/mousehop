@@ -813,8 +813,8 @@ impl Window {
         let button = &self.imp().input_capture_button;
 
         if crate::macos_privacy::accessibility_granted() {
-            // AX granted but capture/emulation still off → the daemon
-            // subprocess bailed at startup and needs a fresh process to
+            // AX granted but capture/emulation still off → the backends
+            // were created without permission and need a fresh process to
             // re-initialize with the new grant in place.
             row.set_title("Relaunch Required");
             row.set_subtitle("Accessibility granted — restart to activate capture and emulation.");
@@ -832,9 +832,9 @@ impl Window {
     ///
     /// Called only from the Accessibility grant-*transition* watcher — NOT
     /// from the general capture/emulation status update. The transition is
-    /// the one unambiguous "relaunch needed" signal: AX was missing, the
-    /// daemon subprocess bailed because of it, and the user has now granted
-    /// it. Triggering off "AX granted && capture/emulation off" instead
+    /// the one unambiguous "relaunch needed" signal: AX was missing when
+    /// the backends were created, and the user has now granted it. Triggering
+    /// off "AX granted && capture/emulation off" instead
     /// would also fire during the brief startup window before the daemon
     /// reports healthy status, re-prompting on every relaunch — an
     /// infinite loop. The relaunched process starts with AX already
