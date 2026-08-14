@@ -56,21 +56,50 @@ share_path="$resources_path/share"
 # - Recursively process the copied dylibs
 fix_references() {
   local bin="$1"
+  # Keep the original Homebrew location alongside the bundled copy. Some
+  # formulae use @rpath for dependencies in the same lib directory, so the
+  # bundled path alone is not enough to find their source files.
+  local source_bin="${2:-$bin}"
+  local source_dir
+  source_dir=$(dirname "$source_bin")
 
-  # Get all Homebrew libraries referenced by the binary
-  libs=$(otool -L "$bin" | awk -v homebrew="$homebrew_path" '$0 ~ homebrew {print $1}')
+  # Inspect every dependency. Absolute Homebrew paths can be copied directly;
+  # @rpath dependencies are resolved beside the source library first, then via
+  # Homebrew's linked lib directory. This keeps the recursive dependency walk
+  # complete when a formula switches its install names to @rpath.
+  libs=$(otool -L "$bin" | awk 'NR > 1 {print $1}')
 
   echo "$libs" | while IFS= read -r old_path; do
     if [ -z "$old_path" ]; then
       continue
     fi
 
-    local base_name="$(basename "$old_path")"
+    local source_path=""
+    case "$old_path" in
+      "$homebrew_path"/*)
+        source_path="$old_path"
+        ;;
+      @rpath/*)
+        local relative_path="${old_path#@rpath/}"
+        if [ -e "$source_dir/$relative_path" ]; then
+          source_path="$source_dir/$relative_path"
+        elif [ -e "$homebrew_path/lib/$relative_path" ]; then
+          source_path="$homebrew_path/lib/$relative_path"
+        else
+          continue
+        fi
+        ;;
+      *)
+        continue
+        ;;
+    esac
+
+    local base_name="$(basename "$source_path")"
     local dest="$fwks_path/$base_name"
 
     if [ ! -e "$dest" ]; then
-      echo "Copying $old_path -> $dest"
-      cp -f "$old_path" "$dest"
+      echo "Copying $source_path -> $dest"
+      cp -f "$source_path" "$dest"
       # Ensure the copied dylib is writable so that xattr -rd /path/to/Lan\ Mouse.app works.
       chmod 644 "$dest"
 
@@ -78,15 +107,31 @@ fix_references() {
       install_name_tool -id "@rpath/$base_name" "$dest"
 
       # Recursively process this dylib
-      fix_references "$dest"
+      fix_references "$dest" "$source_path"
     fi
 
-    echo "Updating $bin to reference @rpath/$base_name..."
-    install_name_tool -change "$old_path" "@rpath/$base_name" "$bin"
+    if [ "$old_path" != "@rpath/$base_name" ]; then
+      echo "Updating $bin to reference @rpath/$base_name..."
+      install_name_tool -change "$old_path" "@rpath/$base_name" "$bin"
+    fi
   done
 }
 
 fix_references "$exec_path"
+
+# Also inspect libraries already present from an earlier invocation. The
+# recursion above intentionally skips an existing destination to avoid cycles;
+# this pass makes reruns repair an incomplete bundle instead of preserving it.
+for bundled_lib in "$fwks_path"/*.dylib; do
+  if [ ! -e "$bundled_lib" ]; then
+    continue
+  fi
+  source_lib="$homebrew_path/lib/$(basename "$bundled_lib")"
+  if [ ! -e "$source_lib" ]; then
+    source_lib="$bundled_lib"
+  fi
+  fix_references "$bundled_lib" "$source_lib"
+done
 
 copy_runtime_data() {
   mkdir -p "$share_path"
@@ -135,5 +180,11 @@ fi
 
 # Se-sign the .app
 codesign --force --deep --sign - "$bundle_path"
+
+# Exercise dyld against the finished dependency closure. `--version` exits
+# before the GUI or daemon starts, but a missing transitive dylib still makes
+# this command fail and prevents a broken bundle from being released.
+echo "Verifying bundled executable dependencies..."
+"$exec_path" --version >/dev/null
 
 echo "Done!"
