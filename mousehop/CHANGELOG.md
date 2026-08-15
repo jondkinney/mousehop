@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/jondkinney/mousehop/compare/v0.14.4...v0.15.0) - 2026-08-15
+
+### Added
+
+- *(macos)* map Command to Control per peer
+
+### Fixed
+
+- *(cursor)* restore position on one-way return
+- *(config)* persist deleting the last client
+- *(macos)* keep accessibility grant flow responsive
+
 ## [0.14.4](https://github.com/jondkinney/mousehop/compare/v0.14.3...v0.14.4) - 2026-08-14
 
 ### Fixed
