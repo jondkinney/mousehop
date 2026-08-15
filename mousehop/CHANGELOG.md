@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1](https://github.com/jondkinney/mousehop/compare/v0.15.0...v0.15.1) - 2026-08-15
+
+### Fixed
+
+- *(emulation/macos)* warp to the right monitor
+- *(emulation/windows)* warp to the right monitor
+
 ## [0.15.0](https://github.com/jondkinney/mousehop/compare/v0.14.4...v0.15.0) - 2026-08-15
 
 ### Added
