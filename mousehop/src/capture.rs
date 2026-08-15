@@ -10,7 +10,7 @@ use input_capture::{
 };
 use input_event::{Event, KeyboardEvent, scancode};
 use local_channel::mpsc::{Receiver, Sender, channel};
-use mousehop_proto::ProtoEvent;
+use mousehop_proto::{LEAVE_HANDOVER, LEAVE_RELEASE_ONLY, ProtoEvent};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
@@ -24,8 +24,14 @@ pub(crate) struct Capture {
 }
 
 pub(crate) enum ICaptureEvent {
-    /// a client was entered
-    CaptureBegin(CaptureHandle),
+    /// A capture barrier was entered. `handover` is true when a Default
+    /// capture shares the edge, so the EnterOnly return will be followed by
+    /// this device's own Enter + CursorPos rather than ending at a local
+    /// release.
+    CaptureBegin {
+        handle: CaptureHandle,
+        handover: bool,
+    },
     /// capture disabled
     CaptureDisabled,
     /// capture disabled
@@ -320,20 +326,29 @@ impl CaptureTask {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
                         }
-                        // Peer sent Leave — either they just released
-                        // their own outbound capture, or they're
-                        // taking over and want us to stop sending to
-                        // them. The "taking over" case is the common
-                        // one (CaptureBegin on the peer triggers a
-                        // send_leave_event to every incoming address)
-                        // and is followed by Enter+CursorPos from the
-                        // peer. Use the handover release so the local
-                        // host warp doesn't race against the peer's
-                        // upcoming proportional CursorPos warp on our
-                        // shared cursor.
-                        ProtoEvent::Leave(_) => {
-                            log::info!("releasing capture: left remote client device region");
-                            self.release_capture_handover(capture).await?;
+                        // A legacy Leave(0), or any future mode this
+                        // receiver doesn't understand, retains the
+                        // handover behavior: skip the host warp because
+                        // the peer's Enter+CursorPos may be racing it on
+                        // the shared cursor. A new peer can explicitly
+                        // report a one-way EnterOnly return with
+                        // LEAVE_RELEASE_ONLY; no CursorPos will follow, so
+                        // the modeled host warp must be applied.
+                        ProtoEvent::Leave(mode) => {
+                            if mode == LEAVE_RELEASE_ONLY {
+                                log::info!(
+                                    "releasing capture: peer returned through a release-only edge"
+                                );
+                                self.release_capture(capture).await?;
+                            } else {
+                                if mode != LEAVE_HANDOVER {
+                                    log::debug!(
+                                        "unknown Leave mode {mode}; treating it as a legacy handover"
+                                    );
+                                }
+                                log::info!("releasing capture: peer is taking over");
+                                self.release_capture_handover(capture).await?;
+                            }
                         },
                         // Peer reported its display geometry — cache it
                         // so the wall-press model has a real upper
@@ -423,8 +438,9 @@ impl CaptureTask {
         }
 
         if matches!(event, CaptureEvent::Begin { .. }) {
+            let handover = self.is_default_capture_at(self.get_pos(handle));
             self.event_tx
-                .send(ICaptureEvent::CaptureBegin(handle))
+                .send(ICaptureEvent::CaptureBegin { handle, handover })
                 .expect("channel closed");
         }
 
@@ -567,7 +583,11 @@ impl CaptureTask {
             }
 
             log::info!("sending Leave event to client {handle}");
-            if let Err(e) = self.conn.send(ProtoEvent::Leave(0), handle).await {
+            if let Err(e) = self
+                .conn
+                .send(ProtoEvent::Leave(LEAVE_HANDOVER), handle)
+                .await
+            {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
         }

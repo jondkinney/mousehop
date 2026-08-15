@@ -112,6 +112,46 @@ struct OutputInfo {
     size: (i32, i32),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DisplayGeometry {
+    origin: (i32, i32),
+    size: (u32, u32),
+}
+
+/// Compute the compositor-coordinate union of all usable outputs. Bounds and
+/// origin must come from the same rectangle: normalizing against the union's
+/// size while assuming an origin of `(0, 0)` misplaces cursor returns whenever
+/// a monitor lives at a negative or otherwise nonzero coordinate.
+fn display_geometry<'a>(infos: impl Iterator<Item = &'a OutputInfo>) -> Option<DisplayGeometry> {
+    let mut xmin = i64::MAX;
+    let mut ymin = i64::MAX;
+    let mut xmax = i64::MIN;
+    let mut ymax = i64::MIN;
+    let mut found = false;
+
+    for info in infos.filter(|info| info.size.0 > 0 && info.size.1 > 0) {
+        let x = i64::from(info.position.0);
+        let y = i64::from(info.position.1);
+        xmin = xmin.min(x);
+        ymin = ymin.min(y);
+        xmax = xmax.max(x + i64::from(info.size.0));
+        ymax = ymax.max(y + i64::from(info.size.1));
+        found = true;
+    }
+
+    if !found || xmax <= xmin || ymax <= ymin {
+        return None;
+    }
+
+    Some(DisplayGeometry {
+        origin: (i32::try_from(xmin).ok()?, i32::try_from(ymin).ok()?),
+        size: (
+            u32::try_from(xmax - xmin).ok()?,
+            u32::try_from(ymax - ymin).ok()?,
+        ),
+    })
+}
+
 struct State {
     active_positions: HashSet<Position>,
     pointer: Option<WlPointer>,
@@ -237,14 +277,41 @@ impl Drop for Window {
 /// the on-axis dimension and span the cross-axis, so the surface-local
 /// cross-axis coord is the screen offset directly.
 fn surface_to_screen(window: &Window, surface_x: f64, surface_y: f64) -> (i32, i32) {
-    let (ox, oy) = window.output_pos;
-    let (ow, oh) = window.output_size;
-    match window.pos {
-        Position::Left => (ox, oy + surface_y as i32),
-        Position::Right => (ox + ow.saturating_sub(1), oy + surface_y as i32),
-        Position::Top => (ox + surface_x as i32, oy),
-        Position::Bottom => (ox + surface_x as i32, oy + oh.saturating_sub(1)),
+    let (origin_x, origin_y) =
+        layer_surface_origin(window.pos, window.output_pos, window.output_size);
+    (origin_x + surface_x as i32, origin_y + surface_y as i32)
+}
+
+/// Screen-space origin of the 1 px layer surface anchored at `pos`.
+fn layer_surface_origin(
+    pos: Position,
+    output_pos: (i32, i32),
+    output_size: (i32, i32),
+) -> (i32, i32) {
+    let (ox, oy) = output_pos;
+    let (ow, oh) = output_size;
+    match pos {
+        Position::Left | Position::Top => (ox, oy),
+        Position::Right => (ox + ow.saturating_sub(1), oy),
+        Position::Bottom => (ox, oy + oh.saturating_sub(1)),
     }
+}
+
+/// Translate a host screen-space warp target into the coordinate system of
+/// the layer surface that owns the active pointer lock. The hint may be
+/// outside the 1 px barrier surface: the pointer-constraints protocol uses
+/// it as the compositor's desired global landing point when the lock ends.
+fn screen_to_surface(
+    pos: Position,
+    output_pos: (i32, i32),
+    output_size: (i32, i32),
+    screen: (i32, i32),
+) -> (f64, f64) {
+    let (surface_x, surface_y) = layer_surface_origin(pos, output_pos, output_size);
+    (
+        f64::from(screen.0) - f64::from(surface_x),
+        f64::from(screen.1) - f64::from(surface_y),
+    )
 }
 
 fn get_edges(outputs: &[Output], pos: Position) -> Vec<(Output, i32)> {
@@ -502,17 +569,33 @@ impl State {
         }
     }
 
-    fn ungrab(&mut self) {
+    fn ungrab(&mut self, warp_target: Option<(i32, i32)>) {
         // get focused client
         let window = match self.focused.as_ref() {
             Some(focused) => focused,
             None => return,
         };
 
-        // ungrab surface
+        // Restore normal keyboard focus. If the caller modeled a host
+        // landing point, attach it to the still-live pointer lock before
+        // committing and destroying the lock. Cursor position hints are
+        // double-buffered Wayland surface state; without this commit,
+        // Hyprland unlocks at the stale pre-capture cursor position.
         window
             .layer_surface
             .set_keyboard_interactivity(KeyboardInteractivity::None);
+        if let (Some(pointer_lock), Some(warp_target)) = (&self.pointer_lock, warp_target) {
+            let (surface_x, surface_y) = screen_to_surface(
+                window.pos,
+                window.output_pos,
+                window.output_size,
+                warp_target,
+            );
+            log::info!(
+                "[release-warp] layer-shell screen target {warp_target:?} -> surface hint ({surface_x:.1}, {surface_y:.1})"
+            );
+            pointer_lock.set_cursor_position_hint(surface_x, surface_y);
+        }
         window.surface.commit();
 
         // destroy pointer lock
@@ -655,10 +738,10 @@ impl Capture for LayerShellInputCapture {
         Ok(inner.flush_events()?)
     }
 
-    async fn release(&mut self, _warp_target: Option<(i32, i32)>) -> Result<(), CaptureError> {
+    async fn release(&mut self, warp_target: Option<(i32, i32)>) -> Result<(), CaptureError> {
         log::debug!("releasing pointer");
         let inner = self.0.get_mut();
-        inner.state.ungrab();
+        inner.state.ungrab(warp_target);
         Ok(inner.flush_events()?)
     }
 
@@ -672,20 +755,15 @@ impl Capture for LayerShellInputCapture {
         // stays consistent: cursor coords reported in this same
         // space normalize cleanly against the returned dimensions.
         let outputs = &self.0.get_ref().state.outputs;
-        let mut xmin = i32::MAX;
-        let mut ymin = i32::MAX;
-        let mut xmax = i32::MIN;
-        let mut ymax = i32::MIN;
-        for info in outputs.iter().filter_map(|o| o.info.as_ref()) {
-            xmin = xmin.min(info.position.0);
-            ymin = ymin.min(info.position.1);
-            xmax = xmax.max(info.position.0 + info.size.0);
-            ymax = ymax.max(info.position.1 + info.size.1);
-        }
-        if xmax <= xmin || ymax <= ymin {
-            return None;
-        }
-        Some(((xmax - xmin) as u32, (ymax - ymin) as u32))
+        display_geometry(outputs.iter().filter_map(|output| output.info.as_ref()))
+            .map(|geometry| geometry.size)
+    }
+
+    fn display_origin(&self) -> (i32, i32) {
+        let outputs = &self.0.get_ref().state.outputs;
+        display_geometry(outputs.iter().filter_map(|output| output.info.as_ref()))
+            .map(|geometry| geometry.origin)
+            .unwrap_or((0, 0))
     }
 }
 
@@ -816,7 +894,7 @@ impl Dispatch<WlPointer, ()> for State {
                 if app.pointer_lock.is_some() {
                     log::warn!("compositor released mouse");
                 }
-                app.ungrab();
+                app.ungrab(None);
             }
             wl_pointer::Event::Button {
                 serial: _,
@@ -1084,3 +1162,67 @@ delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
 delegate_noop!(State: ignore ZwpLockedPointerV1);
+
+#[cfg(test)]
+mod tests {
+    use super::{DisplayGeometry, OutputInfo, display_geometry, screen_to_surface};
+    use crate::Position;
+
+    #[test]
+    fn display_geometry_preserves_negative_union_origin() {
+        let outputs = [
+            OutputInfo {
+                position: (-1920, 0),
+                size: (1920, 1080),
+                ..Default::default()
+            },
+            OutputInfo {
+                position: (0, -200),
+                size: (2560, 1440),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            display_geometry(outputs.iter()),
+            Some(DisplayGeometry {
+                origin: (-1920, -200),
+                size: (4480, 1440),
+            })
+        );
+    }
+
+    #[test]
+    fn display_geometry_ignores_unusable_outputs() {
+        let outputs = [OutputInfo {
+            position: (100, 200),
+            size: (0, 1080),
+            ..Default::default()
+        }];
+
+        assert_eq!(display_geometry(outputs.iter()), None);
+    }
+
+    #[test]
+    fn screen_warp_target_is_relative_to_each_anchored_surface() {
+        let output_pos = (1920, -240);
+        let output_size = (640, 960);
+
+        assert_eq!(
+            screen_to_surface(Position::Left, output_pos, output_size, (1920, 719)),
+            (0.0, 959.0)
+        );
+        assert_eq!(
+            screen_to_surface(Position::Right, output_pos, output_size, (2559, 719)),
+            (0.0, 959.0)
+        );
+        assert_eq!(
+            screen_to_surface(Position::Top, output_pos, output_size, (2559, -240)),
+            (639.0, 0.0)
+        );
+        assert_eq!(
+            screen_to_surface(Position::Bottom, output_pos, output_size, (2559, 719)),
+            (639.0, 0.0)
+        );
+    }
+}

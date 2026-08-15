@@ -19,6 +19,21 @@ pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_
 /// against typical UDP MTU.
 pub const MAX_CLIPBOARD_SIZE: usize = 4 * 1024;
 
+/// Legacy/default [`ProtoEvent::Leave`] mode. The peer is expected to
+/// take over with its own `Enter` + [`ProtoEvent::CursorPos`], so the
+/// receiver must release capture without applying a competing host warp.
+///
+/// Older mousehop versions always sent zero. Keeping zero's current
+/// handover behavior prevents a new receiver from reintroducing the cursor
+/// warp race when it is paired with an older sender.
+pub const LEAVE_HANDOVER: u32 = 0;
+
+/// Explicit [`ProtoEvent::Leave`] mode for a one-way return. The sender has
+/// only an EnterOnly capture at that edge, so no `Enter` +
+/// [`ProtoEvent::CursorPos`] will follow. The receiver should apply its
+/// modeled host warp when releasing capture.
+pub const LEAVE_RELEASE_ONLY: u32 = 1;
+
 /// 8-byte protocol magic identifying a mousehop peer, carried in
 /// every [`ProtoEvent::Hello`]. The `Hello` is exchanged right after
 /// the DTLS handshake authenticates; a peer that fails to present
@@ -76,8 +91,9 @@ pub enum ProtoEvent {
     /// notify a client that the cursor entered its region at the given position
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
     Enter(Position),
-    /// notify a client that the cursor left its region
-    /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
+    /// Notify a client that the cursor left its region. The payload is one
+    /// of [`LEAVE_HANDOVER`] or [`LEAVE_RELEASE_ONLY`]. Unknown values are
+    /// reserved for future release modes.
     Leave(u32),
     /// acknowledge of an [`ProtoEvent::Enter`] or [`ProtoEvent::Leave`] event
     Ack(u32),
@@ -665,5 +681,17 @@ mod tests {
             decoded,
             ProtoEvent::Hello { magic, .. } if magic == PROTOCOL_MAGIC
         ));
+    }
+
+    #[test]
+    fn leave_modes_round_trip() {
+        for mode in [LEAVE_HANDOVER, LEAVE_RELEASE_ONLY] {
+            let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::Leave(mode).into();
+            assert_eq!(len, 1 + size_of::<u32>());
+            assert!(matches!(
+                buf.try_into().expect("decode"),
+                ProtoEvent::Leave(decoded_mode) if decoded_mode == mode
+            ));
+        }
     }
 }

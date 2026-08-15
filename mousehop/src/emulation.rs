@@ -7,7 +7,7 @@ use input_emulation::{
 use input_event::{ClipboardEvent, Event};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use mousehop_ipc::IncomingPeerConfig;
-use mousehop_proto::{Position, ProtoEvent};
+use mousehop_proto::{LEAVE_HANDOVER, LEAVE_RELEASE_ONLY, Position, ProtoEvent};
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -94,7 +94,10 @@ pub(crate) enum EmulationEvent {
 
 enum EmulationRequest {
     Reenable,
-    Release(SocketAddr),
+    Release {
+        addr: SocketAddr,
+        handover: bool,
+    },
     ChangePort(u16),
     /// Replace the per-fingerprint receive-side post-processing
     /// table. Service pushes this on startup, on every authorization
@@ -128,9 +131,9 @@ impl Emulation {
         }
     }
 
-    pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
+    pub(crate) fn send_leave_event(&self, addr: SocketAddr, handover: bool) {
         self.request_tx
-            .send(EmulationRequest::Release(addr))
+            .send(EmulationRequest::Release { addr, handover })
             .expect("channel closed");
     }
 
@@ -377,7 +380,19 @@ impl ListenTask {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    EmulationRequest::Release { addr, handover } => {
+                        // Leave(0) remains the legacy handover signal so a
+                        // new sender stays safe with old receivers. Only a
+                        // one-way EnterOnly edge opts into the new mode: no
+                        // Enter+CursorPos will follow, so the peer must use
+                        // its own modeled host warp when releasing.
+                        let mode = if handover {
+                            LEAVE_HANDOVER
+                        } else {
+                            LEAVE_RELEASE_ONLY
+                        };
+                        self.listener.reply(addr, ProtoEvent::Leave(mode)).await;
+                    }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
