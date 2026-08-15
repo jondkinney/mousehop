@@ -395,6 +395,43 @@ fn get_display_bounds(display: CGDirectDisplayID) -> (CGFloat, CGFloat, CGFloat,
     }
 }
 
+/// Union of every active display's rectangle, as `(origin_x,
+/// origin_y, width, height)` in global display coordinates. `None`
+/// when no active display reports a usable rectangle.
+fn display_union() -> Option<(CGFloat, CGFloat, CGFloat, CGFloat)> {
+    let displays = CGDisplay::active_displays().ok()?;
+    let mut xmin = f64::INFINITY;
+    let mut xmax = f64::NEG_INFINITY;
+    let mut ymin = f64::INFINITY;
+    let mut ymax = f64::NEG_INFINITY;
+    for id in displays {
+        let bounds = CGDisplay::new(id).bounds();
+        xmin = xmin.min(bounds.origin.x);
+        xmax = xmax.max(bounds.origin.x + bounds.size.width);
+        ymin = ymin.min(bounds.origin.y);
+        ymax = ymax.max(bounds.origin.y + bounds.size.height);
+    }
+    if xmax <= xmin || ymax <= ymin {
+        return None;
+    }
+    Some((xmin, ymin, xmax - xmin, ymax - ymin))
+}
+
+/// Convert a union-relative warp target into global display
+/// coordinates.
+///
+/// Warp targets arrive union-relative — the `ProtoEvent::CursorPos`
+/// handler scales the peer's normalized fraction against
+/// `display_bounds()`, which reports only the *size* of the display
+/// union — while `warp_mouse_cursor_position` consumes global
+/// coordinates. Those are anchored at the primary display's top-left,
+/// so a monitor left of or above the primary puts the union's origin
+/// in negative space and the two disagree; see the matching
+/// `display_origin` on the input-capture side.
+fn union_to_global(origin: (CGFloat, CGFloat), x: i32, y: i32) -> (CGFloat, CGFloat) {
+    (origin.0 + x as CGFloat, origin.1 + y as CGFloat)
+}
+
 fn clamp_to_screen_space(
     current_x: CGFloat,
     current_y: CGFloat,
@@ -694,28 +731,16 @@ impl Emulation for MacOSEmulation {
         // Union of every active display's rectangle. Matches the
         // shape used on the input-capture side so the host's
         // wall-press model is consistent across both ends.
-        let displays = CGDisplay::active_displays().ok()?;
-        let mut xmin = f64::INFINITY;
-        let mut xmax = f64::NEG_INFINITY;
-        let mut ymin = f64::INFINITY;
-        let mut ymax = f64::NEG_INFINITY;
-        for id in displays {
-            let bounds = CGDisplay::new(id).bounds();
-            xmin = xmin.min(bounds.origin.x);
-            xmax = xmax.max(bounds.origin.x + bounds.size.width);
-            ymin = ymin.min(bounds.origin.y);
-            ymax = ymax.max(bounds.origin.y + bounds.size.height);
-        }
-        if xmax <= xmin || ymax <= ymin {
-            return None;
-        }
-        Some(((xmax - xmin) as u32, (ymax - ymin) as u32))
+        let (_, _, width, height) = display_union()?;
+        Some((width as u32, height as u32))
     }
 
     async fn warp_cursor(&mut self, x: i32, y: i32) -> Result<(), EmulationError> {
+        let origin = display_union().map_or((0.0, 0.0), |(ox, oy, _, _)| (ox, oy));
+        let (global_x, global_y) = union_to_global(origin, x, y);
         let pt = CGPoint {
-            x: x as CGFloat,
-            y: y as CGFloat,
+            x: global_x,
+            y: global_y,
         };
         // CGDisplay::warp_mouse_cursor_position is a global Quartz
         // call; it doesn't matter which CGDisplay receiver we use.
@@ -800,5 +825,29 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::union_to_global;
+
+    #[test]
+    fn union_to_global_is_identity_when_the_primary_is_top_left() {
+        assert_eq!(union_to_global((0.0, 0.0), 0, 0), (0.0, 0.0));
+        assert_eq!(union_to_global((0.0, 0.0), 1919, 1079), (1919.0, 1079.0));
+    }
+
+    #[test]
+    fn union_to_global_reapplies_a_negative_origin() {
+        // A 1920x1200 display left of and slightly above a 1920x1080
+        // primary: global coordinates are anchored at the primary's
+        // top-left, so the union's own origin sits at (-1920, -120).
+        let origin = (-1920.0, -120.0);
+        assert_eq!(union_to_global(origin, 0, 0), (-1920.0, -120.0));
+        // The primary's top-left, reached from union coordinates.
+        assert_eq!(union_to_global(origin, 1920, 120), (0.0, 0.0));
+        // The far corner of the union: the primary's bottom-right.
+        assert_eq!(union_to_global(origin, 3839, 1199), (1919.0, 1079.0));
     }
 }
