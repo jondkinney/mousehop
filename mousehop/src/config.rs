@@ -624,14 +624,14 @@ impl Config {
 
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
-        if clients.is_empty() {
-            return;
-        }
         if self.config_toml.is_none() {
             self.config_toml = Some(Default::default());
         }
-        self.config_toml.as_mut().expect("config").clients =
-            Some(clients.into_iter().map(|c| c.into()).collect::<Vec<_>>());
+        self.config_toml.as_mut().expect("config").clients = if clients.is_empty() {
+            None
+        } else {
+            Some(clients.into_iter().map(Into::into).collect())
+        };
     }
 
     /// set authorized keys
@@ -756,6 +756,49 @@ mod connection_mode_tests {
             network_locks: locks,
             clipboard_send: false,
         }
+    }
+
+    fn config_with_no_clients() -> Config {
+        let (_watch_tx, watch_rx) = tokio::sync::mpsc::channel(1);
+        let watcher = RecommendedWatcher::new(
+            |_result: Result<notify::Event, notify::Error>| {},
+            notify::Config::default(),
+        )
+        .expect("create config watcher");
+
+        Config {
+            args: Args {
+                port: None,
+                config: None,
+                capture_backend: None,
+                emulation_backend: None,
+                cert_path: None,
+                command: None,
+            },
+            cert_path: PathBuf::new(),
+            config_path: PathBuf::new(),
+            config_dir: PathBuf::new(),
+            config_toml: Some(ConfigToml::default()),
+            watcher,
+            watch_rx,
+        }
+    }
+
+    #[test]
+    fn removing_last_client_roundtrips_as_no_clients() {
+        let mut config = config_with_no_clients();
+        config.set_clients(vec![client_with(ConnectionMode::default(), HashMap::new())]);
+        assert_eq!(config.clients().len(), 1);
+
+        config.set_clients(Vec::new());
+        assert!(config.clients().is_empty());
+        assert_eq!(config.config_toml.as_ref().expect("config").clients, None);
+
+        let serialized =
+            toml_edit::ser::to_string_pretty(config.config_toml.as_ref().expect("config"))
+                .expect("serialize config");
+        let reloaded: ConfigToml = toml::from_str(&serialized).expect("reload config");
+        assert_eq!(reloaded.clients, None);
     }
 
     #[test]
