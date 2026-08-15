@@ -19,9 +19,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_0, KEYEVENTF_EXTENDEDKEY, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, SendInput,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SPI_GETKEYBOARDDELAY,
-    SPI_GETKEYBOARDSPEED, SYSTEM_PARAMETERS_INFO_ACTION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    SetCursorPos, SystemParametersInfoW, XBUTTON1, XBUTTON2,
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED, SYSTEM_PARAMETERS_INFO_ACTION,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetCursorPos, SystemParametersInfoW, XBUTTON1, XBUTTON2,
 };
 
 use super::{Emulation, EmulationHandle};
@@ -146,11 +146,39 @@ impl Emulation for WindowsEmulation {
     }
 
     async fn warp_cursor(&mut self, x: i32, y: i32) -> Result<(), EmulationError> {
+        let (screen_x, screen_y) = union_to_screen(virtual_screen_origin(), x, y);
         unsafe {
-            let _ = SetCursorPos(x, y);
+            let _ = SetCursorPos(screen_x, screen_y);
         }
         Ok(())
     }
+}
+
+/// Top-left corner of the virtual screen in absolute screen
+/// coordinates. Zero on the common layout, but negative on any setup
+/// with a display left of or above the primary — the primary always
+/// starts at (0, 0), so the union extends into negative space.
+fn virtual_screen_origin() -> (i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+        )
+    }
+}
+
+/// Convert a union-relative warp target into absolute screen
+/// coordinates.
+///
+/// Warp targets arrive union-relative — the `ProtoEvent::CursorPos`
+/// handler scales the peer's normalized fraction against
+/// `display_bounds()`, which reports only the *size* of the display
+/// union — while `SetCursorPos` consumes absolute screen coordinates.
+/// Reapplying the origin is a no-op whenever the primary display is
+/// the top-left one, and is the difference between landing on the
+/// intended monitor and the wrong one when it isn't.
+fn union_to_screen(origin: (i32, i32), x: i32, y: i32) -> (i32, i32) {
+    (origin.0.saturating_add(x), origin.1.saturating_add(y))
 }
 
 impl WindowsEmulation {
@@ -308,4 +336,36 @@ fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {
     };
     log::trace!("windows code: {windows_scancode:?}");
     Some(windows_scancode as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::union_to_screen;
+
+    #[test]
+    fn union_to_screen_is_identity_when_the_primary_is_top_left() {
+        assert_eq!(union_to_screen((0, 0), 0, 0), (0, 0));
+        assert_eq!(union_to_screen((0, 0), 1919, 1079), (1919, 1079));
+    }
+
+    #[test]
+    fn union_to_screen_reapplies_a_negative_origin() {
+        // A 1920x1200 display left of and slightly above a 1920x1080
+        // primary: the union's top-left sits at (-1920, -120), so a
+        // union-relative left-edge entry belongs there, not at x = 0.
+        let origin = (-1920, -120);
+        assert_eq!(union_to_screen(origin, 0, 0), (-1920, -120));
+        // The primary's own top-left, reached from union coordinates.
+        assert_eq!(union_to_screen(origin, 1920, 120), (0, 0));
+        // The far corner of the union: the primary's bottom-right.
+        assert_eq!(union_to_screen(origin, 3839, 1199), (1919, 1079));
+    }
+
+    #[test]
+    fn union_to_screen_saturates_rather_than_overflowing() {
+        assert_eq!(
+            union_to_screen((i32::MAX, i32::MIN), 1, -1),
+            (i32::MAX, i32::MIN)
+        );
+    }
 }
