@@ -379,6 +379,12 @@ pub struct ClientConfig {
     /// is a meaningfully different trust scope than mouse/keyboard.
     #[serde(default)]
     pub clipboard_send: bool,
+    /// On a macOS sender, translate this outgoing peer's Command keys
+    /// into the corresponding Control keys. This is a one-way alias,
+    /// not a swap: physical Control remains Control. Defaults to
+    /// `false` so existing peers keep their current modifier mapping.
+    #[serde(default)]
+    pub command_as_ctrl: bool,
 }
 
 impl Default for ClientConfig {
@@ -392,6 +398,7 @@ impl Default for ClientConfig {
             mode: ConnectionMode::default(),
             network_locks: HashMap::new(),
             clipboard_send: false,
+            command_as_ctrl: false,
         }
     }
 }
@@ -705,6 +712,9 @@ pub enum FrontendRequest {
     /// Toggle whether clipboard changes on this device propagate to
     /// the given outgoing client. Per-pair send-side gate.
     SetClientClipboardSend(ClientHandle, bool),
+    /// On a macOS sender, toggle the one-way Command-to-Control alias
+    /// for the given outgoing client.
+    SetClientCommandAsCtrl(ClientHandle, bool),
     /// Set the base connection policy ([`ConnectionMode`]) for a
     /// client, and clear any explicit lock on the *current* network
     /// (so picking "Auto"/"Fastest" in the GUI releases a pin set
@@ -919,10 +929,10 @@ mod tests {
     }
 
     #[test]
-    fn client_config_clipboard_send_defaults_false() {
-        // ClientConfig uses derive(Deserialize) with
-        // #[serde(default)] on clipboard_send — a JSON object that
-        // omits the field should still decode and produce false.
+    fn client_config_opt_in_fields_default_false() {
+        // ClientConfig uses derive(Deserialize) with #[serde(default)]
+        // on opt-in fields — a legacy JSON object that omits them must
+        // still decode without silently enabling either feature.
         let json = r#"{
             "hostname": null,
             "fix_ips": [],
@@ -932,5 +942,17 @@ mod tests {
         }"#;
         let cfg: ClientConfig = serde_json::from_str(json).unwrap();
         assert!(!cfg.clipboard_send);
+        assert!(!cfg.command_as_ctrl);
+    }
+
+    #[test]
+    fn client_config_command_as_ctrl_round_trips() {
+        let cfg = ClientConfig {
+            command_as_ctrl: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let decoded: ClientConfig = serde_json::from_str(&json).unwrap();
+        assert!(decoded.command_as_ctrl);
     }
 }

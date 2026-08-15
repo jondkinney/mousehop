@@ -76,7 +76,7 @@ enum CaptureRequest {
     /// racing local warp computed from stale virtual_cursor state.
     ReleaseForHandover,
     /// add a capture client
-    Create(CaptureHandle, Position, CaptureType),
+    Create(CaptureHandle, Position, CaptureType, bool),
     /// destory a capture client
     Destroy(CaptureHandle),
     /// reenable input capture
@@ -85,6 +85,10 @@ enum CaptureRequest {
     SetReleaseBind(Vec<scancode::Linux>),
     /// set the auto-release pixel threshold (macOS only). 0 disables.
     SetReleaseThreshold(u32),
+    /// Update the Command-to-Control alias stored for an outgoing
+    /// capture. A capture already in progress keeps its mapping until
+    /// the next Begin so a configuration change cannot split a chord.
+    SetCommandAsCtrl(CaptureHandle, bool),
 }
 
 impl Capture {
@@ -108,6 +112,7 @@ impl Capture {
             release_bind: Rc::new(RefCell::new(release_bind)),
             release_threshold_px: Rc::new(RefCell::new(release_threshold_px)),
             state: Default::default(),
+            command_ctrl_mapper: Default::default(),
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -137,10 +142,16 @@ impl Capture {
         handle: CaptureHandle,
         pos: mousehop_ipc::Position,
         capture_type: CaptureType,
+        command_as_ctrl: bool,
     ) {
         let pos = to_capture_pos(pos);
         self.request_tx
-            .send(CaptureRequest::Create(handle, pos, capture_type))
+            .send(CaptureRequest::Create(
+                handle,
+                pos,
+                capture_type,
+                command_as_ctrl,
+            ))
             .expect("channel closed");
     }
 
@@ -169,6 +180,12 @@ impl Capture {
             .request_tx
             .send(CaptureRequest::SetReleaseThreshold(threshold));
     }
+
+    pub(crate) fn set_command_as_ctrl(&self, handle: CaptureHandle, enabled: bool) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::SetCommandAsCtrl(handle, enabled));
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -188,48 +205,242 @@ macro_rules! debounce {
     };
 }
 
+// XKB/X11 modifier-mask bits used by every capture/emulation backend.
+// Command is represented as Mod4 in the cross-platform event stream.
+const CONTROL_MASK: u32 = 1 << 2;
+const MOD4_MASK: u32 = 1 << 6;
+
+#[derive(Debug, Default)]
+struct AliasSide {
+    physical_ctrl_down: bool,
+    physical_command_down: bool,
+}
+
+impl AliasSide {
+    fn logical_ctrl_down(&self) -> bool {
+        self.physical_ctrl_down || self.physical_command_down
+    }
+
+    /// Update one physical source and return the new logical Ctrl
+    /// state only when it actually transitioned. This reference-like
+    /// state prevents Ctrl-up from being emitted while the other
+    /// physical source is still held.
+    fn update(&mut self, command: bool, down: bool) -> Option<bool> {
+        let before = self.logical_ctrl_down();
+        let source = if command {
+            &mut self.physical_command_down
+        } else {
+            &mut self.physical_ctrl_down
+        };
+        if *source == down {
+            return None;
+        }
+        *source = down;
+        let after = self.logical_ctrl_down();
+        (before != after).then_some(after)
+    }
+}
+
+/// Per-capture sender-side Command-to-Control alias. The peer sees
+/// ordinary evdev Control events, so no network protocol support is
+/// required on the receiver.
+#[derive(Debug, Default)]
+struct CommandCtrlMapper {
+    enabled: bool,
+    left: AliasSide,
+    right: AliasSide,
+}
+
+impl CommandCtrlMapper {
+    fn reset(&mut self, enabled: bool) {
+        *self = Self {
+            enabled,
+            ..Default::default()
+        };
+    }
+
+    fn transform(&mut self, event: Event) -> Option<Event> {
+        if !self.enabled {
+            return Some(event);
+        }
+
+        match event {
+            Event::Keyboard(KeyboardEvent::Key { time, key, state }) => {
+                self.transform_key(time, key, state)
+            }
+            Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed,
+                latched,
+                locked,
+                group,
+            }) => Some(Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed: command_mask_as_ctrl(depressed),
+                latched: command_mask_as_ctrl(latched),
+                locked: command_mask_as_ctrl(locked),
+                group,
+            })),
+            other => Some(other),
+        }
+    }
+
+    fn transform_key(&mut self, time: u32, key: u32, state: u8) -> Option<Event> {
+        use scancode::Linux::{KeyLeftCtrl, KeyLeftMeta, KeyRightCtrl, KeyRightmeta};
+
+        let Ok(source) = scancode::Linux::try_from(key) else {
+            return Some(Event::Keyboard(KeyboardEvent::Key { time, key, state }));
+        };
+        let down = state != 0;
+        let (side, command, target) = match source {
+            KeyLeftCtrl => (&mut self.left, false, KeyLeftCtrl),
+            KeyLeftMeta => (&mut self.left, true, KeyLeftCtrl),
+            KeyRightCtrl => (&mut self.right, false, KeyRightCtrl),
+            KeyRightmeta => (&mut self.right, true, KeyRightCtrl),
+            _ => return Some(Event::Keyboard(KeyboardEvent::Key { time, key, state })),
+        };
+
+        side.update(command, down).map(|logical_down| {
+            Event::Keyboard(KeyboardEvent::Key {
+                time,
+                key: target as u32,
+                state: u8::from(logical_down),
+            })
+        })
+    }
+
+    /// Clear alias state and return the logical Ctrl keys that still
+    /// need an up event. Raw Meta/Ctrl keys must not also be flushed:
+    /// that would either leak Meta-up or release a colliding Ctrl too
+    /// early on the receiver.
+    fn take_releases(&mut self) -> Vec<scancode::Linux> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let mut releases = Vec::with_capacity(2);
+        if self.left.logical_ctrl_down() {
+            releases.push(scancode::Linux::KeyLeftCtrl);
+        }
+        if self.right.logical_ctrl_down() {
+            releases.push(scancode::Linux::KeyRightCtrl);
+        }
+        self.left = AliasSide::default();
+        self.right = AliasSide::default();
+        releases
+    }
+
+    fn take_release_keys(
+        &mut self,
+        raw_pressed: impl IntoIterator<Item = scancode::Linux>,
+    ) -> Vec<scancode::Linux> {
+        if !self.enabled {
+            return raw_pressed.into_iter().collect();
+        }
+        let mut releases: Vec<_> = raw_pressed
+            .into_iter()
+            .filter(|key| !is_ctrl_or_command(*key))
+            .collect();
+        releases.extend(self.take_releases());
+        releases
+    }
+}
+
+fn command_mask_as_ctrl(mask: u32) -> u32 {
+    let had_command = mask & MOD4_MASK != 0;
+    let mut mapped = mask & !MOD4_MASK;
+    if had_command {
+        mapped |= CONTROL_MASK;
+    }
+    mapped
+}
+
+fn is_ctrl_or_command(key: scancode::Linux) -> bool {
+    matches!(
+        key,
+        scancode::Linux::KeyLeftCtrl
+            | scancode::Linux::KeyRightCtrl
+            | scancode::Linux::KeyLeftMeta
+            | scancode::Linux::KeyRightmeta
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CaptureRegistration {
+    handle: CaptureHandle,
+    pos: Position,
+    capture_type: CaptureType,
+    command_as_ctrl: bool,
+}
+
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
-    captures: Vec<(CaptureHandle, Position, CaptureType)>,
+    captures: Vec<CaptureRegistration>,
     conn: MousehopConnection,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     release_threshold_px: Rc<RefCell<u32>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
+    command_ctrl_mapper: CommandCtrlMapper,
 }
 
 impl CaptureTask {
-    fn add_capture(&mut self, handle: CaptureHandle, pos: Position, capture_type: CaptureType) {
-        self.captures.push((handle, pos, capture_type));
+    fn add_capture(
+        &mut self,
+        handle: CaptureHandle,
+        pos: Position,
+        capture_type: CaptureType,
+        command_as_ctrl: bool,
+    ) {
+        self.captures.push(CaptureRegistration {
+            handle,
+            pos,
+            capture_type,
+            command_as_ctrl,
+        });
     }
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
-        self.captures.retain(|&(h, ..)| handle != h);
+        self.captures.retain(|capture| capture.handle != handle);
     }
 
     fn is_default_capture_at(&self, pos: Position) -> bool {
         self.captures
             .iter()
-            .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
+            .any(|capture| capture.pos == pos && capture.capture_type == CaptureType::Default)
     }
 
     fn get_pos(&self, handle: CaptureHandle) -> Position {
         self.captures
             .iter()
-            .find(|(h, ..)| *h == handle)
+            .find(|capture| capture.handle == handle)
             .expect("no such capture")
-            .1
+            .pos
     }
 
     fn get_type(&self, handle: CaptureHandle) -> CaptureType {
         self.captures
             .iter()
-            .find(|(h, ..)| *h == handle)
+            .find(|capture| capture.handle == handle)
             .expect("no such capture")
-            .2
+            .capture_type
+    }
+
+    fn command_as_ctrl(&self, handle: CaptureHandle) -> bool {
+        self.captures
+            .iter()
+            .find(|capture| capture.handle == handle)
+            .is_some_and(|capture| capture.command_as_ctrl)
+    }
+
+    fn set_command_as_ctrl(&mut self, handle: CaptureHandle, enabled: bool) {
+        if let Some(capture) = self
+            .captures
+            .iter_mut()
+            .find(|capture| capture.handle == handle)
+        {
+            capture.command_as_ctrl = enabled;
+        }
     }
 
     async fn run(mut self) {
@@ -241,7 +452,9 @@ impl CaptureTask {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
                         CaptureRequest::Reenable => break,
-                        CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
+                        CaptureRequest::Create(h, p, t, command_as_ctrl) => {
+                            self.add_capture(h, p, t, command_as_ctrl)
+                        }
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::ReleaseForHandover => { /* nothing to do */ }
                         CaptureRequest::SetReleaseBind(bind) => {
@@ -249,6 +462,9 @@ impl CaptureTask {
                         }
                         CaptureRequest::SetReleaseThreshold(threshold) => {
                             *self.release_threshold_px.borrow_mut() = threshold;
+                        }
+                        CaptureRequest::SetCommandAsCtrl(handle, enabled) => {
+                            self.set_command_as_ctrl(handle, enabled);
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -292,9 +508,9 @@ impl CaptureTask {
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         let captures = self.captures.clone();
-        for (handle, pos, _type) in captures {
+        for registration in captures {
             tokio::select! {
-                r = capture.create(handle, pos) => r?,
+                r = capture.create(registration.handle, registration.pos) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
             }
         }
@@ -384,8 +600,8 @@ impl CaptureTask {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::ReleaseForHandover => self.release_capture_handover(capture).await?,
-                    CaptureRequest::Create(h, p, t) => {
-                        self.add_capture(h, p, t);
+                    CaptureRequest::Create(h, p, t, command_as_ctrl) => {
+                        self.add_capture(h, p, t, command_as_ctrl);
                         capture.create(h, p).await?;
                     }
                     CaptureRequest::Destroy(h) => {
@@ -407,6 +623,9 @@ impl CaptureTask {
                     CaptureRequest::SetReleaseThreshold(threshold) => {
                         *self.release_threshold_px.borrow_mut() = threshold;
                         capture.set_release_threshold(threshold);
+                    }
+                    CaptureRequest::SetCommandAsCtrl(handle, enabled) => {
+                        self.set_command_as_ctrl(handle, enabled);
                     }
                 },
                 _ = self.cancellation_token.cancelled() => break,
@@ -456,13 +675,25 @@ impl CaptureTask {
             return Ok(());
         }
 
-        // activated a new client
-        if matches!(event, CaptureEvent::Begin { .. }) && Some(handle) != self.active_client {
+        // Every fresh Begin starts a new acknowledgement and mapping
+        // session, including same-handle re-entry after a backend-side
+        // release or send failure. `active_client` can outlive those
+        // release paths, so gating this reset on a handle change would
+        // retain stale held-source state and incorrectly stay Sending.
+        if matches!(event, CaptureEvent::Begin { .. }) {
             self.state = State::WaitingForAck;
-            self.active_client.replace(handle);
-            self.event_tx
-                .send(ICaptureEvent::ClientEntered(handle))
-                .expect("channel closed");
+            // Snapshot the mapping for this capture session. A config
+            // change mid-chord is deliberately deferred until the next
+            // Begin, and hand-edited settings are ignored off macOS so
+            // Linux Super never changes meaning unexpectedly.
+            let command_as_ctrl = cfg!(target_os = "macos") && self.command_as_ctrl(handle);
+            self.command_ctrl_mapper.reset(command_as_ctrl);
+            let changed_client = self.active_client.replace(handle) != Some(handle);
+            if changed_client {
+                self.event_tx
+                    .send(ICaptureEvent::ClientEntered(handle))
+                    .expect("channel closed");
+            }
         }
 
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
@@ -493,7 +724,15 @@ impl CaptureTask {
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
                 State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
-                State::Sending => ProtoEvent::Input(e.clone()),
+                State::Sending => {
+                    let Some(mapped) = self.command_ctrl_mapper.transform(e.clone()) else {
+                        // A second physical source (e.g. Command while
+                        // Ctrl is already held) did not change the
+                        // logical key state, so there is nothing to send.
+                        return Ok(());
+                    };
+                    ProtoEvent::Input(mapped)
+                }
             },
             CaptureEvent::AutoRelease => unreachable!("handled in early return above"),
         };
@@ -547,8 +786,8 @@ impl CaptureTask {
     async fn notify_peer_of_leave(&mut self, capture: &mut InputCapture) {
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
-            // Synthesize key-up events for every key still held in the
-            // capture's pressed_keys set BEFORE sending Leave. Without
+            // Synthesize key-up events for every logical key still held
+            // BEFORE sending Leave. Without
             // this, pressing the release-bind chord (typically all four
             // modifiers) leaves the peer with phantom held modifiers:
             // the down events were forwarded while capture was active,
@@ -557,7 +796,14 @@ impl CaptureTask {
             // then runs every subsequent keystroke through those held
             // mods until its watchdog times out (1+ s) or our Leave
             // arrives — and Leave can be lost over UDP/DTLS.
-            for key in capture.take_pressed_keys() {
+            // With Command->Ctrl enabled, the capture's raw set contains
+            // physical Meta/Ctrl keys, while the peer saw collision-
+            // coalesced logical Ctrl keys. Never flush the raw aliases:
+            // ask the mapper for exactly the logical releases still due.
+            let release_keys = self
+                .command_ctrl_mapper
+                .take_release_keys(capture.take_pressed_keys());
+            for key in release_keys {
                 let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                     time: 0,
                     key: key as u32,
@@ -641,5 +887,188 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod command_ctrl_tests {
+    use super::*;
+    use scancode::Linux::{KeyA, KeyLeftCtrl, KeyLeftMeta, KeyRightCtrl, KeyRightmeta};
+
+    fn key(key: scancode::Linux, state: u8) -> Event {
+        Event::Keyboard(KeyboardEvent::Key {
+            time: 17,
+            key: key as u32,
+            state,
+        })
+    }
+
+    #[test]
+    fn disabled_mapper_is_an_exact_passthrough() {
+        let mut mapper = CommandCtrlMapper::default();
+        assert_eq!(
+            mapper.transform(key(KeyLeftMeta, 1)),
+            Some(key(KeyLeftMeta, 1))
+        );
+        let modifiers = Event::Keyboard(KeyboardEvent::Modifiers {
+            depressed: MOD4_MASK,
+            latched: MOD4_MASK,
+            locked: MOD4_MASK,
+            group: 2,
+        });
+        assert_eq!(mapper.transform(modifiers.clone()), Some(modifiers));
+    }
+
+    #[test]
+    fn maps_left_and_right_command_to_same_side_control() {
+        let mut mapper = CommandCtrlMapper::default();
+        mapper.reset(true);
+
+        assert_eq!(
+            mapper.transform(key(KeyLeftMeta, 1)),
+            Some(key(KeyLeftCtrl, 1))
+        );
+        assert_eq!(
+            mapper.transform(key(KeyLeftMeta, 0)),
+            Some(key(KeyLeftCtrl, 0))
+        );
+        assert_eq!(
+            mapper.transform(key(KeyRightmeta, 1)),
+            Some(key(KeyRightCtrl, 1))
+        );
+        assert_eq!(
+            mapper.transform(key(KeyRightmeta, 0)),
+            Some(key(KeyRightCtrl, 0))
+        );
+        assert_eq!(mapper.transform(key(KeyA, 1)), Some(key(KeyA, 1)));
+    }
+
+    #[test]
+    fn physical_control_and_command_share_one_logical_press() {
+        let mut mapper = CommandCtrlMapper::default();
+        mapper.reset(true);
+
+        // Physical Ctrl first: Command adds a source but no second down;
+        // releasing Ctrl cannot release the still-held Command alias.
+        assert_eq!(
+            mapper.transform(key(KeyLeftCtrl, 1)),
+            Some(key(KeyLeftCtrl, 1))
+        );
+        assert_eq!(mapper.transform(key(KeyLeftMeta, 1)), None);
+        assert_eq!(mapper.transform(key(KeyLeftCtrl, 0)), None);
+        assert_eq!(
+            mapper.transform(key(KeyLeftMeta, 0)),
+            Some(key(KeyLeftCtrl, 0))
+        );
+
+        mapper.reset(true);
+        // Same guarantee in the opposite press and release order.
+        assert_eq!(
+            mapper.transform(key(KeyLeftMeta, 1)),
+            Some(key(KeyLeftCtrl, 1))
+        );
+        assert_eq!(mapper.transform(key(KeyLeftCtrl, 1)), None);
+        assert_eq!(mapper.transform(key(KeyLeftMeta, 0)), None);
+        assert_eq!(
+            mapper.transform(key(KeyLeftCtrl, 0)),
+            Some(key(KeyLeftCtrl, 0))
+        );
+    }
+
+    #[test]
+    fn left_and_right_aliases_are_independent() {
+        let mut mapper = CommandCtrlMapper::default();
+        mapper.reset(true);
+
+        assert_eq!(
+            mapper.transform(key(KeyLeftMeta, 1)),
+            Some(key(KeyLeftCtrl, 1))
+        );
+        assert_eq!(
+            mapper.transform(key(KeyRightmeta, 1)),
+            Some(key(KeyRightCtrl, 1))
+        );
+        assert_eq!(
+            mapper.transform(key(KeyLeftMeta, 0)),
+            Some(key(KeyLeftCtrl, 0))
+        );
+        assert_eq!(
+            mapper.transform(key(KeyRightmeta, 0)),
+            Some(key(KeyRightCtrl, 0))
+        );
+    }
+
+    #[test]
+    fn duplicate_and_unmatched_alias_events_do_not_change_logical_state() {
+        let mut mapper = CommandCtrlMapper::default();
+        mapper.reset(true);
+
+        assert_eq!(mapper.transform(key(KeyLeftMeta, 0)), None);
+        assert_eq!(
+            mapper.transform(key(KeyLeftMeta, 1)),
+            Some(key(KeyLeftCtrl, 1))
+        );
+        assert_eq!(mapper.transform(key(KeyLeftMeta, 1)), None);
+        assert_eq!(
+            mapper.transform(key(KeyLeftMeta, 0)),
+            Some(key(KeyLeftCtrl, 0))
+        );
+        assert_eq!(mapper.transform(key(KeyLeftMeta, 0)), None);
+    }
+
+    #[test]
+    fn modifier_masks_alias_mod4_to_control_and_preserve_other_bits() {
+        let mut mapper = CommandCtrlMapper::default();
+        mapper.reset(true);
+        let shift = 1 << 0;
+        let lock = 1 << 1;
+        let alt = 1 << 3;
+        let unknown = 1 << 12;
+        let input = Event::Keyboard(KeyboardEvent::Modifiers {
+            depressed: MOD4_MASK | shift | alt,
+            latched: MOD4_MASK | unknown,
+            locked: MOD4_MASK | lock,
+            group: 3,
+        });
+        let expected = Event::Keyboard(KeyboardEvent::Modifiers {
+            depressed: CONTROL_MASK | shift | alt,
+            latched: CONTROL_MASK | unknown,
+            locked: CONTROL_MASK | lock,
+            group: 3,
+        });
+        assert_eq!(mapper.transform(input), Some(expected));
+
+        // An existing physical Control bit naturally collides into the
+        // same single logical bit rather than being toggled away.
+        assert_eq!(command_mask_as_ctrl(CONTROL_MASK | MOD4_MASK), CONTROL_MASK);
+    }
+
+    #[test]
+    fn release_cleanup_emits_one_logical_up_and_clears_state() {
+        let mut mapper = CommandCtrlMapper::default();
+        mapper.reset(true);
+        assert_eq!(
+            mapper.transform(key(KeyLeftMeta, 1)),
+            Some(key(KeyLeftCtrl, 1))
+        );
+        assert_eq!(mapper.transform(key(KeyLeftCtrl, 1)), None);
+        let releases = mapper.take_release_keys([KeyLeftMeta, KeyLeftCtrl, KeyA]);
+        assert_eq!(releases.len(), 2);
+        assert!(releases.contains(&KeyLeftCtrl));
+        assert!(releases.contains(&KeyA));
+        assert!(!releases.contains(&KeyLeftMeta));
+        assert!(mapper.take_release_keys([]).is_empty());
+    }
+
+    #[test]
+    fn reset_drops_stale_source_state_for_the_next_capture() {
+        let mut mapper = CommandCtrlMapper::default();
+        mapper.reset(true);
+        assert_eq!(
+            mapper.transform(key(KeyLeftMeta, 1)),
+            Some(key(KeyLeftCtrl, 1))
+        );
+        mapper.reset(true);
+        assert_eq!(mapper.transform(key(KeyLeftMeta, 0)), None);
     }
 }

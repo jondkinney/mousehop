@@ -36,6 +36,7 @@ impl ClientManager {
             mode: config_client.mode,
             network_locks: config_client.network_locks,
             clipboard_send: config_client.clipboard_send,
+            command_as_ctrl: config_client.command_as_ctrl,
         };
         let state = ClientState {
             active: config_client.active,
@@ -354,6 +355,26 @@ impl ClientManager {
         }
     }
 
+    /// Update the macOS Command-to-Control alias for an outgoing
+    /// client. Returns `true` only when the value changed.
+    pub(crate) fn set_command_as_ctrl(&self, handle: ClientHandle, enabled: bool) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((c, _)) if c.command_as_ctrl != enabled => {
+                c.command_as_ctrl = enabled;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn command_as_ctrl(&self, handle: ClientHandle) -> bool {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(c, _)| c.command_as_ctrl)
+            .unwrap_or(false)
+    }
+
     pub(crate) fn get_mode(&self, handle: ClientHandle) -> ConnectionMode {
         self.clients
             .borrow()
@@ -594,6 +615,7 @@ mod tests {
             mode: ConnectionMode::Auto,
             network_locks: HashMap::new(),
             clipboard_send: false,
+            command_as_ctrl: false,
         });
         (cm, handle)
     }
@@ -693,5 +715,16 @@ mod tests {
             !targets.iter().any(|(h, _, _)| *h == empty),
             "a client with no candidate ips must not be a probe target"
         );
+    }
+
+    #[test]
+    fn command_as_ctrl_setter_reports_only_changes() {
+        let (cm, h) = manager_with_ips(&[]);
+        assert!(!cm.command_as_ctrl(h));
+        assert!(cm.set_command_as_ctrl(h, true));
+        assert!(cm.command_as_ctrl(h));
+        assert!(!cm.set_command_as_ctrl(h, true));
+        assert!(cm.set_command_as_ctrl(h, false));
+        assert!(!cm.command_as_ctrl(h));
     }
 }

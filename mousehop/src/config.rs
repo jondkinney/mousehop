@@ -112,6 +112,10 @@ struct TomlClient {
     /// defaults to `false` so existing pairs don't start
     /// transmitting clipboard text on upgrade.
     clipboard_send: Option<bool>,
+    /// macOS-only, per-outgoing-peer Command-to-Control alias.
+    /// Absent in legacy configs and default-off.
+    #[serde(default)]
+    command_as_ctrl: Option<bool>,
 }
 
 impl ConfigToml {
@@ -333,6 +337,7 @@ pub struct ConfigClient {
     pub mode: ConnectionMode,
     pub network_locks: HashMap<String, IpAddr>,
     pub clipboard_send: bool,
+    pub command_as_ctrl: bool,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -346,6 +351,7 @@ impl From<TomlClient> for ConfigClient {
         let mode = toml.mode.unwrap_or_default();
         let network_locks = toml.network_locks.unwrap_or_default();
         let clipboard_send = toml.clipboard_send.unwrap_or(false);
+        let command_as_ctrl = toml.command_as_ctrl.unwrap_or(false);
         Self {
             ips,
             hostname,
@@ -356,6 +362,7 @@ impl From<TomlClient> for ConfigClient {
             mode,
             network_locks,
             clipboard_send,
+            command_as_ctrl,
         }
     }
 }
@@ -383,6 +390,13 @@ impl From<ConfigClient> for TomlClient {
         } else {
             None
         };
+        // Like clipboard sharing, the modifier alias is an explicit
+        // opt-in. Keep default-false implicit in the persisted file.
+        let command_as_ctrl = if client.command_as_ctrl {
+            Some(true)
+        } else {
+            None
+        };
         // Persist the mode only when it diverges from the default, and
         // the lock map only when non-empty, so untouched configs don't
         // sprout new keys on every save.
@@ -399,6 +413,7 @@ impl From<ConfigClient> for TomlClient {
             mode,
             network_locks,
             clipboard_send,
+            command_as_ctrl,
         }
     }
 }
@@ -755,6 +770,7 @@ mod connection_mode_tests {
             mode,
             network_locks: locks,
             clipboard_send: false,
+            command_as_ctrl: false,
         }
     }
 
@@ -821,6 +837,7 @@ mod connection_mode_tests {
         let toml: TomlClient = client_with(ConnectionMode::default(), HashMap::new()).into();
         assert_eq!(toml.mode, None);
         assert_eq!(toml.network_locks, None);
+        assert_eq!(toml.command_as_ctrl, None);
         // A non-default mode IS persisted.
         let toml: TomlClient = client_with(ConnectionMode::Auto, HashMap::new()).into();
         assert_eq!(toml.mode, Some(ConnectionMode::Auto));
@@ -839,5 +856,17 @@ mod connection_mode_tests {
         let cc: ConfigClient = parsed.into();
         assert_eq!(cc.mode, ConnectionMode::default());
         assert!(cc.network_locks.is_empty());
+        assert!(!cc.command_as_ctrl);
+    }
+
+    #[test]
+    fn command_as_ctrl_true_roundtrips_through_toml() {
+        let mut client = client_with(ConnectionMode::default(), HashMap::new());
+        client.command_as_ctrl = true;
+        let toml: TomlClient = client.into();
+        assert_eq!(toml.command_as_ctrl, Some(true));
+
+        let back: ConfigClient = toml.into();
+        assert!(back.command_as_ctrl);
     }
 }

@@ -396,9 +396,23 @@ hostname = "thorium"
 port = 4252
 # optional base policy: "auto" (default) or "fastest"
 mode = "fastest"
+# macOS sender only: make Command act as Control for this peer
+command_as_ctrl = true
 ```
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
+
+### macOS Command as Control
+
+On a Mac, each outgoing client has an optional **Use Command as
+Control** switch. It is off by default and is useful when the peer runs
+Windows or Linux: Command+C/V/A/Z arrives there as Ctrl+C/V/A/Z.
+
+This is a one-way alias, not a swap. Physical Control continues to act
+as Control, while Command no longer acts as the peer's Super/Windows
+key for that client. The setting can also be enabled with
+`command_as_ctrl = true` on the corresponding `[[clients]]` entry and
+is ignored when mousehop is running on a non-macOS sender.
 
 ### Multi-homed peers (interfaces, latency, locking)
 

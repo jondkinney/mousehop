@@ -86,6 +86,22 @@
 				</property>
 			</object>
 		</child>
+		<!-- macOS outgoing modifier alias (hidden by Rust on other OSes) -->
+		<child>
+			<object class="AdwActionRow" id="command_as_ctrl_row">
+				<property name="title" translatable="yes">Use Command as Control</property>
+				<property name="subtitle" translatable="yes">Send Command as Control when this Mac controls this peer. Useful for Windows and Linux peers.</property>
+				<!-- non-activatable so a click on the row doesn't
+				     collapse the surrounding AdwExpanderRow; the inner
+				     GtkSwitch handles its own clicks. -->
+				<property name="activatable">false</property>
+				<child type="suffix">
+					<object class="GtkSwitch" id="command_as_ctrl_switch">
+						<property name="valign">center</property>
+					</object>
+				</child>
+			</object>
+		</child>
 		<!-- clipboard send toggle -->
 		<child>
 			<object class="AdwActionRow">

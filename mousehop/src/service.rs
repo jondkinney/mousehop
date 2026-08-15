@@ -415,6 +415,13 @@ impl Service {
                     self.save_config().await;
                 }
             }
+            FrontendRequest::SetClientCommandAsCtrl(handle, enabled) => {
+                if self.client_manager.set_command_as_ctrl(handle, enabled) {
+                    self.capture.set_command_as_ctrl(handle, enabled);
+                    self.broadcast_client(handle);
+                    self.save_config().await;
+                }
+            }
             FrontendRequest::SetConnectionMode(handle, mode) => {
                 // Resolve the live network first: the user is acting on a
                 // connected machine, so a stale cached `None` (from a
@@ -618,6 +625,7 @@ impl Service {
                 mode: c.mode,
                 network_locks: c.network_locks,
                 clipboard_send: c.clipboard_send,
+                command_as_ctrl: c.command_as_ctrl,
             })
             .collect();
         self.config.set_clients(clients);
@@ -1041,7 +1049,8 @@ impl Service {
     fn add_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
         let handle = Self::ENTER_HANDLE_BEGIN + self.next_trigger_handle;
         self.next_trigger_handle += 1;
-        self.capture.create(handle, pos, CaptureType::EnterOnly);
+        self.capture
+            .create(handle, pos, CaptureType::EnterOnly, false);
         self.incoming_conns.insert(addr);
         self.incoming_conn_info.insert(
             handle,
@@ -1172,7 +1181,9 @@ impl Service {
         /* activate the client */
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
-            self.capture.create(handle, pos, CaptureType::Default);
+            let command_as_ctrl = self.client_manager.command_as_ctrl(handle);
+            self.capture
+                .create(handle, pos, CaptureType::Default, command_as_ctrl);
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
         }

@@ -308,6 +308,22 @@ impl Window {
                         ),
                     );
                     row.connect_closure(
+                        "request-command-as-ctrl-change",
+                        false,
+                        closure_local!(
+                            #[strong]
+                            window,
+                            move |row: ClientRow, command_as_ctrl: bool| {
+                                if let Some(client) = window.client_by_idx(row.index() as u32) {
+                                    window.request(FrontendRequest::SetClientCommandAsCtrl(
+                                        client.handle(),
+                                        command_as_ctrl,
+                                    ));
+                                }
+                            }
+                        ),
+                    );
+                    row.connect_closure(
                         "request-connection-choice",
                         false,
                         closure_local!(
@@ -445,6 +461,7 @@ impl Window {
         row.set_port(client.port);
         row.set_position(client.pos);
         row.set_clipboard_send(client.clipboard_send);
+        row.set_command_as_ctrl(client.command_as_ctrl);
         if let Some(client_object) = self.client_object_for_handle(handle) {
             client_object.set_mode(client.mode);
             row.refresh_addresses(&client_object);

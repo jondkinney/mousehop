@@ -19,6 +19,10 @@ pub struct ClientRow {
     #[template_child]
     pub clipboard_send_switch: TemplateChild<gtk::Switch>,
     #[template_child]
+    pub command_as_ctrl_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub command_as_ctrl_switch: TemplateChild<gtk::Switch>,
+    #[template_child]
     pub dns_button: TemplateChild<gtk::Button>,
     #[template_child]
     pub hostname: TemplateChild<gtk::Entry>,
@@ -41,6 +45,7 @@ pub struct ClientRow {
     position_change_handler: RefCell<Option<SignalHandlerId>>,
     set_state_handler: RefCell<Option<SignalHandlerId>>,
     pub clipboard_send_handler: RefCell<Option<SignalHandlerId>>,
+    pub command_as_ctrl_handler: RefCell<Option<SignalHandlerId>>,
     address_select_handler: RefCell<Option<SignalHandlerId>>,
     /// Maps a non-"Auto" dropdown index (i.e. `selected - 1`) to the
     /// candidate IP string it represents.
@@ -75,6 +80,12 @@ impl ObjectSubclass for ClientRow {
 impl ObjectImpl for ClientRow {
     fn constructed(&self) {
         self.parent_constructed();
+        // The setting describes the physical macOS Command key. Keep
+        // the persisted field portable, but do not offer a Linux
+        // Super/Windows-key remap in other builds.
+        if !cfg!(target_os = "macos") {
+            self.command_as_ctrl_row.set_visible(false);
+        }
         self.delete_button.connect_clicked(clone!(
             #[weak(rename_to = row)]
             self,
@@ -129,6 +140,18 @@ impl ObjectImpl for ClientRow {
             }
         ));
         self.clipboard_send_handler.replace(Some(handler));
+        let handler = self.command_as_ctrl_switch.connect_state_set(clone!(
+            #[weak(rename_to = row)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, state| {
+                row.obj()
+                    .emit_by_name::<()>("request-command-as-ctrl-change", &[&state]);
+                glib::Propagation::Proceed
+            }
+        ));
+        self.command_as_ctrl_handler.replace(Some(handler));
         let handler = self.address_select.connect_selected_notify(clone!(
             #[weak(rename_to = row)]
             self,
@@ -181,6 +204,9 @@ impl ObjectImpl for ClientRow {
                     .param_types([u32::static_type()])
                     .build(),
                 Signal::builder("request-clipboard-send-change")
+                    .param_types([bool::static_type()])
+                    .build(),
+                Signal::builder("request-command-as-ctrl-change")
                     .param_types([bool::static_type()])
                     .build(),
                 // Carries the connection choice: "auto", "fastest", or
@@ -302,6 +328,20 @@ impl ClientRow {
             .expect("client object")
             .set_clipboard_send(value);
         self.clipboard_send_switch.unblock_signal(handler);
+    }
+
+    /// Push a server-originated `command-as-ctrl` value into the
+    /// switch without retriggering the user-change signal.
+    pub(super) fn set_command_as_ctrl(&self, value: bool) {
+        let handler = self.command_as_ctrl_handler.borrow();
+        let handler = handler.as_ref().expect("signal handler");
+        self.command_as_ctrl_switch.block_signal(handler);
+        self.client_object
+            .borrow_mut()
+            .as_mut()
+            .expect("client object")
+            .set_command_as_ctrl(value);
+        self.command_as_ctrl_switch.unblock_signal(handler);
     }
 
     /// Rebuild the connection-address dropdown from the candidate list,

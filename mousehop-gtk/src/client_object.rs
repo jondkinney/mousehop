@@ -28,6 +28,7 @@ impl ClientObject {
             .property("resolving", state.resolving)
             .property("peer-commit", peer_commit_to_string(state.peer_commit))
             .property("clipboard-send", client.clipboard_send)
+            .property("command-as-ctrl", client.command_as_ctrl)
             .build();
         // The candidate list, mode and active lock aren't GObject
         // properties (the row renders them imperatively into a
@@ -233,6 +234,7 @@ pub struct ClientData {
     pub ips: Vec<String>,
     pub peer_commit: Option<String>,
     pub clipboard_send: bool,
+    pub command_as_ctrl: bool,
     /// Candidate addresses with per-address latency, rendered into the
     /// address-selector dropdown. Not a GObject property — updated via
     /// [`ClientObject::set_addresses`].
