@@ -5,6 +5,7 @@ use input_event::{
 };
 
 use async_trait::async_trait;
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::ops::BitOrAssign;
 use std::time::Duration;
@@ -76,11 +77,22 @@ fn read_spi_u32(action: SYSTEM_PARAMETERS_INFO_ACTION) -> Option<u32> {
 
 pub(crate) struct WindowsEmulation {
     repeat_task: Option<AbortHandle>,
+    /// Cached virtual-screen origin, refreshed on each
+    /// `display_bounds()` call — which the emulation proxy invokes
+    /// at backend creation and then every 2s. `warp_cursor` reads
+    /// the origin from here so it pairs with the size the warp
+    /// target was scaled against, instead of a fresher origin that
+    /// could mix two arrangements while displays are being
+    /// rearranged.
+    virtual_screen_origin: Cell<Option<(i32, i32)>>,
 }
 
 impl WindowsEmulation {
     pub(crate) fn new() -> Result<Self, WindowsEmulationCreationError> {
-        Ok(Self { repeat_task: None })
+        Ok(Self {
+            repeat_task: None,
+            virtual_screen_origin: Cell::new(None),
+        })
     }
 }
 
@@ -134,19 +146,32 @@ impl Emulation for WindowsEmulation {
     fn display_bounds(&self) -> Option<(u32, u32)> {
         // Virtual-screen metrics cover the union of every monitor
         // attached to the system, matching the host-side capture
-        // model that uses the union of all displays.
-        unsafe {
-            let w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-            let h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-            if w <= 0 || h <= 0 {
-                return None;
-            }
-            Some((w as u32, h as u32))
+        // model that uses the union of all displays. Also the sole
+        // refresh point of `virtual_screen_origin` — see the field
+        // docs.
+        let (w, h) = unsafe {
+            (
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
+        };
+        if w <= 0 || h <= 0 {
+            return None;
         }
+        self.virtual_screen_origin
+            .set(Some(virtual_screen_origin()));
+        Some((w as u32, h as u32))
     }
 
     async fn warp_cursor(&mut self, x: i32, y: i32) -> Result<(), EmulationError> {
-        let (screen_x, screen_y) = union_to_screen(virtual_screen_origin(), x, y);
+        // Cached at the last display_bounds() poll; the live query
+        // is only a fallback for a warp that somehow arrives before
+        // the proxy's creation-time bounds read.
+        let origin = self
+            .virtual_screen_origin
+            .get()
+            .unwrap_or_else(virtual_screen_origin);
+        let (screen_x, screen_y) = union_to_screen(origin, x, y);
         unsafe {
             let _ = SetCursorPos(screen_x, screen_y);
         }
