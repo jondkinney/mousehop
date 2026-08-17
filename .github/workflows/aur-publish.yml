@@ -82,8 +82,10 @@ jobs:
           # Drop in the variant's PKGBUILD.
           cp "app/packaging/${PKGBUILD_DIR}/PKGBUILD" aur/PKGBUILD
 
-          # Optional pacman install scriptlet (e.g. a post_install message).
-          # Variants/repos without one are unaffected.
+          # Synchronize optional pacman install scriptlets. Remove any scriptlet
+          # left by an older package revision before copying the current source
+          # of truth; variants without one should publish without one.
+          rm -f aur/*.install
           cp "app/packaging/${PKGBUILD_DIR}/"*.install aur/ 2>/dev/null || true
 
           # Pin the version. source/bin reset pkgrel to 1; git's static
@@ -135,5 +137,6 @@ jobs:
           git config user.email "${APP}-release-bot@users.noreply.github.com"
           git add PKGBUILD .SRCINFO
           git add ./*.install 2>/dev/null || true
+          git add -u
           git diff --cached --quiet || git commit -m "Update to $ver"
           git push --quiet -u origin master
