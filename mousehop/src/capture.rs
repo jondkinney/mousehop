@@ -598,7 +598,20 @@ impl CaptureTask {
                     }
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
-                    CaptureRequest::Reenable => { /* already active */ },
+                    CaptureRequest::Reenable => {
+                        // Capture is already running, so there is
+                        // nothing to restart — but "re-enable" is also
+                        // the action reached for when a peer came back
+                        // from sleep and input still isn't flowing.
+                        // A session that outlived its peer still holds
+                        // the compositor's pointer lock, which pins the
+                        // local cursor and stops focus following the
+                        // mouse. Tear it down here so the one action
+                        // that brings the keyboard back hands the mouse
+                        // back with it.
+                        log::info!("releasing capture: re-enable requested while active");
+                        self.release_capture(capture).await?;
+                    },
                     CaptureRequest::ReleaseForHandover => self.release_capture_handover(capture).await?,
                     CaptureRequest::Create(h, p, t, command_as_ctrl) => {
                         self.add_capture(h, p, t, command_as_ctrl);
