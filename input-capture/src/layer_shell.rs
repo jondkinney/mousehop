@@ -570,33 +570,43 @@ impl State {
     }
 
     fn ungrab(&mut self, warp_target: Option<(i32, i32)>) {
-        // get focused client
-        let window = match self.focused.as_ref() {
-            Some(focused) => focused,
-            None => return,
-        };
-
-        // Restore normal keyboard focus. If the caller modeled a host
-        // landing point, attach it to the still-live pointer lock before
-        // committing and destroying the lock. Cursor position hints are
-        // double-buffered Wayland surface state; without this commit,
-        // Hyprland unlocks at the stale pre-capture cursor position.
-        window
-            .layer_surface
-            .set_keyboard_interactivity(KeyboardInteractivity::None);
-        if let (Some(pointer_lock), Some(warp_target)) = (&self.pointer_lock, warp_target) {
-            let (surface_x, surface_y) = screen_to_surface(
-                window.pos,
-                window.output_pos,
-                window.output_size,
-                warp_target,
+        // Only the keyboard-interactivity reset and the release warp
+        // need a focused window; the teardown below must run
+        // regardless. `focused` is cleared by a pointer `Leave` and by
+        // output reconfiguration, either of which can race a release —
+        // and returning early there stranded the pointer lock. Because
+        // that lock is `Lifetime::Persistent`, a stranded one pins the
+        // compositor's cursor for good: warps are ignored, focus never
+        // follows the mouse again, and nothing short of restarting the
+        // daemon frees it.
+        if let Some(window) = self.focused.as_ref() {
+            // Restore normal keyboard focus. If the caller modeled a host
+            // landing point, attach it to the still-live pointer lock before
+            // committing and destroying the lock. Cursor position hints are
+            // double-buffered Wayland surface state; without this commit,
+            // Hyprland unlocks at the stale pre-capture cursor position.
+            window
+                .layer_surface
+                .set_keyboard_interactivity(KeyboardInteractivity::None);
+            if let (Some(pointer_lock), Some(warp_target)) = (&self.pointer_lock, warp_target) {
+                let (surface_x, surface_y) = screen_to_surface(
+                    window.pos,
+                    window.output_pos,
+                    window.output_size,
+                    warp_target,
+                );
+                log::info!(
+                    "[release-warp] layer-shell screen target {warp_target:?} -> surface hint ({surface_x:.1}, {surface_y:.1})"
+                );
+                pointer_lock.set_cursor_position_hint(surface_x, surface_y);
+            }
+            window.surface.commit();
+        } else if self.pointer_lock.is_some() {
+            log::warn!(
+                "ungrab with no focused window — tearing down a pointer lock that would \
+                 otherwise strand the cursor"
             );
-            log::info!(
-                "[release-warp] layer-shell screen target {warp_target:?} -> surface hint ({surface_x:.1}, {surface_y:.1})"
-            );
-            pointer_lock.set_cursor_position_hint(surface_x, surface_y);
         }
-        window.surface.commit();
 
         // destroy pointer lock
         if let Some(pointer_lock) = &self.pointer_lock {
