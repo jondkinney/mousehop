@@ -136,6 +136,16 @@ pub(crate) struct MacOSEmulation {
     /// the idle timer. Initialized to 0; the first call returns a
     /// real ID, subsequent calls within 5s return the same ID.
     user_activity_assertion: Cell<u32>,
+    /// Cached union of every active display's rectangle, refreshed
+    /// on each `display_bounds()` call — which the emulation proxy
+    /// invokes at backend creation and then every 2s. `warp_cursor`
+    /// reads the origin from here instead of re-walking the display
+    /// list on every crossing. Beyond the saved query, this keeps
+    /// the warp self-consistent: the caller scales its target
+    /// against the size `display_bounds()` returned, so pairing
+    /// that with a fresher origin could mix two arrangements while
+    /// displays are being rearranged.
+    display_union_cache: Cell<Option<(CGFloat, CGFloat, CGFloat, CGFloat)>>,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -166,6 +176,7 @@ impl MacOSEmulation {
             notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
             user_activity_assertion: Cell::new(0),
+            display_union_cache: Cell::new(None),
         })
     }
 
@@ -730,13 +741,21 @@ impl Emulation for MacOSEmulation {
     fn display_bounds(&self) -> Option<(u32, u32)> {
         // Union of every active display's rectangle. Matches the
         // shape used on the input-capture side so the host's
-        // wall-press model is consistent across both ends.
-        let (_, _, width, height) = display_union()?;
+        // wall-press model is consistent across both ends. Also the
+        // sole refresh point of `display_union_cache` — see the
+        // field docs.
+        let union = display_union();
+        self.display_union_cache.set(union);
+        let (_, _, width, height) = union?;
         Some((width as u32, height as u32))
     }
 
     async fn warp_cursor(&mut self, x: i32, y: i32) -> Result<(), EmulationError> {
-        let origin = display_union().map_or((0.0, 0.0), |(ox, oy, _, _)| (ox, oy));
+        // Cached at the last display_bounds() poll; the live query
+        // is only a fallback for a warp that somehow arrives before
+        // the proxy's creation-time bounds read.
+        let union = self.display_union_cache.get().or_else(display_union);
+        let origin = union.map_or((0.0, 0.0), |(ox, oy, _, _)| (ox, oy));
         let (global_x, global_y) = union_to_global(origin, x, y);
         let pt = CGPoint {
             x: global_x,
