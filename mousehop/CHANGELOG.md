@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.2](https://github.com/jondkinney/mousehop/compare/v0.15.1...v0.15.2) - 2026-08-19
+
+### Fixed
+
+- release a stale capture when capture is re-enabled
+- *(linux)* always tear down the pointer lock in ungrab
+
 ## [0.15.1](https://github.com/jondkinney/mousehop/compare/v0.15.0...v0.15.1) - 2026-08-15
 
 ### Fixed
