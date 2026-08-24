@@ -93,6 +93,40 @@ It can be used as a remote control for any device supported by Mousehop.
 
 </details>
 
+<details>
+    <summary>Windows</summary>
+
+- Download `mousehop-windows-x86_64.zip` from the releases page and extract it somewhere permanent — the GTK DLLs next to `mousehop.exe` are required, so keep the folder intact
+- Run `mousehop.exe`. No console window appears, and none has to stay open
+
+**Notification area.** Closing the settings window does not quit Mousehop — it
+hides to the notification area (the "system tray") and keeps sharing input.
+
+- Left-click the tray icon to show or hide the settings window
+- Right-click it for **Open Mousehop** / **Quit Mousehop**
+- Quitting from that menu is the only thing that stops input sharing
+
+Windows 11 files new tray icons into the overflow flyout (the `^` chevron) by
+default. Drag the Mousehop icon out of the flyout and onto the taskbar to keep
+it visible, or find it under Settings → Personalization → Taskbar → Other system
+tray icons.
+
+**Start with Windows.** Press <kbd>Win</kbd>+<kbd>R</kbd>, run `shell:startup`,
+and drop a shortcut to `mousehop.exe` into the folder that opens.
+
+**Command line.** `mousehop.exe` is a GUI application, so it prints to the
+terminal only when you give it something to do — `mousehop.exe cli list`,
+`mousehop.exe --help`, `mousehop.exe daemon`. A plain `mousehop.exe` typed at a
+prompt stays silent and detached, so closing that terminal will not take the app
+with it; set `MOUSEHOP_LOG_LEVEL` (e.g. `debug`) to make a GUI launch log to the
+terminal anyway. As with any Windows GUI program, the prompt returns immediately
+rather than waiting for the command to finish.
+
+Crashes are recorded either way, at
+`%LOCALAPPDATA%\Mousehop\logs\panic.log`.
+
+</details>
+
 
 <details>
     <summary>Manual Installation</summary>
