@@ -20,5 +20,19 @@ thiserror = "2.0.0"
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = "0.2"
 
+# Notification-area icon (see src/windows_tray.rs). Same major version
+# as the Windows capture / emulation backends so the feature sets
+# unify into one build of the crate.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [build-dependencies]
 glib-build-tools = { version = "0.20.0" }

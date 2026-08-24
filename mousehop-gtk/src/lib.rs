@@ -17,6 +17,8 @@ mod release_shortcut;
 mod running_app_object;
 mod single_instance;
 mod window;
+#[cfg(windows)]
+mod windows_tray;
 
 use std::{env, process, str, sync::OnceLock};
 
@@ -477,6 +479,28 @@ fn build_ui(app: &Application) {
         TRAY_HOLD.with(|cell| {
             let _ = cell.set(hold);
         });
+    }
+    #[cfg(windows)]
+    {
+        // Same hide-on-close deal as Linux, but wired up only once the
+        // notification-area icon actually exists: hiding the window
+        // with no tray to re-present it from would leave a running
+        // process the user has no way back to. `windows_tray::setup`
+        // returns `None` in that case and the X button keeps its
+        // default close-and-quit behaviour.
+        thread_local! {
+            static TRAY_HOLD: std::cell::OnceCell<gio::ApplicationHoldGuard> =
+                const { std::cell::OnceCell::new() };
+        }
+        if let Some(hold) = windows_tray::setup(app, &window) {
+            window.connect_close_request(|window| {
+                window.set_visible(false);
+                glib::Propagation::Stop
+            });
+            TRAY_HOLD.with(|cell| {
+                let _ = cell.set(hold);
+            });
+        }
     }
     #[cfg(target_os = "macos")]
     {

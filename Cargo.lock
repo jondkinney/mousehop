@@ -2310,6 +2310,7 @@ dependencies = [
  "mousehop-input-event",
  "mousehop-ipc",
  "thiserror 2.0.18",
+ "windows 0.61.3",
 ]
 
 [[package]]
