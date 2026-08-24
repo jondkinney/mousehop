@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.4](https://github.com/jondkinney/mousehop/compare/v0.15.3...v0.15.4) - 2026-08-24
+
+### Added
+
+- *(windows)* drop the console window, keep the command line
+- *(gtk)* Windows notification-area icon with close-to-tray
+
 ## [0.15.3](https://github.com/jondkinney/mousehop/compare/v0.15.2...v0.15.3) - 2026-08-19
 
 ### Other
