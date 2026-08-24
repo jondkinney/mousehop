@@ -1,3 +1,10 @@
+// Build the Windows binary against the GUI subsystem so launching
+// mousehop.exe does not open a console window alongside the app — one
+// that has to stay open, because closing it kills the process. The
+// command-line surface gets its console back at runtime instead; see
+// `mousehop::windows_console`.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use env_logger::Env;
 use input_capture::InputCaptureError;
 use input_emulation::InputEmulationError;
@@ -41,6 +48,12 @@ enum MousehopError {
 }
 
 fn main() {
+    // Windows only, and before anything can log or print: a
+    // GUI-subsystem process starts with no standard handles, so hand
+    // the console back to invocations that have something to say.
+    #[cfg(windows)]
+    mousehop::windows_console::attach_parent();
+
     // init logging
     let env = Env::default().filter_or("MOUSEHOP_LOG_LEVEL", "info");
     env_logger::init_from_env(env);

@@ -2281,6 +2281,7 @@ dependencies = [
  "toml_edit 0.22.27",
  "webrtc-dtls",
  "webrtc-util",
+ "windows 0.61.3",
 ]
 
 [[package]]
