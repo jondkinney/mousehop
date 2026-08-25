@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.5](https://github.com/jondkinney/mousehop/compare/v0.15.4...v0.15.5) - 2026-08-25
+
+### Fixed
+
+- *(emulation/wlroots)* release keymap subscription
+
 ## [0.15.4](https://github.com/jondkinney/mousehop/compare/v0.15.3...v0.15.4) - 2026-08-24
 
 ### Added
