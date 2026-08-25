@@ -113,6 +113,8 @@ impl Capture {
             release_threshold_px: Rc::new(RefCell::new(release_threshold_px)),
             state: Default::default(),
             command_ctrl_mapper: Default::default(),
+            #[cfg(target_os = "macos")]
+            user_activity: Default::default(),
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -382,6 +384,8 @@ struct CaptureTask {
     request_rx: Receiver<CaptureRequest>,
     state: State,
     command_ctrl_mapper: CommandCtrlMapper,
+    #[cfg(target_os = "macos")]
+    user_activity: crate::macos_power::UserActivity,
 }
 
 impl CaptureTask {
@@ -500,6 +504,11 @@ impl CaptureTask {
 
         let r = self.do_capture_session(&mut capture).await;
 
+        // Any backend/session exit ends the remote-control interval,
+        // including cancellation and capture errors that bypass the
+        // ordinary release paths below.
+        self.stop_user_activity();
+
         // FIXME replace with async drop when stabilized
         capture.terminate().await?;
 
@@ -521,8 +530,15 @@ impl CaptureTask {
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
+        // A screen saver can have a shorter idle delay than display
+        // sleep. Refresh the macOS user-activity assertion often
+        // enough to cover either while capture remains on a peer.
+        let mut user_activity_tick = tokio::time::interval(Duration::from_secs(30));
+        user_activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
+                _ = user_activity_tick.tick() => self.pulse_user_activity(),
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
@@ -618,6 +634,9 @@ impl CaptureTask {
                         capture.create(h, p).await?;
                     }
                     CaptureRequest::Destroy(h) => {
+                        if self.active_client == Some(h) {
+                            self.stop_user_activity();
+                        }
                         let pos = self.get_pos(h);
                         self.remove_capture(h);
                         capture.destroy(h).await?;
@@ -694,6 +713,7 @@ impl CaptureTask {
         // release paths, so gating this reset on a handle change would
         // retain stale held-source state and incorrectly stay Sending.
         if matches!(event, CaptureEvent::Begin { .. }) {
+            self.start_user_activity();
             self.state = State::WaitingForAck;
             // Snapshot the mapping for this capture session. A config
             // change mid-chord is deliberately deferred until the next
@@ -753,6 +773,7 @@ impl CaptureTask {
         if let Err(e) = self.conn.send(proto_event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+            self.stop_user_activity();
             capture.release().await?;
             return Ok(());
         }
@@ -797,6 +818,8 @@ impl CaptureTask {
     }
 
     async fn notify_peer_of_leave(&mut self, capture: &mut InputCapture) {
+        self.stop_user_activity();
+
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Synthesize key-up events for every logical key still held
@@ -850,6 +873,21 @@ impl CaptureTask {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
         }
+    }
+
+    fn start_user_activity(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.user_activity.start();
+    }
+
+    fn pulse_user_activity(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.user_activity.pulse_if_active();
+    }
+
+    fn stop_user_activity(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.user_activity.stop();
     }
 }
 

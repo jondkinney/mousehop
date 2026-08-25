@@ -19,7 +19,8 @@ use core_graphics::{
 };
 use futures_core::Stream;
 use input_event::{
-    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
+    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent,
+    MACOS_KEEP_AWAKE_EVENT_TAG, PointerEvent,
 };
 use keycode::{KeyMap, KeyMapping};
 use libc::c_void;
@@ -604,6 +605,16 @@ fn create_event_tap<'a>(
     let event_tap_callback = move |_proxy: CGEventTapProxy,
                                    event_type: CGEventType,
                                    cg_ev: &CGEvent| {
+        // The daemon posts this same-position MouseMoved event to
+        // reset macOS's screen-saver idle timer while capture is on a
+        // peer. Let WindowServer consume it, but do not turn it into a
+        // forwarded pointer delta or snap the hidden cursor to the
+        // edge again. The shared tag is the contract between the
+        // daemon and this tap.
+        if is_mousehop_keep_awake_event(cg_ev) {
+            return CallbackResult::Keep;
+        }
+
         log::trace!("Got event from tap: {event_type:?}");
         let mut state = client_state.blocking_lock();
         let mut capture_position = None;
@@ -791,6 +802,10 @@ fn create_event_tap<'a>(
     }
 
     Ok((tap, tap_mach_port))
+}
+
+fn is_mousehop_keep_awake_event(event: &CGEvent) -> bool {
+    event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == MACOS_KEEP_AWAKE_EVENT_TAG
 }
 
 fn event_tap_thread(
@@ -1233,6 +1248,23 @@ mod permission_tests {
             Err(MacosCaptureCreationError::AccessibilityPermission)
         ));
         assert!(!input_monitoring_checked.get());
+    }
+
+    #[test]
+    fn recognizes_only_the_shared_keep_awake_event_tag() {
+        let source = CGEventSource::new(CGEventSourceStateID::Private).expect("event source");
+        let event = CGEvent::new(source).expect("event");
+
+        event.set_integer_value_field(
+            EventField::EVENT_SOURCE_USER_DATA,
+            MACOS_KEEP_AWAKE_EVENT_TAG,
+        );
+        assert!(is_mousehop_keep_awake_event(&event));
+
+        let untagged_source =
+            CGEventSource::new(CGEventSourceStateID::Private).expect("untagged event source");
+        let untagged = CGEvent::new(untagged_source).expect("untagged event");
+        assert!(!is_mousehop_keep_awake_event(&untagged));
     }
 }
 

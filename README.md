@@ -90,6 +90,7 @@ It can be used as a remote control for any device supported by Mousehop.
 - Launch the app — release builds are signed with a Developer ID and notarized by Apple, so it opens with no Gatekeeper prompt
 - Use the menu bar item to open the settings window or quit Mousehop. Bundled macOS builds run as a menu bar app and do not keep a Dock icon visible.
 - Grant accessibility permissions in System Settings
+- While this Mac is controlling a peer, Mousehop automatically keeps macOS from starting the idle screen saver or turning off the display. The keep-awake assertion ends as soon as the cursor returns to this Mac.
 
 </details>
 

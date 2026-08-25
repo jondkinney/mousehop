@@ -1,4 +1,8 @@
-//! macOS system-power observer for the daemon's listen side.
+//! macOS power integration for wake observation and outgoing capture.
+//!
+//! [`UserActivity`] keeps the local host out of its idle screen saver
+//! while its input is captured for a peer. The rest of this module is
+//! the daemon listen-side system-power observer:
 //!
 //! DTLS rides UDP; a peer connection that was alive before the host
 //! slept has no FIN to deliver on wake, and the `read_loop`'s `recv`
@@ -16,10 +20,125 @@
 //! `input-capture/src/macos.rs:810`, but spawned by the daemon —
 //! capture lives elsewhere (and may not even be on this host).
 
-use libc::c_void;
+use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField};
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use input_event::MACOS_KEEP_AWAKE_EVENT_TAG;
+use libc::{c_char, c_int, c_void};
 use std::thread::{self, JoinHandle};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
+
+/// macOS keep-awake state for an outgoing capture session. The capture
+/// event tap replaces real forwarded events with `kCGEventNull`, so
+/// WindowServer never sees them as local input and would otherwise
+/// start the screen saver while the user is controlling a peer.
+///
+/// `start` declares activity immediately; the capture loop calls
+/// `pulse_if_active` periodically until `stop`. Each pulse combines a
+/// power assertion (display wake/sleep) with a tagged, same-position
+/// MouseMoved event (screen-saver idle). The capture tap recognizes
+/// the shared tag and never forwards the synthetic event to the peer.
+#[derive(Default)]
+pub(crate) struct UserActivity {
+    active: bool,
+    assertion_id: u32,
+}
+
+impl UserActivity {
+    pub(crate) fn start(&mut self) {
+        self.active = true;
+        self.pulse();
+    }
+
+    pub(crate) fn pulse_if_active(&mut self) {
+        if self.active {
+            self.pulse();
+        }
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.active = false;
+        if self.assertion_id == 0 {
+            return;
+        }
+
+        let id = std::mem::take(&mut self.assertion_id);
+        let result = unsafe { IOPMAssertionRelease(id) };
+        if result != K_IO_RETURN_SUCCESS {
+            // User-activity assertions also expire on their own. If
+            // powerd already retired this ID, there is nothing left
+            // for us to release.
+            log::debug!(
+                "macos_power: user-activity assertion {id} was already inactive ({result:#x})"
+            );
+        }
+    }
+
+    fn pulse(&mut self) {
+        self.declare_power_user_activity();
+
+        match keep_awake_mouse_event() {
+            Ok(event) => event.post(CGEventTapLocation::HID),
+            Err(()) => log::warn!("macos_power: could not create keep-awake mouse event"),
+        }
+    }
+
+    fn declare_power_user_activity(&mut self) {
+        let reason = unsafe {
+            CFStringCreateWithCString(
+                std::ptr::null(),
+                c"Mousehop: controlling a peer".as_ptr(),
+                K_CF_STRING_ENCODING_UTF8,
+            )
+        };
+        if reason.is_null() {
+            log::warn!("macos_power: could not create user-activity description");
+            return;
+        }
+
+        let result = unsafe {
+            IOPMAssertionDeclareUserActivity(
+                reason,
+                K_IOPM_USER_ACTIVE_LOCAL,
+                &mut self.assertion_id,
+            )
+        };
+        unsafe { CFRelease(reason) };
+
+        if result != K_IO_RETURN_SUCCESS {
+            log::warn!("macos_power: could not declare user activity ({result:#x})");
+            self.assertion_id = 0;
+        }
+    }
+}
+
+/// Build the mouse-jiggler half of a keep-awake pulse. The event's
+/// position exactly matches the live cursor, so it resets HID and
+/// screen-saver idle without a visible jump. Its private source and
+/// shared user-data marker let the capture tap distinguish it from
+/// physical input.
+fn keep_awake_mouse_event() -> Result<CGEvent, ()> {
+    let source = CGEventSource::new(CGEventSourceStateID::Private)?;
+    let cursor = CGEvent::new(source.clone())?.location();
+    let event =
+        CGEvent::new_mouse_event(source, CGEventType::MouseMoved, cursor, CGMouseButton::Left)?;
+    event.set_integer_value_field(
+        EventField::EVENT_SOURCE_USER_DATA,
+        MACOS_KEEP_AWAKE_EVENT_TAG,
+    );
+    Ok(event)
+}
+
+impl Drop for UserActivity {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+const K_IO_RETURN_SUCCESS: c_int = 0;
+const K_IOPM_USER_ACTIVE_LOCAL: c_int = 0;
+// `kCFStringEncodingUTF8` from CFString.h.
+const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
 /// Owns the observer thread and the registration. Held by
 /// `MousehopListener` for its lifetime; dropping it stops the
@@ -188,13 +307,56 @@ extern "C" {
     fn IONotificationPortGetRunLoopSource(notify: *mut c_void) -> *mut c_void;
     fn IONotificationPortDestroy(notify: *mut c_void);
     fn IOAllowPowerChange(kernel_port: u32, notification_id: isize) -> i32;
+    fn IOPMAssertionDeclareUserActivity(
+        assertion_name: *const c_void,
+        user_type: c_int,
+        assertion_id: *mut u32,
+    ) -> c_int;
+    fn IOPMAssertionRelease(assertion_id: u32) -> c_int;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
+    fn CFStringCreateWithCString(
+        allocator: *const c_void,
+        c_string: *const c_char,
+        encoding: u32,
+    ) -> *const c_void;
+    fn CFRelease(value: *const c_void);
     fn CFRunLoopGetCurrent() -> *mut c_void;
     fn CFRunLoopRun();
     fn CFRunLoopStop(rl: *mut c_void);
     fn CFRunLoopAddSource(rl: *mut c_void, source: *mut c_void, mode: *const c_void);
     static kCFRunLoopCommonModes: *const c_void;
+}
+
+#[cfg(test)]
+mod tests {
+    use core_graphics::event::EventField;
+    use input_event::MACOS_KEEP_AWAKE_EVENT_TAG;
+
+    use super::{UserActivity, keep_awake_mouse_event};
+
+    #[test]
+    fn user_activity_assertion_starts_and_stops() {
+        let mut activity = UserActivity::default();
+
+        activity.start();
+        assert!(activity.active);
+        assert_ne!(activity.assertion_id, 0);
+
+        activity.stop();
+        assert!(!activity.active);
+        assert_eq!(activity.assertion_id, 0);
+    }
+
+    #[test]
+    fn keep_awake_mouse_event_carries_the_capture_filter_tag() {
+        let event = keep_awake_mouse_event().expect("keep-awake event");
+
+        assert_eq!(
+            event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA),
+            MACOS_KEEP_AWAKE_EVENT_TAG
+        );
+    }
 }
