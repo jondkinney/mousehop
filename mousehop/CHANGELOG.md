@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.6](https://github.com/jondkinney/mousehop/compare/v0.15.5...v0.15.6) - 2026-08-25
+
 ### Fixed
 
-- *(capture/macos)* keep the host awake while controlling a peer
+- *(macos)* prevent screen saver during outgoing capture
 
 ## [0.15.5](https://github.com/jondkinney/mousehop/compare/v0.15.4...v0.15.5) - 2026-08-25
 
