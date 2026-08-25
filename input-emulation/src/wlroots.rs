@@ -43,6 +43,11 @@ use super::error::WaylandBindError;
 
 struct State {
     keymap: Option<(u32, OwnedFd, u32)>,
+    /// Temporary keyboard used only to receive the compositor's
+    /// keymap. The wlroots backend does not otherwise drive this
+    /// Wayland event queue, so leaving the object alive would let
+    /// later keymap FDs accumulate unread in the compositor.
+    keymap_keyboard: Option<WlKeyboard>,
     input_for_client: HashMap<EmulationHandle, VirtualInput>,
     seat: wl_seat::WlSeat,
     qh: QueueHandle<Self>,
@@ -145,6 +150,7 @@ impl WlrootsEmulation {
             last_flush_failed: false,
             state: State {
                 keymap: None,
+                keymap_keyboard: None,
                 input_for_client,
                 seat,
                 vpm,
@@ -157,6 +163,16 @@ impl WlrootsEmulation {
         };
         while emulate.state.keymap.is_none() {
             emulate.queue.blocking_dispatch(&mut emulate.state)?;
+        }
+
+        // We only need wl_keyboard long enough to obtain a keymap for
+        // the virtual keyboards. Release it and wait for the server to
+        // process the destructor so future keymap changes cannot queue
+        // file descriptors on an event queue this backend does not
+        // continuously dispatch.
+        if let Some(keyboard) = emulate.state.keymap_keyboard.take() {
+            keyboard.release();
+            emulate.queue.roundtrip(&mut emulate.state)?;
         }
         // let fd = unsafe { &File::from_raw_fd(emulate.state.keymap.unwrap().1.as_raw_fd()) };
         // let mmap = unsafe { MmapOptions::new().map_copy(fd).unwrap() };
@@ -489,7 +505,7 @@ impl Dispatch<WlOutput, ()> for State {
 
 impl Dispatch<WlSeat, ()> for State {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         seat: &WlSeat,
         event: <WlSeat as wayland_client::Proxy>::Event,
         _: &(),
@@ -500,8 +516,11 @@ impl Dispatch<WlSeat, ()> for State {
             capabilities: WEnum::Value(capabilities),
         } = event
         {
-            if capabilities.contains(wl_seat::Capability::Keyboard) {
-                seat.get_keyboard(qhandle, ());
+            if capabilities.contains(wl_seat::Capability::Keyboard)
+                && state.keymap.is_none()
+                && state.keymap_keyboard.is_none()
+            {
+                state.keymap_keyboard = Some(seat.get_keyboard(qhandle, ()));
             }
         }
     }
