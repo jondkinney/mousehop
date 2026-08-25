@@ -13,6 +13,12 @@ pub const BTN_MIDDLE: u32 = 0x112;
 pub const BTN_BACK: u32 = 0x113;
 pub const BTN_FORWARD: u32 = 0x114;
 
+/// `CGEventField::EVENT_SOURCE_USER_DATA` marker used by Mousehop's
+/// macOS keep-awake pulse. The capture event tap lets tagged events
+/// reach WindowServer so they reset screen-saver idle, but never
+/// forwards them to a peer. The hexadecimal bytes spell `MOUSEHOP`.
+pub const MACOS_KEEP_AWAKE_EVENT_TAG: i64 = 0x4d4f_5553_4548_4f50;
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum PointerEvent {
     /// relative motion event

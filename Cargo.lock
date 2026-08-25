@@ -2249,6 +2249,7 @@ name = "mousehop"
 version = "0.15.5"
 dependencies = [
  "clap 4.6.0",
+ "core-graphics",
  "env_logger",
  "futures",
  "hostname",

@@ -79,6 +79,9 @@ windows = { version = "0.61.2", features = [
     "Win32_System_Console",
 ] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = { version = "0.25.0", features = ["highsierra"] }
+
 [features]
 default = [
     "gtk",
