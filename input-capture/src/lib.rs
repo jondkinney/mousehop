@@ -43,6 +43,14 @@ mod dummy;
 
 pub type CaptureHandle = u64;
 
+/// Confirmed availability of input on the capturing host. Backends emit this
+/// only when the operating system exposes an authoritative state transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostInputState {
+    Unlocked,
+    Locked,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum CaptureEvent {
     /// Capture on this handle is now active. `cursor`, when present,
@@ -63,6 +71,10 @@ pub enum CaptureEvent {
     /// at the host-adjacent edge of the guest and kept pushing). The
     /// capture loop should treat this like a release-bind chord.
     AutoRelease,
+    /// The host locked or unlocked. This is a host-wide lifecycle event, so a
+    /// backend may route it through every registered capture position; the
+    /// higher-level capture task is responsible for de-duplicating it.
+    HostInputState(HostInputState),
 }
 
 impl Display for CaptureEvent {
@@ -74,6 +86,7 @@ impl Display for CaptureEvent {
             } => write!(f, "begin capture @ ({x}, {y})"),
             CaptureEvent::Input(e) => write!(f, "{e}"),
             CaptureEvent::AutoRelease => write!(f, "auto-release"),
+            CaptureEvent::HostInputState(state) => write!(f, "host input {state:?}"),
         }
     }
 }

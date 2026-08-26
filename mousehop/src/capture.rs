@@ -6,11 +6,14 @@ use std::{
 
 use futures::StreamExt;
 use input_capture::{
-    CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
+    CaptureError, CaptureEvent, CaptureHandle, HostInputState, InputCapture, InputCaptureError,
+    Position,
 };
 use input_event::{Event, KeyboardEvent, scancode};
 use local_channel::mpsc::{Receiver, Sender, channel};
-use mousehop_proto::{LEAVE_HANDOVER, LEAVE_RELEASE_ONLY, ProtoEvent};
+use mousehop_proto::{
+    HostInputState as ProtoHostInputState, LEAVE_HANDOVER, LEAVE_RELEASE_ONLY, ProtoEvent,
+};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
@@ -108,6 +111,9 @@ impl Capture {
             captures: Default::default(),
             conn,
             event_tx,
+            host_input_state: HostInputState::Unlocked,
+            host_input_generation: 0,
+            lock_recovery_client: None,
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             release_threshold_px: Rc::new(RefCell::new(release_threshold_px)),
@@ -379,6 +385,17 @@ struct CaptureTask {
     captures: Vec<CaptureRegistration>,
     conn: MousehopConnection,
     event_tx: Sender<ICaptureEvent>,
+    /// Last authoritative host lock state seen from the capture backend.
+    /// Input is never forwarded while this is `Locked`.
+    host_input_state: HostInputState,
+    /// Monotonic transition number paired with host-input state on the wire.
+    /// Lets the receiver reject an old Locked datagram that arrives after a
+    /// newer Unlocked transition.
+    host_input_generation: u32,
+    /// Peer that was being controlled when the host locked. Retained after
+    /// capture is released so a sleeping peer can receive the state when it
+    /// reconnects, and so a later confirmed unlock can dismiss its dialog.
+    lock_recovery_client: Option<CaptureHandle>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     release_threshold_px: Rc<RefCell<u32>>,
     request_rx: Receiver<CaptureRequest>,
@@ -535,19 +552,30 @@ impl CaptureTask {
         // enough to cover either while capture remains on a peer.
         let mut user_activity_tick = tokio::time::interval(Duration::from_secs(30));
         user_activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut lock_recovery_tick = tokio::time::interval(Duration::from_secs(2));
+        lock_recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
                 _ = user_activity_tick.tick() => self.pulse_user_activity(),
+                _ = lock_recovery_tick.tick() => {
+                    let _ = self.retry_lock_recovery().await;
+                },
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
                 },
                 (handle, event) = self.conn.recv() => {
                     if let Some(active) = self.active_client {
-                        if handle != active {
-                            // we only care about events coming from the client we are currently connected to
-                            // only `Ack` and `Leave` are relevant
+                        if handle != active
+                            && !matches!(
+                                &event,
+                                ProtoEvent::Hello { .. } | ProtoEvent::HostInputStateAck { .. }
+                            )
+                        {
+                            // Capture events belong to the active client, but
+                            // connection and recovery control-plane events can
+                            // arrive from the retained recovery peer.
                             continue
                         }
                     }
@@ -558,6 +586,26 @@ impl CaptureTask {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
                         }
+                        ProtoEvent::HostInputStateAck { state, generation }
+                            if completes_lock_recovery(
+                                self.host_input_state,
+                                self.host_input_generation,
+                                self.lock_recovery_client,
+                                handle,
+                                state,
+                                generation,
+                            ) =>
+                        {
+                            // Keep the recovery target through Locked so it
+                            // can receive a later Unlocked. Clear it only after
+                            // the receiver explicitly confirms that it removed
+                            // its locked-input gate.
+                            log::info!(
+                                "client {handle} acknowledged host-input recovery completion"
+                            );
+                            self.lock_recovery_client = None;
+                        }
+                        ProtoEvent::HostInputStateAck { .. } => {}
                         // A legacy Leave(0), or any future mode this
                         // receiver doesn't understand, retains the
                         // handover behavior: skip the host warp because
@@ -609,6 +657,7 @@ impl CaptureTask {
                             self.event_tx
                                 .send(ICaptureEvent::PeerCommitUpdated(handle))
                                 .expect("channel closed");
+                            let _ = self.retry_lock_recovery_for(handle).await;
                         }
                         _ => {}
                     }
@@ -634,6 +683,9 @@ impl CaptureTask {
                         capture.create(h, p).await?;
                     }
                     CaptureRequest::Destroy(h) => {
+                        if self.lock_recovery_client == Some(h) {
+                            self.lock_recovery_client = None;
+                        }
                         if self.active_client == Some(h) {
                             self.stop_user_activity();
                         }
@@ -674,6 +726,20 @@ impl CaptureTask {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
 
+        if let CaptureEvent::HostInputState(state) = &event {
+            return self.handle_host_input_state(capture, *state).await;
+        }
+
+        // A backend event already queued when the lock transition arrived can
+        // race behind the lifecycle notification. Once lock is confirmed,
+        // discard every non-lifecycle event until a confirmed unlock; never
+        // allow a stale Begin or key event to recreate forwarding.
+        if self.host_input_state == HostInputState::Locked {
+            log::debug!("discarding capture event while host input is locked");
+            capture.release().await?;
+            return Ok(());
+        }
+
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture).await;
@@ -713,6 +779,13 @@ impl CaptureTask {
         // release paths, so gating this reset on a handle change would
         // retain stale held-source state and incorrectly stay Sending.
         if matches!(event, CaptureEvent::Begin { .. }) {
+            // Send Unlocked directly before a new Enter as well as on the
+            // recovery timer. DTLS rides UDP, so send success is not proof the
+            // receiver removed its locked-input gate; only the dedicated
+            // HostInputStateAck completes recovery.
+            if self.host_input_state == HostInputState::Unlocked {
+                let _ = self.retry_lock_recovery().await;
+            }
             self.start_user_activity();
             self.state = State::WaitingForAck;
             // Snapshot the mapping for this capture session. A config
@@ -768,6 +841,9 @@ impl CaptureTask {
                 }
             },
             CaptureEvent::AutoRelease => unreachable!("handled in early return above"),
+            CaptureEvent::HostInputState(_) => {
+                unreachable!("handled in early return above")
+            }
         };
 
         if let Err(e) = self.conn.send(proto_event, handle).await {
@@ -797,6 +873,70 @@ impl CaptureTask {
             );
         }
         Ok(())
+    }
+
+    async fn handle_host_input_state(
+        &mut self,
+        capture: &mut InputCapture,
+        state: HostInputState,
+    ) -> Result<(), CaptureError> {
+        if state == self.host_input_state {
+            return Ok(());
+        }
+        self.host_input_state = state;
+        self.host_input_generation = self.host_input_generation.wrapping_add(1);
+
+        match state {
+            HostInputState::Locked => {
+                // Prefer the peer being controlled at the instant of lock. An
+                // active handle can survive a send failure while that peer is
+                // asleep, which is exactly the recovery case this state must
+                // retain across reconnection.
+                if let Some(active) = self.active_client {
+                    self.lock_recovery_client = Some(active);
+                }
+                let _ = self.retry_lock_recovery().await;
+                log::info!("host locked; releasing outgoing capture");
+                self.release_capture(capture).await?;
+            }
+            HostInputState::Unlocked => {
+                // Inform the same peer, but deliberately do not restart the
+                // old capture. The user must make a fresh edge crossing.
+                let _ = self.retry_lock_recovery().await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn retry_lock_recovery(&mut self) -> bool {
+        let Some(handle) = self.lock_recovery_client else {
+            return false;
+        };
+        self.retry_lock_recovery_for(handle).await
+    }
+
+    async fn retry_lock_recovery_for(&mut self, handle: CaptureHandle) -> bool {
+        if self.lock_recovery_client != Some(handle) {
+            return false;
+        }
+        let wire_state = to_proto_host_input_state(self.host_input_state);
+        match self
+            .conn
+            .send(
+                ProtoEvent::HostInputState {
+                    state: wire_state,
+                    generation: self.host_input_generation,
+                },
+                handle,
+            )
+            .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                log::debug!("host-input state for recovery client {handle} not delivered yet: {e}");
+                false
+            }
+        }
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
@@ -900,6 +1040,27 @@ enum State {
     #[default]
     WaitingForAck,
     Sending,
+}
+
+fn to_proto_host_input_state(state: HostInputState) -> ProtoHostInputState {
+    match state {
+        HostInputState::Unlocked => ProtoHostInputState::Unlocked,
+        HostInputState::Locked => ProtoHostInputState::Locked,
+    }
+}
+
+fn completes_lock_recovery(
+    host_input_state: HostInputState,
+    host_input_generation: u32,
+    recovery_client: Option<CaptureHandle>,
+    ack_handle: CaptureHandle,
+    ack_state: ProtoHostInputState,
+    ack_generation: u32,
+) -> bool {
+    host_input_state == HostInputState::Unlocked
+        && recovery_client == Some(ack_handle)
+        && ack_state == ProtoHostInputState::Unlocked
+        && ack_generation == host_input_generation
 }
 
 fn to_capture_pos(pos: mousehop_ipc::Position) -> input_capture::Position {
@@ -1121,5 +1282,55 @@ mod command_ctrl_tests {
         );
         mapper.reset(true);
         assert_eq!(mapper.transform(key(KeyLeftMeta, 0)), None);
+    }
+}
+
+#[cfg(test)]
+mod lock_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn only_matching_unlocked_ack_completes_recovery() {
+        let handle = 42;
+        assert!(completes_lock_recovery(
+            HostInputState::Unlocked,
+            9,
+            Some(handle),
+            handle,
+            ProtoHostInputState::Unlocked,
+            9,
+        ));
+        assert!(!completes_lock_recovery(
+            HostInputState::Locked,
+            8,
+            Some(handle),
+            handle,
+            ProtoHostInputState::Locked,
+            8,
+        ));
+        assert!(!completes_lock_recovery(
+            HostInputState::Unlocked,
+            9,
+            Some(handle),
+            handle,
+            ProtoHostInputState::Locked,
+            8,
+        ));
+        assert!(!completes_lock_recovery(
+            HostInputState::Unlocked,
+            9,
+            Some(handle),
+            handle + 1,
+            ProtoHostInputState::Unlocked,
+            9,
+        ));
+        assert!(!completes_lock_recovery(
+            HostInputState::Unlocked,
+            9,
+            Some(handle),
+            handle,
+            ProtoHostInputState::Unlocked,
+            8,
+        ));
     }
 }

@@ -19,7 +19,8 @@ use local_channel::mpsc::{Receiver, channel};
 use log;
 use mousehop_ipc::{
     AppIdent, AsyncFrontendListener, ClientHandle, ConnectionMode, FrontendEvent, FrontendRequest,
-    HostKind, IncomingPeerConfig, IpcError, IpcListenerCreationError, Position, Status,
+    HostKind, IncomingPeerConfig, IpcError, IpcListenerCreationError, Position, RemoteHostState,
+    Status,
 };
 use mousehop_proto::ProtoEvent;
 use std::{
@@ -85,6 +86,9 @@ pub struct Service {
     incoming_conns: HashSet<SocketAddr>,
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
+    /// Retained peer lock-recovery states, keyed by authenticated certificate
+    /// fingerprint so a reconnect on a new source port keeps the same identity.
+    remote_host_states: HashMap<String, RemoteHostRecovery>,
     next_trigger_handle: u64,
     /// mDNS-SD service registration + browse. Advertises our primary
     /// interface IP for peer dialers to bias toward; populates
@@ -147,6 +151,41 @@ struct Incoming {
     fingerprint: String,
     addr: SocketAddr,
     pos: Position,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteHostRecovery {
+    addr: SocketAddr,
+    state: RemoteHostState,
+}
+
+fn mark_locked_remote_host_unavailable(
+    states: &mut HashMap<String, RemoteHostRecovery>,
+    addr: SocketAddr,
+) -> Option<(String, SocketAddr)> {
+    states
+        .iter_mut()
+        .find(|(_, recovery)| recovery.addr == addr && recovery.state == RemoteHostState::Locked)
+        .map(|(fingerprint, recovery)| {
+            recovery.state = RemoteHostState::Unavailable;
+            (fingerprint.clone(), recovery.addr)
+        })
+}
+
+fn record_remote_host_state(
+    states: &mut HashMap<String, RemoteHostRecovery>,
+    fingerprint: &str,
+    addr: SocketAddr,
+    state: RemoteHostState,
+) -> bool {
+    if state == RemoteHostState::Unlocked {
+        return states.remove(fingerprint).is_some();
+    }
+    let changed = states
+        .get(fingerprint)
+        .is_none_or(|recovery| recovery.addr != addr || recovery.state != state);
+    states.insert(fingerprint.to_owned(), RemoteHostRecovery { addr, state });
+    changed
 }
 
 impl Service {
@@ -255,6 +294,7 @@ impl Service {
             emulation_status: Default::default(),
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
+            remote_host_states: Default::default(),
             next_trigger_handle: 0,
             discovery,
             discovery_event_rx,
@@ -693,6 +733,7 @@ impl Service {
                 }
             }
             EmulationEvent::Disconnected { addr } => {
+                self.mark_remote_host_unavailable(addr);
                 if let Some(addr) = self.remove_incoming(addr) {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
@@ -717,6 +758,9 @@ impl Service {
             EmulationEvent::ReleaseNotify => self.capture.release_for_handover(),
             EmulationEvent::Connected { addr, fingerprint } => {
                 self.update_incoming_peer_address(addr, &fingerprint).await;
+                if let Some(recovery) = self.remote_host_states.get_mut(&fingerprint) {
+                    recovery.addr = addr;
+                }
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
             EmulationEvent::PeerHello { addr, commit } => {
@@ -728,6 +772,29 @@ impl Service {
                 if let Some(handle) = self.client_manager.get_client(addr) {
                     self.client_manager.set_peer_commit(handle, Some(commit));
                     self.broadcast_client(handle);
+                }
+            }
+            EmulationEvent::RemoteHostState {
+                addr,
+                fingerprint,
+                state,
+            } => {
+                let state = match state {
+                    mousehop_proto::HostInputState::Locked => RemoteHostState::Locked,
+                    mousehop_proto::HostInputState::Unlocked => RemoteHostState::Unlocked,
+                };
+                let changed = record_remote_host_state(
+                    &mut self.remote_host_states,
+                    &fingerprint,
+                    addr,
+                    state,
+                );
+                if changed {
+                    self.notify_frontend(FrontendEvent::RemoteHostState {
+                        fingerprint,
+                        addr,
+                        state,
+                    });
                 }
             }
             EmulationEvent::ClipboardReceived {
@@ -1042,6 +1109,18 @@ impl Service {
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         let host_list = self.config.clipboard_suppression().host().clone();
         self.notify_frontend(FrontendEvent::SuppressedAppsUpdated(host_list));
+        let recovery_events: Vec<_> = self
+            .remote_host_states
+            .iter()
+            .map(|(fingerprint, recovery)| FrontendEvent::RemoteHostState {
+                fingerprint: fingerprint.clone(),
+                addr: recovery.addr,
+                state: recovery.state,
+            })
+            .collect();
+        for event in recovery_events {
+            self.notify_frontend(event);
+        }
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
@@ -1101,6 +1180,17 @@ impl Service {
         self.incoming_conn_info
             .remove(&handle)
             .map(|incoming| incoming.addr)
+    }
+
+    fn mark_remote_host_unavailable(&mut self, addr: SocketAddr) {
+        let update = mark_locked_remote_host_unavailable(&mut self.remote_host_states, addr);
+        if let Some((fingerprint, addr)) = update {
+            self.notify_frontend(FrontendEvent::RemoteHostState {
+                fingerprint,
+                addr,
+                state: RemoteHostState::Unavailable,
+            });
+        }
     }
 
     fn notify_frontend(&mut self, event: FrontendEvent) {
@@ -1333,5 +1423,61 @@ mod tests {
         map.retain(|_, ts| ts.elapsed() < RECENT_FORWARD_TTL);
         assert!(!map.contains_key(&("fp_a".to_string(), 1)));
         assert!(map.contains_key(&("fp_b".to_string(), 2)));
+    }
+
+    #[test]
+    fn disconnect_downgrades_confirmed_lock_to_unavailable() {
+        let addr: SocketAddr = "192.0.2.4:4252".parse().expect("address");
+        let mut states = HashMap::from([(
+            "peer-fingerprint".to_owned(),
+            RemoteHostRecovery {
+                addr,
+                state: RemoteHostState::Locked,
+            },
+        )]);
+
+        assert_eq!(
+            mark_locked_remote_host_unavailable(&mut states, addr),
+            Some(("peer-fingerprint".to_owned(), addr))
+        );
+        assert_eq!(
+            states["peer-fingerprint"].state,
+            RemoteHostState::Unavailable
+        );
+        assert_eq!(
+            mark_locked_remote_host_unavailable(&mut states, addr),
+            None,
+            "an unavailable peer must not be reported as a fresh lock"
+        );
+    }
+
+    #[test]
+    fn repeated_wire_state_does_not_reopen_recovery_ui() {
+        let addr: SocketAddr = "192.0.2.4:4252".parse().expect("address");
+        let mut states = HashMap::new();
+        assert!(record_remote_host_state(
+            &mut states,
+            "peer-fingerprint",
+            addr,
+            RemoteHostState::Locked,
+        ));
+        assert!(!record_remote_host_state(
+            &mut states,
+            "peer-fingerprint",
+            addr,
+            RemoteHostState::Locked,
+        ));
+        assert!(record_remote_host_state(
+            &mut states,
+            "peer-fingerprint",
+            addr,
+            RemoteHostState::Unlocked,
+        ));
+        assert!(!record_remote_host_state(
+            &mut states,
+            "peer-fingerprint",
+            addr,
+            RemoteHostState::Unlocked,
+        ));
     }
 }

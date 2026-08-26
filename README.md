@@ -91,6 +91,7 @@ It can be used as a remote control for any device supported by Mousehop.
 - Use the menu bar item to open the settings window or quit Mousehop. Bundled macOS builds run as a menu bar app and do not keep a Dock icon visible.
 - Grant accessibility permissions in System Settings
 - While this Mac is controlling a peer, Mousehop automatically keeps macOS from starting the idle screen saver or turning off the display. The keep-awake assertion ends as soon as the cursor returns to this Mac.
+- If the Mac nevertheless locks after a controlled peer sleeps or disconnects, Mousehop releases capture and shows confirmed recovery status on that peer. Use the keyboard physically attached to the Mac: Shift is a harmless wake key, then wait for the status; type the Mac password only while the peer still reports **locked**. The dialog has no password field, and Mousehop never reads or transports the password. If status becomes **unavailable**, switch the monitor to the Mac or use Touch ID, Apple Watch, or your hardware input switch instead.
 
 </details>
 

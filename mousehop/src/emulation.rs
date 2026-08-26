@@ -7,10 +7,10 @@ use input_emulation::{
 use input_event::{ClipboardEvent, Event};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use mousehop_ipc::IncomingPeerConfig;
-use mousehop_proto::{LEAVE_HANDOVER, LEAVE_RELEASE_ONLY, Position, ProtoEvent};
+use mousehop_proto::{HostInputState, LEAVE_HANDOVER, LEAVE_RELEASE_ONLY, Position, ProtoEvent};
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     rc::Rc,
     time::{Duration, Instant},
@@ -24,6 +24,51 @@ fn to_pp(peer: &IncomingPeerConfig) -> ReceivePostProcessing {
     ReceivePostProcessing {
         natural_scroll: peer.natural_scroll,
         mouse_sensitivity: peer.mouse_sensitivity,
+    }
+}
+
+fn update_locked_host(
+    locked_hosts: &mut HashSet<SocketAddr>,
+    addr: SocketAddr,
+    state: HostInputState,
+) -> bool {
+    match state {
+        HostInputState::Locked => locked_hosts.insert(addr),
+        HostInputState::Unlocked => {
+            locked_hosts.remove(&addr);
+            false
+        }
+    }
+}
+
+fn remote_input_allowed(locked_hosts: &HashSet<SocketAddr>, addr: SocketAddr) -> bool {
+    !locked_hosts.contains(&addr)
+}
+
+fn accept_host_input_state(
+    latest_states: &mut HashMap<SocketAddr, (u32, HostInputState)>,
+    addr: SocketAddr,
+    state: HostInputState,
+    generation: u32,
+) -> bool {
+    match latest_states.get(&addr).copied() {
+        None => {
+            latest_states.insert(addr, (generation, state));
+            true
+        }
+        Some((current_generation, current_state)) if generation == current_generation => {
+            // Repeated state is an expected retry after a lost acknowledgement.
+            // A different state with the same generation is contradictory and
+            // must not mutate the input gate.
+            state == current_state
+        }
+        Some((current_generation, _))
+            if generation.wrapping_sub(current_generation) < (1 << 31) =>
+        {
+            latest_states.insert(addr, (generation, state));
+            true
+        }
+        Some(_) => false,
     }
 }
 
@@ -74,6 +119,14 @@ pub(crate) enum EmulationEvent {
         addr: SocketAddr,
         commit: [u8; 8],
     },
+    /// Authenticated peer reported a confirmed lock/unlock transition. The
+    /// receiver uses this only for recovery guidance; no input or password is
+    /// accepted in response.
+    RemoteHostState {
+        addr: SocketAddr,
+        fingerprint: String,
+        state: HostInputState,
+    },
     /// Authorized peer at `addr` delivered a clipboard frame whose
     /// receive-side gate evaluated true. The local clipboard has
     /// already been updated by [`ListenTask`]; Service consumes
@@ -122,6 +175,8 @@ impl Emulation {
             event_tx,
             addr_to_fingerprint: HashMap::new(),
             incoming_peers: HashMap::new(),
+            locked_hosts: HashSet::new(),
+            latest_host_input_states: HashMap::new(),
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -188,6 +243,14 @@ struct ListenTask {
     /// and on `SetIncomingPeers` to build the per-handle
     /// `ReceivePostProcessing` snapshots that go into InputEmulation.
     incoming_peers: HashMap<String, IncomingPeerConfig>,
+    /// Peers that have authoritatively reported themselves locked. Input from
+    /// these addresses is dropped until a confirmed unlock, guarding against
+    /// queued/reordered datagrams after the sender released capture.
+    locked_hosts: HashSet<SocketAddr>,
+    /// Latest ordered host-input transition per authenticated DTLS session.
+    /// A generation number prevents a delayed Locked retry from overriding a
+    /// newer Unlocked transition after recovery has completed.
+    latest_host_input_states: HashMap<SocketAddr, (u32, HostInputState)>,
 }
 
 impl ListenTask {
@@ -216,7 +279,9 @@ impl ListenTask {
                         last_response.insert(addr, Instant::now());
                         match event {
                             ProtoEvent::Enter(pos) => {
-                                if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
+                                if !remote_input_allowed(&self.locked_hosts, addr) {
+                                    log::debug!("dropping Enter from locked host {addr}");
+                                } else if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
@@ -265,7 +330,13 @@ impl ListenTask {
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
-                            ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
+                            ProtoEvent::Input(event) => {
+                                if !remote_input_allowed(&self.locked_hosts, addr) {
+                                    log::trace!("dropping input from locked host {addr}");
+                                } else {
+                                    self.emulation_proxy.consume(event, addr);
+                                }
+                            }
                             ProtoEvent::Clipboard { from_fingerprint, content } => {
                                 let receive_ok = self.addr_to_fingerprint
                                     .get(&addr)
@@ -300,6 +371,49 @@ impl ListenTask {
                                     }).expect("channel closed");
                                 }
                             }
+                            ProtoEvent::HostInputState { state, generation } => {
+                                if let Some(fingerprint) =
+                                    self.addr_to_fingerprint.get(&addr).cloned()
+                                {
+                                    if !accept_host_input_state(
+                                        &mut self.latest_host_input_states,
+                                        addr,
+                                        state,
+                                        generation,
+                                    ) {
+                                        log::warn!(
+                                            "dropping stale or contradictory host-input state from {addr}: {state:?} generation {generation}"
+                                        );
+                                    } else {
+                                        if update_locked_host(&mut self.locked_hosts, addr, state) {
+                                            // Independent teardown in case the
+                                            // sender's following Leave or key-up
+                                            // datagrams are lost.
+                                            self.emulation_proxy.remove(addr);
+                                        }
+                                        self.event_tx
+                                            .send(EmulationEvent::RemoteHostState {
+                                                addr,
+                                                fingerprint,
+                                                state,
+                                            })
+                                            .expect("channel closed");
+                                        self.listener
+                                            .reply(
+                                                addr,
+                                                ProtoEvent::HostInputStateAck {
+                                                    state,
+                                                    generation,
+                                                },
+                                            )
+                                            .await;
+                                    }
+                                } else {
+                                    log::warn!(
+                                        "dropping host-input state from unmapped peer {addr}"
+                                    );
+                                }
+                            }
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
                             // Peer's version handshake. Echo our own
                             // commit back so the peer's connect-side
@@ -332,7 +446,9 @@ impl ListenTask {
                             // (nx == 1.0 or ny == 1.0) doesn't compute
                             // one pixel past the addressable column.
                             ProtoEvent::CursorPos { pos, nx, ny } => {
-                                if let Some((w, h)) = self.emulation_proxy.display_bounds() {
+                                if !remote_input_allowed(&self.locked_hosts, addr) {
+                                    log::trace!("dropping cursor warp from locked host {addr}");
+                                } else if let Some((w, h)) = self.emulation_proxy.display_bounds() {
                                     let pwi = w as i32;
                                     let phi = h as i32;
                                     let cx = ((nx * w as f32) as i32).clamp(0, pwi.saturating_sub(1));
@@ -357,6 +473,11 @@ impl ListenTask {
                         }
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
+                        // A new authenticated session starts in unknown/unlocked
+                        // transport state. A still-locked sender immediately
+                        // re-publishes Locked from its retained recovery state.
+                        self.locked_hosts.remove(&addr);
+                        self.latest_host_input_states.remove(&addr);
                         self.addr_to_fingerprint.insert(addr, fingerprint.clone());
                         // Pre-cache the per-handle post-processing so
                         // EmulationTask can pick it up the moment the
@@ -423,6 +544,8 @@ impl ListenTask {
                     last_response.retain(|&addr,instant| {
                         if instant.elapsed() > Duration::from_secs(1) {
                             log::warn!("releasing keys: {addr} not responding!");
+                            self.locked_hosts.remove(&addr);
+                            self.latest_host_input_states.remove(&addr);
                             self.emulation_proxy.remove(addr);
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                             false
@@ -814,5 +937,72 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod lock_state_tests {
+    use super::*;
+
+    #[test]
+    fn confirmed_lock_gates_input_until_confirmed_unlock() {
+        let addr: SocketAddr = "192.0.2.8:4252".parse().expect("address");
+        let mut locked_hosts = HashSet::new();
+        assert!(remote_input_allowed(&locked_hosts, addr));
+
+        assert!(update_locked_host(
+            &mut locked_hosts,
+            addr,
+            HostInputState::Locked
+        ));
+        assert!(!remote_input_allowed(&locked_hosts, addr));
+        assert!(
+            !update_locked_host(&mut locked_hosts, addr, HostInputState::Locked),
+            "a retry must not repeat teardown"
+        );
+
+        assert!(!update_locked_host(
+            &mut locked_hosts,
+            addr,
+            HostInputState::Unlocked
+        ));
+        assert!(remote_input_allowed(&locked_hosts, addr));
+    }
+
+    #[test]
+    fn stale_lock_cannot_override_newer_unlock() {
+        let addr: SocketAddr = "192.0.2.8:4252".parse().expect("address");
+        let mut latest_states = HashMap::new();
+
+        assert!(accept_host_input_state(
+            &mut latest_states,
+            addr,
+            HostInputState::Locked,
+            7,
+        ));
+        assert!(accept_host_input_state(
+            &mut latest_states,
+            addr,
+            HostInputState::Unlocked,
+            8,
+        ));
+        assert!(
+            !accept_host_input_state(&mut latest_states, addr, HostInputState::Locked, 7,),
+            "a delayed Locked retry must not override generation 8"
+        );
+        assert!(accept_host_input_state(
+            &mut latest_states,
+            addr,
+            HostInputState::Unlocked,
+            8,
+        ));
+        assert!(
+            !accept_host_input_state(&mut latest_states, addr, HostInputState::Locked, 8,),
+            "one generation cannot carry contradictory states"
+        );
+        assert_eq!(
+            latest_states.get(&addr),
+            Some(&(8, HostInputState::Unlocked))
+        );
     }
 }

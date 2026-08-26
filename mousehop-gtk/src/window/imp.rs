@@ -13,6 +13,7 @@ use mousehop_ipc::{DEFAULT_PORT, FrontendRequestWriter};
 
 use crate::authorization_window::AuthorizationWindow;
 use crate::clipboard_privacy_window::ClipboardPrivacyWindow;
+use crate::lock_recovery_window::LockRecoveryWindow;
 
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/com/mousehop/Mousehop/window.ui")]
@@ -84,6 +85,10 @@ pub struct Window {
     pub capture_active: Cell<bool>,
     pub emulation_active: Cell<bool>,
     pub authorization_window: RefCell<Option<AuthorizationWindow>>,
+    /// Informational recovery dialog for a confirmed remote Mac lock. It has
+    /// no text entry and is updated in place as the state becomes unavailable
+    /// or the peer confirms unlock.
+    pub lock_recovery_window: RefCell<Option<LockRecoveryWindow>>,
     /// Connected handler for the auto-release-threshold scale's
     /// value-changed signal, so we can block it when programmatically
     /// updating the slider in response to a Sync event.

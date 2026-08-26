@@ -52,6 +52,9 @@ pub enum ProtocolError {
     /// position type does not exist
     #[error("invalid event id: `{0}`")]
     InvalidPosition(#[from] TryFromPrimitiveError<Position>),
+    /// host-input state does not exist
+    #[error("invalid host-input state: `{0}`")]
+    InvalidHostInputState(#[from] TryFromPrimitiveError<HostInputState>),
     /// clipboard payload exceeds [`MAX_CLIPBOARD_SIZE`]
     #[error("clipboard payload too large: {0} bytes")]
     ClipboardTooLarge(usize),
@@ -71,6 +74,16 @@ pub enum Position {
     Right,
     Top,
     Bottom,
+}
+
+/// Confirmed input availability of the capturing host. This is sent only for
+/// OS state the sender can verify; connection loss is represented locally by
+/// the receiver as "unavailable", never guessed on the wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromPrimitive, IntoPrimitive)]
+#[repr(u8)]
+pub enum HostInputState {
+    Unlocked = 0,
+    Locked = 1,
 }
 
 impl Display for Position {
@@ -164,6 +177,20 @@ pub enum ProtoEvent {
         from_fingerprint: String,
         content: String,
     },
+    /// Confirmed lock/unlock state of the capturing host. A locked sender has
+    /// already released capture; an unlocked event is informational and does
+    /// not resume forwarding without a fresh edge crossing.
+    HostInputState {
+        state: HostInputState,
+        generation: u32,
+    },
+    /// Receiver confirmation that a [`ProtoEvent::HostInputState`] datagram
+    /// was processed. DTLS authenticates the peer but remains unreliable over
+    /// UDP, so the sender retries recovery state until this arrives.
+    HostInputStateAck {
+        state: HostInputState,
+        generation: u32,
+    },
 }
 
 impl Display for ProtoEvent {
@@ -214,6 +241,12 @@ impl Display for ProtoEvent {
                     content.len(),
                 )
             }
+            ProtoEvent::HostInputState { state, generation } => {
+                write!(f, "HostInputState({state:?}, generation={generation})")
+            }
+            ProtoEvent::HostInputStateAck { state, generation } => {
+                write!(f, "HostInputStateAck({state:?}, generation={generation})")
+            }
         }
     }
 }
@@ -241,6 +274,11 @@ pub enum EventType {
     /// fixed-size [`MAX_EVENT_SIZE`] buffer path. See
     /// [`decode_clipboard_event`].
     Clipboard,
+    /// Fixed-size host lock/unlock state. Appended after Clipboard so every
+    /// existing event tag remains wire-stable for older peers.
+    HostInputState,
+    /// Acknowledgement for [`EventType::HostInputState`].
+    HostInputStateAck,
 }
 
 impl ProtoEvent {
@@ -281,6 +319,8 @@ impl ProtoEvent {
             ProtoEvent::Hello { .. } => EventType::Hello,
             ProtoEvent::ReceiverSensitivity { .. } => EventType::ReceiverSensitivity,
             ProtoEvent::Clipboard { .. } => EventType::Clipboard,
+            ProtoEvent::HostInputState { .. } => EventType::HostInputState,
+            ProtoEvent::HostInputStateAck { .. } => EventType::HostInputStateAck,
         }
     }
 }
@@ -367,6 +407,14 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             // through the fixed-size buffer path; the connect/listen
             // layer routes them through `decode_clipboard_event`.
             EventType::Clipboard => Err(ProtocolError::BufferTooSmall),
+            EventType::HostInputState => Ok(Self::HostInputState {
+                state: decode_u8(&mut buf)?.try_into()?,
+                generation: decode_u32(&mut buf)?,
+            }),
+            EventType::HostInputStateAck => Ok(Self::HostInputStateAck {
+                state: decode_u8(&mut buf)?.try_into()?,
+                generation: decode_u32(&mut buf)?,
+            }),
         }
     }
 }
@@ -472,6 +520,11 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                         "ProtoEvent::Clipboard cannot use the fixed-buffer encoder; \
                          route via encode_clipboard_event"
                     );
+                }
+                ProtoEvent::HostInputState { state, generation }
+                | ProtoEvent::HostInputStateAck { state, generation } => {
+                    encode_u8(buf, len, state as u8);
+                    encode_u32(buf, len, generation);
                 }
             }
         }
@@ -693,5 +746,43 @@ mod tests {
                 ProtoEvent::Leave(decoded_mode) if decoded_mode == mode
             ));
         }
+    }
+
+    #[test]
+    fn host_input_states_round_trip_without_shifting_existing_tags() {
+        assert_eq!(EventType::Clipboard as u8, 16);
+        assert_eq!(EventType::HostInputState as u8, 17);
+        assert_eq!(EventType::HostInputStateAck as u8, 18);
+
+        for state in [HostInputState::Unlocked, HostInputState::Locked] {
+            let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::HostInputState {
+                state,
+                generation: 17,
+            }
+            .into();
+            assert_eq!(len, 1 + size_of::<u8>() + size_of::<u32>());
+            assert!(matches!(
+                buf.try_into().expect("decode"),
+                ProtoEvent::HostInputState { state: decoded, generation: 17 }
+                    if decoded == state
+            ));
+        }
+    }
+
+    #[test]
+    fn host_input_state_ack_round_trips() {
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::HostInputStateAck {
+            state: HostInputState::Unlocked,
+            generation: 23,
+        }
+        .into();
+        assert_eq!(len, 1 + size_of::<u8>() + size_of::<u32>());
+        assert!(matches!(
+            buf.try_into().expect("decode"),
+            ProtoEvent::HostInputStateAck {
+                state: HostInputState::Unlocked,
+                generation: 23,
+            }
+        ));
     }
 }

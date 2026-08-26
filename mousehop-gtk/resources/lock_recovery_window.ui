@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.0"/>
+  <requires lib="libadwaita" version="1.0"/>
+  <template class="LockRecoveryWindow" parent="AdwWindow">
+    <property name="modal">True</property>
+    <property name="resizable">False</property>
+    <property name="width-request">320</property>
+    <property name="default-width">520</property>
+    <property name="content">
+      <object class="AdwToolbarView">
+        <child type="top">
+          <object class="AdwHeaderBar">
+            <style>
+              <class name="flat"/>
+            </style>
+          </object>
+        </child>
+        <property name="content">
+          <object class="AdwClamp">
+            <property name="maximum-size">560</property>
+            <property name="tightening-threshold">0</property>
+            <property name="child">
+              <object class="GtkBox">
+                <property name="orientation">vertical</property>
+                <property name="spacing">16</property>
+                <property name="margin-start">24</property>
+                <property name="margin-end">24</property>
+                <property name="margin-top">20</property>
+                <property name="margin-bottom">24</property>
+                <child>
+                  <object class="GtkImage" id="state_icon">
+                    <property name="pixel-size">48</property>
+                    <property name="icon-name">dialog-warning-symbolic</property>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkLabel" id="title_label">
+                    <property name="label">Mac is locked</property>
+                    <property name="wrap">True</property>
+                    <property name="justify">center</property>
+                    <style>
+                      <class name="title-1"/>
+                    </style>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkLabel" id="status_label">
+                    <property name="label">Waiting for confirmed unlock…</property>
+                    <property name="wrap">True</property>
+                    <property name="justify">center</property>
+                    <style>
+                      <class name="heading"/>
+                    </style>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkSeparator"/>
+                </child>
+                <child>
+                  <object class="GtkLabel" id="instructions_label">
+                    <property name="wrap">True</property>
+                    <property name="wrap-mode">word-char</property>
+                    <property name="xalign">0</property>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkLabel" id="assurance_label">
+                    <property name="wrap">True</property>
+                    <property name="wrap-mode">word-char</property>
+                    <property name="xalign">0</property>
+                    <style>
+                      <class name="dim-label"/>
+                    </style>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkLabel" id="peer_label">
+                    <property name="wrap">True</property>
+                    <property name="selectable">True</property>
+                    <property name="xalign">0</property>
+                    <style>
+                      <class name="dim-label"/>
+                      <class name="caption"/>
+                    </style>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton">
+                    <signal name="clicked" handler="handle_dismiss" swapped="true"/>
+                    <property name="label" translatable="yes">Hide</property>
+                    <property name="halign">center</property>
+                    <property name="can-shrink">True</property>
+                    <property name="tooltip-text" translatable="yes">Hide this guidance; it does not change the Mac’s lock state</property>
+                    <style>
+                      <class name="pill"/>
+                    </style>
+                  </object>
+                </child>
+              </object>
+            </property>
+          </object>
+        </property>
+      </object>
+    </property>
+  </template>
+</interface>

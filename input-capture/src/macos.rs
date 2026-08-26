@@ -1,4 +1,6 @@
-use super::{Capture, CaptureError, CaptureEvent, Position, error::MacosCaptureCreationError};
+use super::{
+    Capture, CaptureError, CaptureEvent, HostInputState, Position, error::MacosCaptureCreationError,
+};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::{
@@ -75,6 +77,7 @@ enum ProducerEvent {
     Destroy(Position),
     Grab(Position),
     EventTapDisabled,
+    ScreenUnlocked,
     DisplayReconfigured,
 }
 
@@ -183,7 +186,7 @@ impl InputCaptureState {
     async fn handle_producer_event(
         &mut self,
         producer_event: ProducerEvent,
-    ) -> Result<(), CaptureError> {
+    ) -> Result<Option<HostInputState>, CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
             ProducerEvent::Release { warp_target } => {
@@ -251,7 +254,7 @@ impl InputCaptureState {
                     log::info!(
                         "CGEventTap disabled while screen locked — will re-enable on unlock"
                     );
-                    return Ok(());
+                    return Ok(Some(HostInputState::Locked));
                 }
                 // Distinguish AX revocation from a recoverable cause
                 // (secure-input mode while typing in a password field
@@ -274,6 +277,18 @@ impl InputCaptureState {
                 }
                 return Err(CaptureError::EventTapDisabled);
             }
+            ProducerEvent::ScreenUnlocked => {
+                // The distributed notification is authoritative in normal
+                // operation, but verify the WindowServer state before telling
+                // a peer it is safe to type a password. A racing/spurious
+                // notification must degrade to no update, never a false
+                // "unlocked" confirmation.
+                if is_screen_locked() {
+                    log::warn!("screen-unlocked notification arrived while session still locked");
+                } else {
+                    return Ok(Some(HostInputState::Unlocked));
+                }
+            }
             ProducerEvent::DisplayReconfigured => {
                 // The macOS display configuration changed — a monitor
                 // was plugged in/out, the resolution changed, the
@@ -289,7 +304,23 @@ impl InputCaptureState {
                 }
             }
         };
-        Ok(())
+        Ok(None)
+    }
+}
+
+async fn publish_host_input_state(
+    event_tx: &Sender<(Position, CaptureEvent)>,
+    positions: Vec<Position>,
+    state: HostInputState,
+) {
+    for pos in positions {
+        if let Err(e) = event_tx
+            .send((pos, CaptureEvent::HostInputState(state)))
+            .await
+        {
+            log::debug!("capture stream closed while publishing host input state: {e}");
+            break;
+        }
     }
 }
 
@@ -840,6 +871,7 @@ fn event_tap_thread(
     // loop exits.
     let unlock_ctx = Box::into_raw(Box::new(UnlockObserverCtx {
         tap_mach_port: Arc::clone(&tap_mach_port),
+        sender: display_notify_tx.clone(),
     }));
     let unlock_name = unsafe {
         let cstr = CString::new("com.apple.screenIsUnlocked").unwrap();
@@ -952,8 +984,8 @@ fn event_tap_thread(
 /// locked; on Sequoia 15+ it's typically absent when unlocked rather
 /// than `kCFBooleanFalse`, so missing-or-nil is treated as unlocked.
 /// Costs ~10–50µs per call (an XPC round-trip to WindowServer);
-/// called from the event tap callback only on `MouseMoved`, so the
-/// amortized cost is negligible (<2% CPU at typical mouse rates).
+/// called from the event tap only at an attempted edge crossing plus a
+/// two-second lifecycle poll, so the amortized cost is negligible.
 fn is_screen_locked() -> bool {
     let key = unsafe {
         let cstr = CString::new("CGSSessionScreenIsLocked").unwrap();
@@ -1068,6 +1100,7 @@ extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_i
 /// thread's run loop — never crosses threads after construction.
 struct UnlockObserverCtx {
     tap_mach_port: Arc<OnceLock<usize>>,
+    sender: Sender<ProducerEvent>,
 }
 
 /// CFNotificationCenter callback for `com.apple.screenIsUnlocked`.
@@ -1096,6 +1129,9 @@ extern "C" fn screen_unlocked_callback(
         Some(&port) => {
             log::info!("screen unlocked — re-enabling CGEventTap");
             unsafe { CGEventTapEnable(port as *mut c_void, true) };
+            if let Err(e) = ctx.sender.blocking_send(ProducerEvent::ScreenUnlocked) {
+                log::warn!("failed to publish screen-unlocked transition: {e}");
+            }
         }
         None => log::warn!("screen unlocked but tap mach port not yet stored — cannot re-enable"),
     }
@@ -1119,6 +1155,7 @@ impl MacOSInputCapture {
         // a GC-like tokio scheduling gap — without dropping motion
         // samples or blocking the callback.
         let (event_tx, event_rx) = mpsc::channel(1024);
+        let lifecycle_event_tx = event_tx.clone();
         let (notify_tx, mut notify_rx) = mpsc::channel(32);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tap_exit_tx, mut tap_exit_rx) = oneshot::channel();
@@ -1144,6 +1181,7 @@ impl MacOSInputCapture {
         let run_loop = ready_rx.recv().expect("channel closed")?;
 
         let _tap_task: tokio::task::JoinHandle<()> = tokio::task::spawn_local(async move {
+            let mut last_host_input_state = HostInputState::Unlocked;
             // Safety net for display-geometry changes the Quartz
             // reconfiguration callback misses. That callback is
             // registered on the event-tap thread's run loop (see
@@ -1166,9 +1204,21 @@ impl MacOSInputCapture {
                             break;
                         };
                         let mut state = state.lock().await;
-                        state.handle_producer_event(producer_event).await.unwrap_or_else(|e| {
-                            log::error!("Failed to handle producer event: {e}");
-                        })
+                        let transition = match state.handle_producer_event(producer_event).await {
+                            Ok(Some(next)) if next != last_host_input_state => {
+                                last_host_input_state = next;
+                                Some((next, state.active_clients.iter().copied().collect()))
+                            }
+                            Ok(_) => None,
+                            Err(e) => {
+                                log::error!("Failed to handle producer event: {e}");
+                                None
+                            }
+                        };
+                        drop(state);
+                        if let Some((next, positions)) = transition {
+                            publish_host_input_state(&lifecycle_event_tx, positions, next).await;
+                        }
                     }
                     _ = bounds_poll.tick() => {
                         let mut state = state.lock().await;
@@ -1180,6 +1230,24 @@ impl MacOSInputCapture {
                             ),
                             Ok(()) => {}
                             Err(e) => log::warn!("periodic bounds refresh failed: {e}"),
+                        }
+                        // Poll as a safety net for a missed secure-input tap
+                        // disable or distributed unlock notification. This is
+                        // the same authoritative WindowServer state used by
+                        // the immediate callbacks, sampled only every two
+                        // seconds rather than on the hot input path.
+                        let observed = if is_screen_locked() {
+                            HostInputState::Locked
+                        } else {
+                            HostInputState::Unlocked
+                        };
+                        let transition = (observed != last_host_input_state).then(|| {
+                            last_host_input_state = observed;
+                            (observed, state.active_clients.iter().copied().collect())
+                        });
+                        drop(state);
+                        if let Some((next, positions)) = transition {
+                            publish_host_input_state(&lifecycle_event_tx, positions, next).await;
                         }
                     }
                     _ = &mut tap_exit_rx => break,

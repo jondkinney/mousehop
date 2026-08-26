@@ -269,6 +269,12 @@ impl MousehopConnection {
         handle: ClientHandle,
     ) -> Result<(), MousehopConnectionError> {
         let event_display = format!("{event}");
+        // Lock-recovery status is control-plane information, not input
+        // emulation. It must still reach a peer whose latest Pong reported
+        // emulation unavailable (including the reconnect window before the
+        // first Pong), otherwise the recovery dialog can never explain why
+        // forwarding stopped.
+        let send_when_emulation_inactive = matches!(&event, ProtoEvent::HostInputState { .. });
         // Clipboard frames are variable-length and can't ride the
         // fixed-size codec; route them through the dedicated helper.
         // For all other events the existing 21-byte path is faster.
@@ -298,7 +304,7 @@ impl MousehopConnection {
                 conns.get(&addr).cloned()
             };
             if let Some(conn) = conn {
-                if !self.client_manager.alive(handle) {
+                if !self.client_manager.alive(handle) && !send_when_emulation_inactive {
                     return Err(MousehopConnectionError::TargetEmulationDisabled);
                 }
                 match conn.send(buf).await {
@@ -306,6 +312,7 @@ impl MousehopConnection {
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
                         disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        return Err(e.into());
                     }
                 }
                 log::trace!("{event_display} >->->->->- {addr}");

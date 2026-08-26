@@ -8,6 +8,7 @@ mod key_object;
 mod key_row;
 #[cfg(target_os = "linux")]
 mod linux_tray;
+mod lock_recovery_window;
 #[cfg(target_os = "macos")]
 mod macos_privacy;
 #[cfg(target_os = "macos")]
@@ -611,6 +612,11 @@ fn build_ui(app: &Application) {
                     FrontendEvent::IncomingDisconnected(addr) => {
                         window.show_toast(format!("{addr} disconnected").as_str());
                     }
+                    FrontendEvent::RemoteHostState {
+                        fingerprint,
+                        addr,
+                        state,
+                    } => window.set_remote_host_state(&fingerprint, addr, state),
                     FrontendEvent::ReleaseThreshold(threshold) => {
                         window.set_release_threshold(threshold);
                     }
