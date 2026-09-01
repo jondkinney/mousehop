@@ -56,10 +56,33 @@
       packages = forEachPkgs (
         { pkgs, rustToolchainForBuild, ... }:
         let
-          customRustPlatform = pkgs.makeRustPlatform {
-            cargo = rustToolchainForBuild;
-            rustc = rustToolchainForBuild;
-          };
+          customRustPlatform =
+            (pkgs.makeRustPlatform {
+              cargo = rustToolchainForBuild;
+              rustc = rustToolchainForBuild;
+            }).overrideScope
+              (
+                _final: _previous: {
+                  # The pinned nixpkgs still uses crates.io's rate-limited API
+                  # endpoint. Rewrite only fixed-output crate downloads to the
+                  # immutable CDN, preserving the known-good package graph for
+                  # Linux and both supported macOS architectures.
+                  importCargoLock = pkgs.buildPackages.callPackage "${nixpkgs}/pkgs/build-support/rust/import-cargo-lock.nix" {
+                    cargo = rustToolchainForBuild;
+                    fetchurl =
+                      args:
+                      pkgs.buildPackages.fetchurl (
+                        args
+                        // {
+                          url = lib.replaceStrings
+                            [ "https://crates.io/api/v1/crates" ]
+                            [ "https://static.crates.io/crates" ]
+                            args.url;
+                        }
+                      );
+                  };
+                }
+              );
           mousehop = pkgs.callPackage ./nix { rustPlatform = customRustPlatform; };
         in
         {
