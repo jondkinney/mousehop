@@ -27,6 +27,10 @@ use core_graphics::base::CGError;
 pub enum CaptureError {
     #[error("activation stream closed unexpectedly")]
     ActivationClosed,
+    #[error("capture update stream closed unexpectedly")]
+    CaptureUpdatesClosed,
+    #[error("zone update stream closed unexpectedly")]
+    ZonesChangedClosed,
     #[error("libei stream was closed")]
     EndOfStream,
     #[error("io error: `{0}`")]
@@ -55,6 +59,9 @@ pub enum CaptureError {
     #[cfg(target_os = "macos")]
     #[error("Event tap disabled")]
     EventTapDisabled,
+    #[cfg(target_os = "macos")]
+    #[error("active display topology is unavailable")]
+    DisplayTopologyUnavailable,
 }
 
 #[derive(Debug, Error)]

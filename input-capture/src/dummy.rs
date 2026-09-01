@@ -62,7 +62,10 @@ impl Stream for DummyInputCapture {
         let event = match self.start {
             None => {
                 self.start.replace(current);
-                CaptureEvent::Begin { cursor: None }
+                CaptureEvent::Begin {
+                    cursor: None,
+                    normalized_cursor: None,
+                }
             }
             Some(start) => {
                 let elapsed = start.elapsed();

@@ -568,6 +568,17 @@ pub struct ClientState {
     pub peer_commit: Option<[u8; 8]>,
 }
 
+/// Receiver-side view of a remote host's input availability. `Locked` and
+/// `Unlocked` are authenticated, peer-confirmed states. `Unavailable` is a
+/// local connection fact and must never be presented as confirmation that it
+/// is safe to type a password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteHostState {
+    Locked,
+    Unlocked,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FrontendEvent {
     /// a client was created
@@ -607,6 +618,13 @@ pub enum FrontendEvent {
     },
     /// incoming disconnected
     IncomingDisconnected(SocketAddr),
+    /// Authenticated lock-recovery status for a remote host. The frontend
+    /// presents guidance only; it never accepts or transports a password.
+    RemoteHostState {
+        fingerprint: String,
+        addr: SocketAddr,
+        state: RemoteHostState,
+    },
     /// failed connection attempt (approval for fingerprint required)
     ConnectionAttempt { fingerprint: String },
     /// pixel threshold for the wall-press auto-release fallback.

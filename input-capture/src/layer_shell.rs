@@ -61,9 +61,13 @@ use wayland_client::{
     },
 };
 
-use input_event::{Event, KeyboardEvent, PointerEvent};
+use input_event::{
+    Event, KeyboardEvent, PointerEvent,
+    display::{DisplayEdge, DisplayLayout, EdgeSegment},
+    scancode,
+};
 
-use crate::{CaptureError, CaptureEvent};
+use crate::{CaptureError, CaptureEvent, normalize_cursor_in_layout};
 
 use super::{
     Capture, Position,
@@ -84,6 +88,7 @@ struct Globals {
 #[derive(Clone, Debug)]
 struct Output {
     wl_output: WlOutput,
+    xdg_output: ZxdgOutputV1,
     global: Global,
     info: Option<OutputInfo>,
     pending_info: OutputInfo,
@@ -110,46 +115,6 @@ struct OutputInfo {
     name: String,
     position: (i32, i32),
     size: (i32, i32),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DisplayGeometry {
-    origin: (i32, i32),
-    size: (u32, u32),
-}
-
-/// Compute the compositor-coordinate union of all usable outputs. Bounds and
-/// origin must come from the same rectangle: normalizing against the union's
-/// size while assuming an origin of `(0, 0)` misplaces cursor returns whenever
-/// a monitor lives at a negative or otherwise nonzero coordinate.
-fn display_geometry<'a>(infos: impl Iterator<Item = &'a OutputInfo>) -> Option<DisplayGeometry> {
-    let mut xmin = i64::MAX;
-    let mut ymin = i64::MAX;
-    let mut xmax = i64::MIN;
-    let mut ymax = i64::MIN;
-    let mut found = false;
-
-    for info in infos.filter(|info| info.size.0 > 0 && info.size.1 > 0) {
-        let x = i64::from(info.position.0);
-        let y = i64::from(info.position.1);
-        xmin = xmin.min(x);
-        ymin = ymin.min(y);
-        xmax = xmax.max(x + i64::from(info.size.0));
-        ymax = ymax.max(y + i64::from(info.size.1));
-        found = true;
-    }
-
-    if !found || xmax <= xmin || ymax <= ymin {
-        return None;
-    }
-
-    Some(DisplayGeometry {
-        origin: (i32::try_from(xmin).ok()?, i32::try_from(ymin).ok()?),
-        size: (
-            u32::try_from(xmax - xmin).ok()?,
-            u32::try_from(ymax - ymin).ok()?,
-        ),
-    })
 }
 
 struct State {
@@ -189,13 +154,10 @@ struct Window {
     surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
     pos: Position,
-    /// Output's top-left corner in compositor coordinate space —
-    /// used together with `wl_pointer::Enter`'s surface-local coords
-    /// to recover the host screen-space cursor position at the moment
-    /// of crossing, so we can populate `CaptureEvent::Begin { cursor }`
-    /// for cross-axis preservation.
-    output_pos: (i32, i32),
-    output_size: (i32, i32),
+    /// Top-left of this (possibly partial) edge surface in compositor
+    /// coordinates. Combined with `wl_pointer::Enter`'s surface-local point
+    /// to recover the exact screen-space crossing coordinate.
+    surface_origin: (i32, i32),
 }
 
 impl Window {
@@ -205,14 +167,44 @@ impl Window {
         output: &WlOutput,
         pos: Position,
         output_pos: (i32, i32),
-        size: (i32, i32),
+        segment: EdgeSegment,
     ) -> Window {
-        log::debug!("creating window output: {output:?}, size: {size:?}");
+        log::debug!("creating window output: {output:?}, segment: {segment:?}");
         let g = &state.globals;
 
-        let (width, height) = match pos {
-            Position::Left | Position::Right => (1, size.1 as u32),
-            Position::Top | Position::Bottom => (size.0 as u32, 1),
+        let (width, height, surface_origin, anchor, top_margin, left_margin) = match pos {
+            Position::Left => (
+                1,
+                segment.len(),
+                (segment.coordinate, segment.start),
+                Anchor::Left | Anchor::Top,
+                segment.start - output_pos.1,
+                0,
+            ),
+            Position::Right => (
+                1,
+                segment.len(),
+                (segment.coordinate, segment.start),
+                Anchor::Right | Anchor::Top,
+                segment.start - output_pos.1,
+                0,
+            ),
+            Position::Top => (
+                segment.len(),
+                1,
+                (segment.start, segment.coordinate),
+                Anchor::Top | Anchor::Left,
+                0,
+                segment.start - output_pos.0,
+            ),
+            Position::Bottom => (
+                segment.len(),
+                1,
+                (segment.start, segment.coordinate),
+                Anchor::Bottom | Anchor::Left,
+                0,
+                segment.start - output_pos.0,
+            ),
         };
         let mut file = tempfile::tempfile().unwrap();
         draw(&mut file, (width, height));
@@ -238,17 +230,10 @@ impl Window {
             qh,
             (),
         );
-        let anchor = match pos {
-            Position::Left => Anchor::Left,
-            Position::Right => Anchor::Right,
-            Position::Top => Anchor::Top,
-            Position::Bottom => Anchor::Bottom,
-        };
-
         layer_surface.set_anchor(anchor);
         layer_surface.set_size(width, height);
         layer_surface.set_exclusive_zone(-1);
-        layer_surface.set_margin(0, 0, 0, 0);
+        layer_surface.set_margin(top_margin, 0, 0, left_margin);
         surface.set_input_region(None);
         surface.commit();
         Window {
@@ -256,8 +241,7 @@ impl Window {
             buffer,
             surface,
             layer_surface,
-            output_pos,
-            output_size: size,
+            surface_origin,
         }
     }
 }
@@ -277,73 +261,68 @@ impl Drop for Window {
 /// the on-axis dimension and span the cross-axis, so the surface-local
 /// cross-axis coord is the screen offset directly.
 fn surface_to_screen(window: &Window, surface_x: f64, surface_y: f64) -> (i32, i32) {
-    let (origin_x, origin_y) =
-        layer_surface_origin(window.pos, window.output_pos, window.output_size);
+    let (origin_x, origin_y) = window.surface_origin;
     (origin_x + surface_x as i32, origin_y + surface_y as i32)
-}
-
-/// Screen-space origin of the 1 px layer surface anchored at `pos`.
-fn layer_surface_origin(
-    pos: Position,
-    output_pos: (i32, i32),
-    output_size: (i32, i32),
-) -> (i32, i32) {
-    let (ox, oy) = output_pos;
-    let (ow, oh) = output_size;
-    match pos {
-        Position::Left | Position::Top => (ox, oy),
-        Position::Right => (ox + ow.saturating_sub(1), oy),
-        Position::Bottom => (ox, oy + oh.saturating_sub(1)),
-    }
 }
 
 /// Translate a host screen-space warp target into the coordinate system of
 /// the layer surface that owns the active pointer lock. The hint may be
 /// outside the 1 px barrier surface: the pointer-constraints protocol uses
 /// it as the compositor's desired global landing point when the lock ends.
-fn screen_to_surface(
-    pos: Position,
-    output_pos: (i32, i32),
-    output_size: (i32, i32),
-    screen: (i32, i32),
-) -> (f64, f64) {
-    let (surface_x, surface_y) = layer_surface_origin(pos, output_pos, output_size);
+fn screen_to_surface(surface_origin: (i32, i32), screen: (i32, i32)) -> (f64, f64) {
+    let (surface_x, surface_y) = surface_origin;
     (
         f64::from(screen.0) - f64::from(surface_x),
         f64::from(screen.1) - f64::from(surface_y),
     )
 }
 
-fn get_edges(outputs: &[Output], pos: Position) -> Vec<(Output, i32)> {
-    outputs
-        .iter()
-        .filter_map(|output| {
-            output.info.as_ref().map(|info| {
-                (
-                    output.clone(),
-                    match pos {
-                        Position::Left => info.position.0,
-                        Position::Right => info.position.0 + info.size.0,
-                        Position::Top => info.position.1,
-                        Position::Bottom => info.position.1 + info.size.1,
-                    },
-                )
-            })
-        })
-        .collect()
+fn display_edge(pos: Position) -> DisplayEdge {
+    match pos {
+        Position::Left => DisplayEdge::Left,
+        Position::Right => DisplayEdge::Right,
+        Position::Top => DisplayEdge::Top,
+        Position::Bottom => DisplayEdge::Bottom,
+    }
 }
 
-fn get_output_configuration(state: &State, pos: Position) -> Vec<Output> {
-    // get all output edges corresponding to the position
-    let edges = get_edges(&state.outputs, pos);
-    let opposite_edges = get_edges(&state.outputs, pos.opposite());
+fn output_layout(outputs: &[Output]) -> DisplayLayout {
+    // Feed one tuple per wl_output, including an invalid placeholder while
+    // xdg-output information is pending. DisplayLayout retains tuple indices,
+    // so EdgeSegment::rect_index continues to address `outputs` directly.
+    DisplayLayout::new(outputs.iter().map(|output| {
+        output.info.as_ref().map_or((0, 0, 0, 0), |info| {
+            (
+                info.position.0,
+                info.position.1,
+                u32::try_from(info.size.0).unwrap_or(0),
+                u32::try_from(info.size.1).unwrap_or(0),
+            )
+        })
+    }))
+}
 
-    // remove those edges that are at the same position
-    // as an opposite edge of a different output
-    edges
-        .iter()
-        .filter(|(_, edge)| !opposite_edges.iter().map(|(_, e)| *e).any(|e| &e == edge))
-        .map(|(o, _)| o.clone())
+fn lost_active_seat_device(
+    had_pointer: bool,
+    had_keyboard: bool,
+    has_pointer: bool,
+    has_keyboard: bool,
+) -> bool {
+    (had_pointer && !has_pointer) || (had_keyboard && !has_keyboard)
+}
+
+fn get_output_configuration(state: &State, pos: Position) -> Vec<(Output, EdgeSegment)> {
+    let layout = output_layout(&state.outputs);
+    layout
+        .exposed_segments(display_edge(pos))
+        .into_iter()
+        .filter_map(|segment| {
+            state
+                .outputs
+                .get(segment.rect_index)
+                .cloned()
+                .map(|output| (output, segment))
+        })
         .collect()
 }
 
@@ -462,21 +441,40 @@ impl LayerShellInputCapture {
     fn delete_client(&mut self, pos: Position) {
         let inner = self.0.get_mut();
         inner.state.active_positions.remove(&pos);
-        // remove all windows corresponding to this client
-        while let Some(i) = inner.state.active_windows.iter().position(|w| w.pos == pos) {
-            inner.state.active_windows.remove(i);
-            inner.state.focused = None;
+
+        // A single edge can be removed while another edge owns the live
+        // pointer/keyboard grab. Preserve that unrelated focus. If this edge
+        // does own the grab, tear it down while its Window is still alive so
+        // `ungrab` can reset Exclusive keyboard interactivity and the wrapper
+        // receives an AutoRelease for the interrupted capture.
+        let focused_pos = inner.state.focused.as_ref().map(|window| window.pos);
+        if deleting_position_interrupts_focus(focused_pos, pos) {
+            inner.state.lose_focus();
         }
+        inner
+            .state
+            .active_windows
+            .retain(|window| window.pos != pos);
     }
+}
+
+fn deleting_position_interrupts_focus(focused: Option<Position>, deleted: Position) -> bool {
+    focused == Some(deleted)
+}
+
+fn surface_leave_matches_focus<T: PartialEq>(
+    focused_surface: Option<&T>,
+    leaving_surface: &T,
+) -> bool {
+    focused_surface.is_some_and(|surface| surface == leaving_surface)
 }
 
 impl State {
     fn update_output_info(&mut self, name: u32) {
-        let output = self
-            .outputs
-            .iter_mut()
-            .find(|o| o.global.name == name)
-            .expect("output not found");
+        let Some(output) = self.outputs.iter_mut().find(|o| o.global.name == name) else {
+            log::debug!("ignoring update for removed output {name}");
+            return;
+        };
         if output.has_xdg_info {
             output.info.replace(output.pending_info.clone());
             self.update_windows();
@@ -492,11 +490,13 @@ impl State {
                 &self.qh,
                 global.name,
             );
-            self.globals
-                .xdg_output_manager
-                .get_xdg_output(&wl_output, &self.qh, global.name);
+            let xdg_output =
+                self.globals
+                    .xdg_output_manager
+                    .get_xdg_output(&wl_output, &self.qh, global.name);
             self.outputs.push(Output {
                 wl_output,
+                xdg_output,
                 global,
                 info: None,
                 has_xdg_info: false,
@@ -506,15 +506,20 @@ impl State {
     }
 
     fn deregister_global(&mut self, name: u32) {
+        let previous_len = self.outputs.len();
         self.outputs.retain(|o| {
             if o.global.name == name {
                 log::debug!("{o} (global {:?}) removed", o.global);
+                o.xdg_output.destroy();
                 o.wl_output.release();
                 false
             } else {
                 true
             }
         });
+        if self.outputs.len() != previous_len {
+            self.update_windows();
+        }
     }
 
     fn grab(
@@ -589,12 +594,7 @@ impl State {
                 .layer_surface
                 .set_keyboard_interactivity(KeyboardInteractivity::None);
             if let (Some(pointer_lock), Some(warp_target)) = (&self.pointer_lock, warp_target) {
-                let (surface_x, surface_y) = screen_to_surface(
-                    window.pos,
-                    window.output_pos,
-                    window.output_size,
-                    warp_target,
-                );
+                let (surface_x, surface_y) = screen_to_surface(window.surface_origin, warp_target);
                 log::info!(
                     "[release-warp] layer-shell screen target {warp_target:?} -> surface hint ({surface_x:.1}, {surface_y:.1})"
                 );
@@ -627,25 +627,50 @@ impl State {
         }
     }
 
+    /// Tear down a compositor-side grab whose surface disappeared or lost
+    /// pointer focus. Notify the higher capture task only when a live pointer
+    /// lock proves that a remote-control interval was actually interrupted.
+    fn lose_focus(&mut self) {
+        let interrupted_position = self
+            .pointer_lock
+            .as_ref()
+            .and_then(|_| self.focused.as_ref().map(|window| window.pos));
+        self.ungrab(None);
+        self.focused = None;
+        if let Some(position) = interrupted_position {
+            self.pending_events
+                .push_back((position, CaptureEvent::AutoRelease));
+        }
+    }
+
     fn add_client(&mut self, pos: Position) {
         self.active_positions.insert(pos);
         let outputs = get_output_configuration(self, pos);
 
         log::info!(
-            "adding capture for position {pos} - using outputs: {:?}",
+            "adding capture for position {pos} - using output segments: {:?}",
             outputs
                 .iter()
-                .map(|o| o
-                    .info
-                    .as_ref()
-                    .map(|i| i.name.to_owned())
-                    .unwrap_or("unknown output".to_owned()))
+                .map(|(output, segment)| (
+                    output
+                        .info
+                        .as_ref()
+                        .map(|i| i.name.to_owned())
+                        .unwrap_or("unknown output".to_owned()),
+                    segment
+                ))
                 .collect::<Vec<_>>()
         );
-        outputs.iter().for_each(|o| {
-            if let Some(info) = o.info.as_ref() {
-                let window =
-                    Window::new(self, &self.qh, &o.wl_output, pos, info.position, info.size);
+        outputs.iter().for_each(|(output, segment)| {
+            if let Some(info) = output.info.as_ref() {
+                let window = Window::new(
+                    self,
+                    &self.qh,
+                    &output.wl_output,
+                    pos,
+                    info.position,
+                    *segment,
+                );
                 let window = Arc::new(window);
                 self.active_windows.push(window);
             }
@@ -658,6 +683,9 @@ impl State {
             log::info!(" * {output}");
         }
 
+        if self.focused.is_some() {
+            self.lose_focus();
+        }
         self.active_windows.clear();
 
         let active_positions = self.active_positions.iter().cloned().collect::<Vec<_>>();
@@ -760,20 +788,18 @@ impl Capture for LayerShellInputCapture {
     }
 
     fn display_bounds(&self) -> Option<(u32, u32)> {
-        // Union of every active output's rectangle in compositor
-        // coords. Mirrors the macOS impl so MotionAbsolute scaling
-        // stays consistent: cursor coords reported in this same
-        // space normalize cleanly against the returned dimensions.
-        let outputs = &self.0.get_ref().state.outputs;
-        display_geometry(outputs.iter().filter_map(|output| output.info.as_ref()))
-            .map(|geometry| geometry.size)
+        self.display_layout()?.size()
     }
 
     fn display_origin(&self) -> (i32, i32) {
-        let outputs = &self.0.get_ref().state.outputs;
-        display_geometry(outputs.iter().filter_map(|output| output.info.as_ref()))
-            .map(|geometry| geometry.origin)
+        self.display_layout()
+            .and_then(|layout| layout.origin())
             .unwrap_or((0, 0))
+    }
+
+    fn display_layout(&self) -> Option<DisplayLayout> {
+        let layout = output_layout(&self.0.get_ref().state.outputs);
+        (!layout.is_empty()).then_some(layout)
     }
 }
 
@@ -843,17 +869,32 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
             capabilities: WEnum::Value(capabilities),
         } = event
         {
-            if capabilities.contains(wl_seat::Capability::Pointer) {
-                if let Some(p) = state.pointer.take() {
-                    p.release();
-                }
-                state.pointer.replace(seat.get_pointer(qh, ()));
+            let has_pointer = capabilities.contains(wl_seat::Capability::Pointer);
+            let has_keyboard = capabilities.contains(wl_seat::Capability::Keyboard);
+            if lost_active_seat_device(
+                state.pointer.is_some(),
+                state.keyboard.is_some(),
+                has_pointer,
+                has_keyboard,
+            ) && (state.focused.is_some() || state.pointer_lock.is_some())
+            {
+                log::warn!("seat lost an input capability during capture");
+                state.lose_focus();
             }
-            if capabilities.contains(wl_seat::Capability::Keyboard) {
-                if let Some(k) = state.keyboard.take() {
-                    k.release();
+
+            if has_pointer {
+                if state.pointer.is_none() {
+                    state.pointer.replace(seat.get_pointer(qh, ()));
                 }
-                seat.get_keyboard(qh, ());
+            } else if let Some(pointer) = state.pointer.take() {
+                pointer.release();
+            }
+            if has_keyboard {
+                if state.keyboard.is_none() {
+                    state.keyboard.replace(seat.get_keyboard(qh, ()));
+                }
+            } else if let Some(keyboard) = state.keyboard.take() {
+                keyboard.release();
             }
         }
     }
@@ -886,14 +927,17 @@ impl Dispatch<WlPointer, ()> for State {
                 app.focused = Some(window.clone());
                 app.grab(&surface, pointer, serial, qh);
                 let cursor = surface_to_screen(&window, surface_x, surface_y);
+                let layout = output_layout(&app.outputs);
+                let normalized_cursor = normalize_cursor_in_layout(&layout, cursor);
                 app.pending_events.push_back((
                     window.pos,
                     CaptureEvent::Begin {
                         cursor: Some(cursor),
+                        normalized_cursor,
                     },
                 ));
             }
-            wl_pointer::Event::Leave { .. } => {
+            wl_pointer::Event::Leave { surface, .. } => {
                 /* There are rare cases, where when a window is opened in
                  * just the wrong moment, the pointer is released, while
                  * still grabbed.
@@ -901,10 +945,17 @@ impl Dispatch<WlPointer, ()> for State {
                  * it is impossible to grab it again (since the pointer
                  * lock, relative pointer,... objects are still in place)
                  */
-                if app.pointer_lock.is_some() {
-                    log::warn!("compositor released mouse");
+                if surface_leave_matches_focus(
+                    app.focused.as_ref().map(|window| &window.surface),
+                    &surface,
+                ) {
+                    if app.pointer_lock.is_some() {
+                        log::warn!("compositor released mouse");
+                    }
+                    app.lose_focus();
+                } else {
+                    log::debug!("ignoring pointer Leave for a stale layer surface");
                 }
-                app.ungrab(None);
             }
             wl_pointer::Event::Button {
                 serial: _,
@@ -912,7 +963,10 @@ impl Dispatch<WlPointer, ()> for State {
                 button,
                 state,
             } => {
-                let window = app.focused.as_ref().unwrap();
+                let Some(window) = app.focused.as_ref() else {
+                    log::debug!("dropping pointer button queued after capture lost focus");
+                    return;
+                };
                 app.pending_events.push_back((
                     window.pos,
                     CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
@@ -923,7 +977,11 @@ impl Dispatch<WlPointer, ()> for State {
                 ));
             }
             wl_pointer::Event::Axis { time, axis, value } => {
-                let window = app.focused.as_ref().unwrap();
+                let Some(window) = app.focused.as_ref() else {
+                    app.scroll_discrete_pending = false;
+                    log::debug!("dropping pointer axis queued after capture lost focus");
+                    return;
+                };
                 if app.scroll_discrete_pending {
                     // each axisvalue120 event is coupled with
                     // a corresponding axis event, which needs to
@@ -942,7 +1000,10 @@ impl Dispatch<WlPointer, ()> for State {
                 }
             }
             wl_pointer::Event::AxisValue120 { axis, value120 } => {
-                let window = app.focused.as_ref().unwrap();
+                let Some(window) = app.focused.as_ref() else {
+                    log::debug!("dropping discrete pointer axis queued after capture lost focus");
+                    return;
+                };
                 app.scroll_discrete_pending = true;
                 app.pending_events.push_back((
                     window.pos,
@@ -971,7 +1032,6 @@ impl Dispatch<WlKeyboard, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        let window = &app.focused;
         match event {
             wl_keyboard::Event::Key {
                 serial: _,
@@ -979,7 +1039,7 @@ impl Dispatch<WlKeyboard, ()> for State {
                 key,
                 state,
             } => {
-                if let Some(window) = window {
+                if let Some(window) = &app.focused {
                     app.pending_events.push_back((
                         window.pos,
                         CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
@@ -997,7 +1057,7 @@ impl Dispatch<WlKeyboard, ()> for State {
                 mods_locked,
                 group,
             } => {
-                if let Some(window) = window {
+                if let Some(window) = &app.focused {
                     app.pending_events.push_back((
                         window.pos,
                         CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
@@ -1009,9 +1069,71 @@ impl Dispatch<WlKeyboard, ()> for State {
                     ));
                 }
             }
+            wl_keyboard::Event::Enter { keys, .. } => {
+                if let Some(window) = &app.focused {
+                    // `keys` is a native-endian wl_array of evdev u32s held
+                    // before this layer surface gained keyboard focus. Replay
+                    // only momentary modifiers: they must work immediately on
+                    // the peer and participate in release-bind/pressed-key
+                    // cleanup. Replaying characters or toggle locks here would
+                    // type phantom text or invert Caps/Num/Scroll on every
+                    // boundary crossing.
+                    for key in held_modifiers_on_enter(&keys) {
+                        app.pending_events.push_back((
+                            window.pos,
+                            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                                time: 0,
+                                key,
+                                state: 1,
+                            })),
+                        ));
+                    }
+                }
+            }
+            wl_keyboard::Event::Leave { surface, .. } => {
+                let matches_focus = surface_leave_matches_focus(
+                    app.focused.as_ref().map(|window| &window.surface),
+                    &surface,
+                );
+                if matches_focus {
+                    if app.pointer_lock.is_some() {
+                        log::warn!("compositor released keyboard focus during capture");
+                    }
+                    app.lose_focus();
+                } else {
+                    // Output reconfiguration or a rapid re-entry can leave a
+                    // Leave for an old surface queued behind focus on another
+                    // edge. It must not tear down that newer live grab.
+                    log::debug!("ignoring keyboard Leave for a stale layer surface");
+                }
+            }
             _ => (),
         }
     }
+}
+
+fn held_modifiers_on_enter(keys: &[u8]) -> Vec<u32> {
+    keys.chunks_exact(size_of::<u32>())
+        .filter_map(|bytes| {
+            let key = u32::from_ne_bytes(bytes.try_into().expect("exact u32 chunk"));
+            scancode::Linux::try_from(key)
+                .ok()
+                .filter(|key| {
+                    matches!(
+                        key,
+                        scancode::Linux::KeyLeftShift
+                            | scancode::Linux::KeyRightShift
+                            | scancode::Linux::KeyLeftCtrl
+                            | scancode::Linux::KeyRightCtrl
+                            | scancode::Linux::KeyLeftAlt
+                            | scancode::Linux::KeyRightalt
+                            | scancode::Linux::KeyLeftMeta
+                            | scancode::Linux::KeyRightmeta
+                    )
+                })
+                .map(|key| key as u32)
+        })
+        .collect()
 }
 
 impl Dispatch<ZwpRelativePointerV1, ()> for State {
@@ -1107,11 +1229,10 @@ impl Dispatch<ZxdgOutputV1, u32> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        let output = state
-            .outputs
-            .iter_mut()
-            .find(|o| o.global.name == *name)
-            .expect("output");
+        let Some(output) = state.outputs.iter_mut().find(|o| o.global.name == *name) else {
+            log::debug!("ignoring xdg-output event for removed output {name}");
+            return;
+        };
 
         log::debug!("xdg_output {name} - {event:?}");
         match event {
@@ -1135,7 +1256,7 @@ impl Dispatch<ZxdgOutputV1, u32> for State {
                 output.pending_info.description = description;
                 output.has_xdg_info = true;
             }
-            _ => todo!(),
+            _ => {}
         }
     }
 }
@@ -1175,64 +1296,88 @@ delegate_noop!(State: ignore ZwpLockedPointerV1);
 
 #[cfg(test)]
 mod tests {
-    use super::{DisplayGeometry, OutputInfo, display_geometry, screen_to_surface};
+    use super::{
+        deleting_position_interrupts_focus, held_modifiers_on_enter, lost_active_seat_device,
+        screen_to_surface, surface_leave_matches_focus,
+    };
     use crate::Position;
+    use input_event::scancode::Linux::{
+        KeyA, KeyCapsLock, KeyLeftShift, KeyNumlock, KeyRightCtrl, KeyScrollLock,
+    };
 
-    #[test]
-    fn display_geometry_preserves_negative_union_origin() {
-        let outputs = [
-            OutputInfo {
-                position: (-1920, 0),
-                size: (1920, 1080),
-                ..Default::default()
-            },
-            OutputInfo {
-                position: (0, -200),
-                size: (2560, 1440),
-                ..Default::default()
-            },
-        ];
-
-        assert_eq!(
-            display_geometry(outputs.iter()),
-            Some(DisplayGeometry {
-                origin: (-1920, -200),
-                size: (4480, 1440),
-            })
-        );
-    }
-
-    #[test]
-    fn display_geometry_ignores_unusable_outputs() {
-        let outputs = [OutputInfo {
-            position: (100, 200),
-            size: (0, 1080),
-            ..Default::default()
-        }];
-
-        assert_eq!(display_geometry(outputs.iter()), None);
+    fn native_keys(keys: &[input_event::scancode::Linux]) -> Vec<u8> {
+        keys.iter()
+            .flat_map(|key| (*key as u32).to_ne_bytes())
+            .collect()
     }
 
     #[test]
     fn screen_warp_target_is_relative_to_each_anchored_surface() {
-        let output_pos = (1920, -240);
-        let output_size = (640, 960);
+        assert_eq!(screen_to_surface((1920, -240), (1920, 719)), (0.0, 959.0));
+        assert_eq!(screen_to_surface((2559, -240), (2559, 719)), (0.0, 959.0));
+        assert_eq!(screen_to_surface((1920, -240), (2559, -240)), (639.0, 0.0));
+        assert_eq!(screen_to_surface((1920, 719), (2559, 719)), (639.0, 0.0));
+    }
+
+    #[test]
+    fn an_active_seat_device_loss_interrupts_capture() {
+        assert!(lost_active_seat_device(true, true, false, true));
+        assert!(lost_active_seat_device(true, true, true, false));
+        assert!(!lost_active_seat_device(true, true, true, true));
+        assert!(!lost_active_seat_device(false, false, false, false));
+    }
+
+    #[test]
+    fn keyboard_leave_only_matches_the_current_surface() {
+        let focused_surface = 17_u32;
+        let stale_surface = 23_u32;
+
+        assert!(surface_leave_matches_focus(
+            Some(&focused_surface),
+            &focused_surface
+        ));
+        assert!(!surface_leave_matches_focus(
+            Some(&focused_surface),
+            &stale_surface
+        ));
+        assert!(!surface_leave_matches_focus::<u32>(None, &focused_surface));
+    }
+
+    #[test]
+    fn deleting_an_edge_only_interrupts_focus_owned_by_that_edge() {
+        assert!(deleting_position_interrupts_focus(
+            Some(Position::Right),
+            Position::Right
+        ));
+        assert!(!deleting_position_interrupts_focus(
+            Some(Position::Right),
+            Position::Left
+        ));
+        assert!(!deleting_position_interrupts_focus(None, Position::Right));
+    }
+
+    #[test]
+    fn keyboard_enter_forwards_only_preheld_momentary_modifiers() {
+        let keys = native_keys(&[
+            KeyLeftShift,
+            KeyA,
+            KeyCapsLock,
+            KeyNumlock,
+            KeyScrollLock,
+            KeyRightCtrl,
+        ]);
 
         assert_eq!(
-            screen_to_surface(Position::Left, output_pos, output_size, (1920, 719)),
-            (0.0, 959.0)
+            held_modifiers_on_enter(&keys),
+            vec![KeyLeftShift as u32, KeyRightCtrl as u32],
         );
-        assert_eq!(
-            screen_to_surface(Position::Right, output_pos, output_size, (2559, 719)),
-            (0.0, 959.0)
-        );
-        assert_eq!(
-            screen_to_surface(Position::Top, output_pos, output_size, (2559, -240)),
-            (639.0, 0.0)
-        );
-        assert_eq!(
-            screen_to_surface(Position::Bottom, output_pos, output_size, (2559, 719)),
-            (639.0, 0.0)
-        );
+    }
+
+    #[test]
+    fn keyboard_enter_ignores_trailing_partial_keycode() {
+        let mut keys = native_keys(&[KeyLeftShift]);
+        keys.extend_from_slice(&[0xaa, 0xbb]);
+
+        assert_eq!(held_modifiers_on_enter(&keys), vec![KeyLeftShift as u32]);
     }
 }

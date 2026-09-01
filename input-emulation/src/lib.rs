@@ -4,7 +4,10 @@ use std::{
     fmt::Display,
 };
 
-use input_event::{ClipboardEvent, Event, KeyboardEvent, PointerEvent};
+use input_event::{
+    ClipboardEvent, Event, KeyboardEvent, PointerEvent,
+    display::{DisplayEdge, DisplayLayout},
+};
 
 use crate::clipboard::ClipboardEmulation;
 
@@ -34,6 +37,34 @@ mod dummy;
 mod error;
 
 pub type EmulationHandle = u64;
+
+/// Result of an entry-edge cursor warp.
+///
+/// `Applied` carries the exact display snapshot used to project the target so
+/// the caller can publish matching topology metadata in the same handover
+/// transaction. `Unsupported` means this backend cannot report/project an
+/// absolute cursor position; ownership transfer may still proceed without a
+/// landing warp.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EdgeWarpOutcome {
+    Applied(DisplayLayout),
+    Unsupported,
+}
+
+fn edge_warp_projection(
+    layout: &DisplayLayout,
+    edge: DisplayEdge,
+    cross_fraction: f64,
+) -> Option<((i32, i32), (i32, i32))> {
+    let bounds = layout.bounds()?;
+    let global = layout.project_fraction(edge, cross_fraction)?;
+    let origin = bounds.origin();
+    let relative = (
+        i32::try_from(i64::from(global.0) - i64::from(origin.0)).ok()?,
+        i32::try_from(i64::from(global.1) - i64::from(origin.1)).ok()?,
+    );
+    Some((global, relative))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
@@ -303,14 +334,49 @@ impl InputEmulation {
     /// Display geometry of this device (union of all active
     /// displays), if the backend can report it. See
     /// `Emulation::display_bounds`.
-    pub fn display_bounds(&self) -> Option<(u32, u32)> {
+    pub fn display_bounds(&mut self) -> Option<(u32, u32)> {
         self.emulation.display_bounds()
+    }
+
+    /// Full logical topology of this device's active displays. Backends that
+    /// only report a bounding size inherit a single-rectangle layout from the
+    /// trait default.
+    pub fn display_layout(&mut self) -> Option<DisplayLayout> {
+        self.emulation.display_layout()
     }
 
     /// Warp the local cursor to the given absolute position. See
     /// `Emulation::warp_cursor`.
     pub async fn warp_cursor(&mut self, x: i32, y: i32) -> Result<(), EmulationError> {
         self.emulation.warp_cursor(x, y).await
+    }
+
+    /// Warp to the actual exposed contour on `edge`, preserving the
+    /// normalized position along its cross axis. Unlike a rectangular
+    /// bounding-box warp, this cannot land in the empty corner of a stepped
+    /// multi-monitor layout.
+    pub async fn warp_cursor_to_edge(
+        &mut self,
+        edge: DisplayEdge,
+        cross_fraction: f64,
+    ) -> Result<EdgeWarpOutcome, EmulationError> {
+        if !self.emulation.supports_edge_warp() {
+            return Ok(EdgeWarpOutcome::Unsupported);
+        }
+        let layout = self
+            .emulation
+            .display_layout()
+            .ok_or(EmulationError::DisplayTopologyUnavailable)?;
+        let Some(((global_x, global_y), (x, y))) =
+            edge_warp_projection(&layout, edge, cross_fraction)
+        else {
+            return Err(EmulationError::DisplayTopologyUnavailable);
+        };
+        log::info!(
+            "[cursor-pos] projected {edge:?} fraction={cross_fraction:.4} onto global=({global_x},{global_y}), union-relative=({x},{y})"
+        );
+        self.emulation.warp_cursor_in_layout(x, y, &layout).await?;
+        Ok(EdgeWarpOutcome::Applied(layout))
     }
 
     pub async fn release_keys(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
@@ -380,8 +446,39 @@ trait Emulation: Send {
     /// should leave the default `None` and the wall-press
     /// auto-release fallback will degrade to "no upper clamp"
     /// behavior on the host.
-    fn display_bounds(&self) -> Option<(u32, u32)> {
+    fn display_bounds(&mut self) -> Option<(u32, u32)> {
         None
+    }
+
+    /// Full logical display topology used to project edge warps onto the
+    /// actual monitor contour. Backends that only expose a bounding size get
+    /// rectangular behavior from this default; topology-aware backends should
+    /// override it with every active display rectangle.
+    fn display_layout(&mut self) -> Option<DisplayLayout> {
+        let (width, height) = self.display_bounds()?;
+        let layout = DisplayLayout::new([(0, 0, width, height)]);
+        (!layout.is_empty()).then_some(layout)
+    }
+
+    /// Whether this backend can project and apply an absolute entry-edge
+    /// cursor warp. Backends that only support relative emulation retain the
+    /// default and complete handover with an `Unsupported` outcome.
+    fn supports_edge_warp(&self) -> bool {
+        false
+    }
+
+    /// Apply a union-relative target using the exact layout snapshot that was
+    /// used to project it. Geometry-aware backends override this to avoid
+    /// mixing the target from one hotplug generation with the extent/origin
+    /// from another; the default preserves existing backends whose
+    /// `warp_cursor` query is already self-contained.
+    async fn warp_cursor_in_layout(
+        &mut self,
+        x: i32,
+        y: i32,
+        _layout: &DisplayLayout,
+    ) -> Result<(), EmulationError> {
+        self.warp_cursor(x, y).await
     }
 
     /// Warp the cursor to an absolute position on the receiving
@@ -394,5 +491,37 @@ trait Emulation: Send {
     /// connection still works.
     async fn warp_cursor(&mut self, _x: i32, _y: i32) -> Result<(), EmulationError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::{DisplayEdge, DisplayLayout, edge_warp_projection};
+
+    #[test]
+    fn edge_warps_are_union_relative_but_follow_the_real_contour() {
+        let linux = DisplayLayout::new([
+            (-1024, 0, 1024, 600),
+            (0, 0, 3072, 1728),
+            (836, 1728, 1280, 360),
+        ]);
+        assert_eq!(
+            edge_warp_projection(&linux, DisplayEdge::Right, 500.5 / 2088.0),
+            Some(((3071, 500), (4095, 500))),
+        );
+        assert_eq!(
+            edge_warp_projection(&linux, DisplayEdge::Right, 1800.5 / 2088.0),
+            Some(((2115, 1800), (3139, 1800))),
+        );
+
+        let mac = DisplayLayout::new([(0, 0, 3072, 1728), (-1728, 0, 1728, 1117)]);
+        assert_eq!(
+            edge_warp_projection(&mac, DisplayEdge::Left, 500.5 / 1728.0),
+            Some(((-1728, 500), (0, 500))),
+        );
+        assert_eq!(
+            edge_warp_projection(&mac, DisplayEdge::Left, 1500.5 / 1728.0),
+            Some(((0, 1500), (1728, 1500))),
+        );
     }
 }

@@ -429,7 +429,13 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
      * be far worse than a logged drop. */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
     let active = ACTIVE_CLIENT.get().expect("active client");
-    if let Err(e) = try_send_event(active, CaptureEvent::Begin { cursor: None }) {
+    if let Err(e) = try_send_event(
+        active,
+        CaptureEvent::Begin {
+            cursor: None,
+            normalized_cursor: None,
+        },
+    ) {
         log::error!("forwarding channel full — dropped capture-begin event: {e}");
     }
 

@@ -91,6 +91,7 @@ It can be used as a remote control for any device supported by Mousehop.
 - Use the menu bar item to open the settings window or quit Mousehop. Bundled macOS builds run as a menu bar app and do not keep a Dock icon visible.
 - Grant accessibility permissions in System Settings
 - While this Mac is controlling a peer, Mousehop automatically keeps macOS from starting the idle screen saver or turning off the display. The keep-awake assertion ends as soon as the cursor returns to this Mac.
+- If the Mac nevertheless locks after a controlled peer sleeps or disconnects, Mousehop releases capture and shows confirmed recovery status on that peer. Use the keyboard physically attached to the Mac: Shift is a harmless wake key, then wait for the status; type the Mac password only while the peer still reports **locked**. The dialog has no password field, and Mousehop never reads or transports the password. If status becomes **unavailable**, switch the monitor to the Mac or use Touch ID, Apple Watch, or your hardware input switch instead.
 
 </details>
 
@@ -580,6 +581,8 @@ The following sections detail the emulation and capture backends provided by mou
 
 - `layer-shell`: This backend creates a single pixel wide window on the edges of Displays to capture the cursor using the [layer-shell protocol](https://wayland.app/protocols/wlr-layer-shell-unstable-v1).
 - `libei`: This backend uses [libei](https://gitlab.freedesktop.org/libinput/libei) and is supported by GNOME >= 45 or KDE Plasma >= 6.1.
+- Hyprland automatically prefers `layer-shell` capture because monitor hotplug can make its input-capture portal publish transient pointer barriers that tear down the EIS keyboard seat. An explicit backend selection still takes precedence.
+- Current peers exchange their full logical monitor topology, allowing cross-screen entry, return tracking, and cursor warps to follow exposed edges in stepped or negative-origin multi-monitor layouts. Older peers continue to use rectangular display bounds.
 - `windows`: Backend for input capture on Windows.
 - `macos`: Backend for input capture on MacOS.
 - `x11`: TODO (not yet supported)

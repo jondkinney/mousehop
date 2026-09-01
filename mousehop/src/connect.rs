@@ -1,11 +1,13 @@
 use crate::client::ClientManager;
 use crate::config::local_commit;
 use crate::discovery::{PrimaryCache, normalize_mdns_name};
+use input_event::{Event as InputEvent, KeyboardEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use mousehop_ipc::{ClientHandle, ConnectionMode, DEFAULT_PORT};
 use mousehop_proto::{
     MAX_CLIPBOARD_SIZE, MAX_EVENT_SIZE, PROTOCOL_MAGIC, ProtoEvent, decode_clipboard_event,
-    encode_clipboard_event,
+    decode_display_layout_event, decode_fixed_event, encode_clipboard_event,
+    encode_display_layout_event,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -30,6 +32,50 @@ use webrtc_dtls::{
 };
 use webrtc_util::Conn;
 
+type ArcConn = Arc<dyn Conn + Send + Sync>;
+pub(crate) type ConnectionSession = u64;
+
+#[derive(Clone)]
+struct ConnectionSlot {
+    handle: ClientHandle,
+    session: ConnectionSession,
+    conn: ArcConn,
+}
+
+#[derive(Clone, Default)]
+struct SessionTracker {
+    next: Rc<Cell<ConnectionSession>>,
+    current: Rc<RefCell<HashMap<ClientHandle, ConnectionSession>>>,
+}
+
+impl SessionTracker {
+    fn allocate(&self, handle: ClientHandle) -> ConnectionSession {
+        let mut session = self.next.get().wrapping_add(1);
+        if session == 0 {
+            session = 1;
+        }
+        self.next.set(session);
+        self.current.borrow_mut().insert(handle, session);
+        session
+    }
+
+    fn is_current(&self, handle: ClientHandle, session: ConnectionSession) -> bool {
+        self.current.borrow().get(&handle).copied() == Some(session)
+    }
+
+    fn current(&self, handle: ClientHandle) -> Option<ConnectionSession> {
+        self.current.borrow().get(&handle).copied()
+    }
+
+    fn remove_if_current(&self, handle: ClientHandle, session: ConnectionSession) -> bool {
+        if !self.is_current(handle, session) {
+            return false;
+        }
+        self.current.borrow_mut().remove(&handle);
+        true
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum MousehopConnectionError {
     #[error(transparent)]
@@ -44,6 +90,64 @@ pub(crate) enum MousehopConnectionError {
     TargetEmulationDisabled,
     #[error("Connection timed out")]
     Timeout,
+}
+
+/// Events delivered from the outbound connection tasks to the capture loop.
+/// A disconnect is deliberately distinct from a wire `Leave`: the peer is no
+/// longer reachable, so capture must be released locally without trying to
+/// send cleanup events over (and potentially reconnect) the dead session.
+#[derive(Debug)]
+pub(crate) enum MousehopConnectionEvent {
+    Received {
+        handle: ClientHandle,
+        addr: SocketAddr,
+        session: ConnectionSession,
+        event: ProtoEvent,
+    },
+    Disconnected {
+        handle: ClientHandle,
+        session: ConnectionSession,
+    },
+}
+
+/// Before a DTLS peer proves it speaks Mousehop, only its protocol `Hello`
+/// may affect connection or input state. The caller still validates the
+/// hello's magic and rejects a foreign value.
+pub(crate) fn handshake_allows_event(hello_ok: bool, event: &ProtoEvent) -> bool {
+    hello_ok || matches!(event, ProtoEvent::Hello { .. })
+}
+
+/// Cleanup already committed to an exact transport generation must remain
+/// deliverable after Service removes or reconfigures the corresponding
+/// `ClientManager` entry. Ordinary input is deliberately excluded: a stale
+/// capture event must not gain permission merely because it still knows an old
+/// session number.
+fn is_session_cleanup_event(event: &ProtoEvent) -> bool {
+    matches!(
+        event,
+        ProtoEvent::Leave(_)
+            | ProtoEvent::HandoverLeave { .. }
+            | ProtoEvent::Input(InputEvent::Keyboard(KeyboardEvent::Key { state: 0, .. }))
+            | ProtoEvent::HandoverInput {
+                event: InputEvent::Keyboard(KeyboardEvent::Key { state: 0, .. }),
+                ..
+            }
+            | ProtoEvent::Input(InputEvent::Keyboard(KeyboardEvent::Modifiers {
+                depressed: 0,
+                latched: 0,
+                locked: 0,
+                group: 0,
+            }))
+            | ProtoEvent::HandoverInput {
+                event: InputEvent::Keyboard(KeyboardEvent::Modifiers {
+                    depressed: 0,
+                    latched: 0,
+                    locked: 0,
+                    group: 0,
+                }),
+                ..
+            }
+    )
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -191,18 +295,22 @@ async fn connect_any(
 pub(crate) struct MousehopConnection {
     cert: Certificate,
     client_manager: ClientManager,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
-    recv_tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    conns: Rc<Mutex<HashMap<SocketAddr, ConnectionSlot>>>,
+    sessions: SessionTracker,
+    /// In-flight dial token per handle. The token is also the prospective DTLS
+    /// session generation, so reset/delete can invalidate a dial before Slab
+    /// reuses the numeric handle for another peer.
+    connecting: Rc<Mutex<HashMap<ClientHandle, ConnectionSession>>>,
+    recv_rx: Receiver<MousehopConnectionEvent>,
+    recv_tx: Sender<MousehopConnectionEvent>,
+    ping_response: Rc<RefCell<HashSet<(SocketAddr, ConnectionSession)>>>,
     /// Send timestamp of the most-recent keepalive ping per active
     /// address. `receive_loop` subtracts it on `Pong` to get the live
     /// round-trip latency of the *active* connection — measured over
     /// the real DTLS/UDP path, so it's accurate and works even where a
     /// host firewall drops the TCP probe (the active address is then
     /// excluded from TCP probing; see [`ClientManager::probe_targets`]).
-    ping_sent_at: Rc<RefCell<HashMap<SocketAddr, Instant>>>,
+    ping_sent_at: Rc<RefCell<HashMap<(SocketAddr, ConnectionSession), Instant>>>,
     /// Map of `peer_hostname -> primary_ipv4` populated by the
     /// `Discovery` mDNS browse task. Read on every `connect_to_handle`
     /// to bias which address gets the handshake head-start. Empty
@@ -228,6 +336,7 @@ impl MousehopConnection {
             cert,
             client_manager,
             conns: Default::default(),
+            sessions: Default::default(),
             connecting: Default::default(),
             recv_rx,
             recv_tx,
@@ -238,8 +347,42 @@ impl MousehopConnection {
         }
     }
 
-    pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
-        self.recv_rx.recv().await.expect("channel closed")
+    pub(crate) async fn recv(&mut self) -> MousehopConnectionEvent {
+        loop {
+            let event = self.recv_rx.recv().await.expect("channel closed");
+            let is_current =
+                match &event {
+                    MousehopConnectionEvent::Received {
+                        handle,
+                        addr,
+                        session,
+                        ..
+                    } => {
+                        self.sessions.is_current(*handle, *session)
+                            && self.conns.lock().await.get(addr).is_some_and(|slot| {
+                                slot.handle == *handle && slot.session == *session
+                            })
+                    }
+                    MousehopConnectionEvent::Disconnected {
+                        handle, session, ..
+                    } => self
+                        .sessions
+                        .current(*handle)
+                        .is_none_or(|current| current == *session),
+                };
+            if is_current {
+                return event;
+            }
+            log::debug!("dropping queued event from a replaced outbound DTLS session");
+        }
+    }
+
+    /// Return the authenticated transport generation currently selected for
+    /// `handle`. Capture pins a handover and every Ack-gated input event to
+    /// this value so a reconnect cannot inherit an in-flight crossing.
+    pub(crate) fn current_session(&self, handle: ClientHandle) -> Option<ConnectionSession> {
+        self.client_manager.active_addr(handle)?;
+        self.sessions.current(handle)
     }
 
     /// Cheap send-only handle that shares all the dialer state with
@@ -253,6 +396,7 @@ impl MousehopConnection {
             cert: self.cert.clone(),
             client_manager: self.client_manager.clone(),
             conns: self.conns.clone(),
+            sessions: self.sessions.clone(),
             connecting: self.connecting.clone(),
             recv_rx: dead_rx,
             recv_tx: self.recv_tx.clone(),
@@ -269,14 +413,27 @@ impl MousehopConnection {
         handle: ClientHandle,
     ) -> Result<(), MousehopConnectionError> {
         let event_display = format!("{event}");
-        // Clipboard frames are variable-length and can't ride the
-        // fixed-size codec; route them through the dedicated helper.
-        // For all other events the existing 21-byte path is faster.
+        // Lock-recovery status is control-plane information, not input
+        // emulation. It must still reach a peer whose latest Pong reported
+        // emulation unavailable (including the reconnect window before the
+        // first Pong), otherwise the recovery dialog can never explain why
+        // forwarding stopped.
+        let send_when_emulation_inactive = matches!(&event, ProtoEvent::HostInputState { .. });
+        // Clipboard and display-topology frames are variable-length and can't
+        // ride the fixed-size codec; route them through dedicated helpers. For
+        // all other events the existing 21-byte path is faster.
         let bytes_owned: Option<Vec<u8>> = match &event {
             ProtoEvent::Clipboard { .. } => match encode_clipboard_event(&event) {
                 Ok(v) => Some(v),
                 Err(e) => {
                     log::warn!("dropping oversize clipboard event for client {handle}: {e}");
+                    return Ok(());
+                }
+            },
+            ProtoEvent::DisplayLayout { .. } => match encode_display_layout_event(&event) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    log::warn!("dropping invalid display layout for client {handle}: {e}");
                     return Ok(());
                 }
             },
@@ -293,19 +450,42 @@ impl MousehopConnection {
             &bytes_fixed.0[..bytes_fixed.1]
         };
         if let Some(addr) = self.client_manager.active_addr(handle) {
-            let conn = {
+            let slot = {
                 let conns = self.conns.lock().await;
                 conns.get(&addr).cloned()
             };
-            if let Some(conn) = conn {
-                if !self.client_manager.alive(handle) {
+            if let Some(slot) = slot {
+                if slot.handle != handle || !self.sessions.is_current(handle, slot.session) {
+                    return Err(MousehopConnectionError::NotConnected);
+                }
+                if !self.client_manager.alive(handle) && !send_when_emulation_inactive {
                     return Err(MousehopConnectionError::TargetEmulationDisabled);
                 }
-                match conn.send(buf).await {
+                match slot.conn.send(buf).await {
                     Ok(_) => {}
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        let removed = disconnect(
+                            &self.client_manager,
+                            handle,
+                            addr,
+                            slot.session,
+                            &self.conns,
+                            &self.sessions,
+                            &self.ping_response,
+                            &self.ping_sent_at,
+                            &self.recv_tx,
+                        )
+                        .await;
+                        // Wake the receive/keepalive tasks even if this slot
+                        // was replaced between lookup and the failed send.
+                        let _ = slot.conn.close().await;
+                        if let Some(removed) = removed {
+                            if !Arc::ptr_eq(&removed, &slot.conn) {
+                                let _ = removed.close().await;
+                            }
+                        }
+                        return Err(e.into());
                     }
                 }
                 log::trace!("{event_display} >->->->->- {addr}");
@@ -315,14 +495,22 @@ impl MousehopConnection {
 
         // check if we are already trying to connect
         let mut connecting = self.connecting.lock().await;
-        if !connecting.contains(&handle) && self.should_attempt(handle) {
-            connecting.insert(handle);
+        if !connecting.contains_key(&handle) && self.should_attempt(handle) {
+            // A prospective session is not established yet. Clear any stale
+            // address first so `current_session()` cannot expose the dial token
+            // to Capture as a usable DTLS generation.
+            self.client_manager.set_active_addr(handle, None);
+            self.client_manager.set_alive(handle, false);
+            let session = self.sessions.allocate(handle);
+            connecting.insert(handle, session);
             // connect in the background
             spawn_local(connect_to_handle(
                 self.client_manager.clone(),
                 self.cert.clone(),
                 handle,
+                session,
                 self.conns.clone(),
+                self.sessions.clone(),
                 self.connecting.clone(),
                 self.recv_tx.clone(),
                 self.ping_response.clone(),
@@ -334,20 +522,129 @@ impl MousehopConnection {
         Err(MousehopConnectionError::NotConnected)
     }
 
+    /// Send only on the exact already-established DTLS session. Unlike
+    /// [`Self::send`], this never starts a connection and never falls through
+    /// to a replacement session. It is used for atomic handover retries,
+    /// Ack-gated input, and release cleanup whose meaning belongs to one
+    /// particular transport generation.
+    pub(crate) async fn send_on_session(
+        &self,
+        event: ProtoEvent,
+        handle: ClientHandle,
+        session: ConnectionSession,
+    ) -> Result<(), MousehopConnectionError> {
+        let event_display = format!("{event}");
+        let send_when_emulation_inactive = matches!(&event, ProtoEvent::HostInputState { .. });
+        let session_cleanup = is_session_cleanup_event(&event);
+        let bytes_owned: Option<Vec<u8>> = match &event {
+            ProtoEvent::Clipboard { .. } => match encode_clipboard_event(&event) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    log::warn!("dropping oversize clipboard event for client {handle}: {e}");
+                    return Ok(());
+                }
+            },
+            ProtoEvent::DisplayLayout { .. } => match encode_display_layout_event(&event) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    log::warn!("dropping invalid display layout for client {handle}: {e}");
+                    return Ok(());
+                }
+            },
+            _ => None,
+        };
+        let bytes_fixed: ([u8; MAX_EVENT_SIZE], usize) = if bytes_owned.is_some() {
+            ([0u8; MAX_EVENT_SIZE], 0)
+        } else {
+            event.into()
+        };
+        let buf: &[u8] = if let Some(v) = bytes_owned.as_deref() {
+            v
+        } else {
+            &bytes_fixed.0[..bytes_fixed.1]
+        };
+
+        // Resolve the already-pinned transport directly. Client deletion and
+        // hostname/port reconfiguration can clear or mutate active_addr before
+        // Capture processes its asynchronous Destroy and sends key-up/Leave.
+        // Looking up the exact (handle, session) slot lets that cleanup finish
+        // without ever falling through to a replacement generation.
+        let (addr, slot) = {
+            let conns = self.conns.lock().await;
+            conns.iter().find_map(|(&addr, slot)| {
+                (slot.handle == handle && slot.session == session).then(|| (addr, slot.clone()))
+            })
+        }
+        .ok_or(MousehopConnectionError::NotConnected)?;
+        if !self.sessions.is_current(handle, session) {
+            return Err(MousehopConnectionError::NotConnected);
+        }
+        if self.client_manager.active_addr(handle) != Some(addr) && !session_cleanup {
+            return Err(MousehopConnectionError::NotConnected);
+        }
+        if !self.client_manager.alive(handle) && !send_when_emulation_inactive && !session_cleanup {
+            return Err(MousehopConnectionError::TargetEmulationDisabled);
+        }
+        if let Err(e) = slot.conn.send(buf).await {
+            log::warn!("client {handle} session {session} failed to send: {e}");
+            let removed = disconnect(
+                &self.client_manager,
+                handle,
+                addr,
+                session,
+                &self.conns,
+                &self.sessions,
+                &self.ping_response,
+                &self.ping_sent_at,
+                &self.recv_tx,
+            )
+            .await;
+            let _ = slot.conn.close().await;
+            if let Some(removed) = removed {
+                if !Arc::ptr_eq(&removed, &slot.conn) {
+                    let _ = removed.close().await;
+                }
+            }
+            return Err(e.into());
+        }
+        log::trace!("{event_display} >->->->->- {addr} session {session}");
+        Ok(())
+    }
+
     /// Tear down any live connection for `handle` and clear its retry
     /// gate so the next send re-dials from scratch. Called when the
     /// user changes the locked address: the path we're on may be the
     /// wrong interface now, so we drop it and let `connect_to_handle`
     /// re-evaluate (honoring the new lock) on the next event. Closing
-    /// the connection unblocks its `receive_loop`/`ping_pong` tasks,
-    /// which run the normal `disconnect` teardown.
+    /// the connection after the shared disconnect teardown has notified
+    /// capture, so the local pointer is released immediately rather than
+    /// waiting for `receive_loop` to observe the close.
     pub(crate) async fn reset_handle(&self, handle: ClientHandle) {
-        if let Some(addr) = self.client_manager.active_addr(handle) {
-            let conn = self.conns.lock().await.remove(&addr);
-            if let Some(conn) = conn {
-                let _ = conn.close().await;
+        let session = self.sessions.current(handle);
+        if let Some(session) = session {
+            if let Some(addr) = self.client_manager.active_addr(handle) {
+                let conn = disconnect(
+                    &self.client_manager,
+                    handle,
+                    addr,
+                    session,
+                    &self.conns,
+                    &self.sessions,
+                    &self.ping_response,
+                    &self.ping_sent_at,
+                    &self.recv_tx,
+                )
+                .await;
+                if let Some(conn) = conn {
+                    let _ = conn.close().await;
+                }
+            } else {
+                // No established address means this is an in-flight dial.
+                // Invalidating its prospective session prevents it from
+                // installing after config deletion/handle reuse.
+                self.sessions.remove_if_current(handle, session);
             }
-            self.client_manager.set_active_addr(handle, None);
+            remove_connecting_if_current(&self.connecting, handle, session).await;
         }
         self.retry_state.borrow_mut().remove(&handle);
     }
@@ -382,16 +679,39 @@ impl MousehopConnection {
     }
 }
 
+async fn remove_connecting_if_current(
+    connecting: &Mutex<HashMap<ClientHandle, ConnectionSession>>,
+    handle: ClientHandle,
+    session: ConnectionSession,
+) {
+    let mut connecting = connecting.lock().await;
+    if connecting.get(&handle) == Some(&session) {
+        connecting.remove(&handle);
+    }
+}
+
+async fn finish_failed_dial(
+    connecting: &Mutex<HashMap<ClientHandle, ConnectionSession>>,
+    sessions: &SessionTracker,
+    handle: ClientHandle,
+    session: ConnectionSession,
+) {
+    sessions.remove_if_current(handle, session);
+    remove_connecting_if_current(connecting, handle, session).await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn connect_to_handle(
     client_manager: ClientManager,
     cert: Certificate,
     handle: ClientHandle,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-    ping_sent_at: Rc<RefCell<HashMap<SocketAddr, Instant>>>,
+    session: ConnectionSession,
+    conns: Rc<Mutex<HashMap<SocketAddr, ConnectionSlot>>>,
+    sessions: SessionTracker,
+    connecting: Rc<Mutex<HashMap<ClientHandle, ConnectionSession>>>,
+    tx: Sender<MousehopConnectionEvent>,
+    ping_response: Rc<RefCell<HashSet<(SocketAddr, ConnectionSession)>>>,
+    ping_sent_at: Rc<RefCell<HashMap<(SocketAddr, ConnectionSession), Instant>>>,
     primary_hints: PrimaryCache,
     retry_state: Rc<RefCell<HashMap<ClientHandle, RetryState>>>,
 ) -> Result<(), MousehopConnectionError> {
@@ -446,7 +766,7 @@ async fn connect_to_handle(
             // event — `should_attempt` will keep gating until either
             // the backoff elapses or new info arrives.
             record_retry_failure(&retry_state, handle, &ips_set, primary_ip);
-            connecting.lock().await.remove(&handle);
+            finish_failed_dial(&connecting, &sessions, handle, session).await;
             return Err(MousehopConnectionError::NotConnected);
         }
         let res = connect_any(&addrs, preferred, cert).await;
@@ -454,14 +774,59 @@ async fn connect_to_handle(
             Ok(c) => c,
             Err(e) => {
                 record_retry_failure(&retry_state, handle, &ips_set, primary_ip);
-                connecting.lock().await.remove(&handle);
+                finish_failed_dial(&connecting, &sessions, handle, session).await;
                 return Err(e);
             }
         };
+        let mut conns_guard = conns.lock().await;
+        if !sessions.is_current(handle, session) || client_manager.get_state(handle).is_none() {
+            drop(conns_guard);
+            finish_failed_dial(&connecting, &sessions, handle, session).await;
+            let _ = conn.close().await;
+            log::debug!(
+                "discarding completed dial for reset/replaced client {handle} session {session}"
+            );
+            return Err(MousehopConnectionError::NotConnected);
+        }
         log::info!("client ({handle}) connected @ {addr}");
+        // `alive` belongs to the authenticated protocol session, not merely
+        // this client handle. A reconnect can otherwise inherit `true` from
+        // the previous connection and send input before the new peer has
+        // completed Hello/Pong validation.
+        client_manager.set_alive(handle, false);
         client_manager.set_active_addr(handle, Some(addr));
-        conns.lock().await.insert(addr, conn.clone());
-        connecting.lock().await.remove(&handle);
+        let replaced = conns_guard.insert(
+            addr,
+            ConnectionSlot {
+                handle,
+                session,
+                conn: conn.clone(),
+            },
+        );
+        drop(conns_guard);
+        if let Some(replaced) = replaced {
+            ping_response.borrow_mut().remove(&(addr, replaced.session));
+            ping_sent_at.borrow_mut().remove(&(addr, replaced.session));
+            log::info!(
+                "replacing prior outbound DTLS session {} for {addr}",
+                replaced.session
+            );
+            let _ = replaced.conn.close().await;
+            if replaced.handle != handle
+                && sessions.is_current(replaced.handle, replaced.session)
+                && client_manager.active_addr(replaced.handle) == Some(addr)
+            {
+                client_manager.set_alive(replaced.handle, false);
+                client_manager.set_active_addr(replaced.handle, None);
+                client_manager.set_peer_commit(replaced.handle, None);
+                sessions.remove_if_current(replaced.handle, replaced.session);
+                let _ = tx.send(MousehopConnectionEvent::Disconnected {
+                    handle: replaced.handle,
+                    session: replaced.session,
+                });
+            }
+        }
+        remove_connecting_if_current(&connecting, handle, session).await;
         retry_state.borrow_mut().remove(&handle);
 
         // Protocol handshake. mousehop refuses any peer that does not
@@ -476,8 +841,14 @@ async fn connect_to_handle(
 
         // poll connection for active
         spawn_local(ping_pong(
+            client_manager.clone(),
+            handle,
             addr,
+            session,
             conn.clone(),
+            conns.clone(),
+            sessions.clone(),
+            tx.clone(),
             ping_response.clone(),
             ping_sent_at.clone(),
         ));
@@ -487,8 +858,10 @@ async fn connect_to_handle(
             client_manager,
             handle,
             addr,
+            session,
             conn,
             conns,
+            sessions,
             tx,
             ping_response.clone(),
             ping_sent_at,
@@ -496,7 +869,7 @@ async fn connect_to_handle(
         ));
         return Ok(());
     }
-    connecting.lock().await.remove(&handle);
+    finish_failed_dial(&connecting, &sessions, handle, session).await;
     Err(MousehopConnectionError::NotConnected)
 }
 
@@ -540,34 +913,103 @@ async fn hello_handshake(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ping_pong(
+    client_manager: ClientManager,
+    handle: ClientHandle,
     addr: SocketAddr,
-    conn: Arc<dyn Conn + Send + Sync>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-    ping_sent_at: Rc<RefCell<HashMap<SocketAddr, Instant>>>,
+    session: ConnectionSession,
+    conn: ArcConn,
+    conns: Rc<Mutex<HashMap<SocketAddr, ConnectionSlot>>>,
+    sessions: SessionTracker,
+    tx: Sender<MousehopConnectionEvent>,
+    ping_response: Rc<RefCell<HashSet<(SocketAddr, ConnectionSession)>>>,
+    ping_sent_at: Rc<RefCell<HashMap<(SocketAddr, ConnectionSession), Instant>>>,
 ) {
     loop {
+        if client_manager.get_state(handle).is_none()
+            || !connection_is_current(&conns, &sessions, handle, addr, session).await
+        {
+            disconnect(
+                &client_manager,
+                handle,
+                addr,
+                session,
+                &conns,
+                &sessions,
+                &ping_response,
+                &ping_sent_at,
+                &tx,
+            )
+            .await;
+            let _ = conn.close().await;
+            return;
+        }
         let (buf, len) = ProtoEvent::Ping.into();
 
         // send 4 pings, at least one must be answered
         for _ in 0..4 {
+            if client_manager.get_state(handle).is_none()
+                || !connection_is_current(&conns, &sessions, handle, addr, session).await
+            {
+                disconnect(
+                    &client_manager,
+                    handle,
+                    addr,
+                    session,
+                    &conns,
+                    &sessions,
+                    &ping_response,
+                    &ping_sent_at,
+                    &tx,
+                )
+                .await;
+                let _ = conn.close().await;
+                return;
+            }
             // Stamp the send time so `receive_loop` can derive the live
             // RTT from the matching Pong. On a LAN the Pong returns well
             // within the 500 ms inter-ping gap, so the most-recent stamp
             // is the one being answered.
-            ping_sent_at.borrow_mut().insert(addr, Instant::now());
+            ping_sent_at
+                .borrow_mut()
+                .insert((addr, session), Instant::now());
             if let Err(e) = conn.send(&buf[..len]).await {
                 log::warn!("{addr}: send error `{e}`, closing connection");
+                disconnect(
+                    &client_manager,
+                    handle,
+                    addr,
+                    session,
+                    &conns,
+                    &sessions,
+                    &ping_response,
+                    &ping_sent_at,
+                    &tx,
+                )
+                .await;
                 let _ = conn.close().await;
-                break;
+                return;
             }
             log::trace!("PING >->->->->- {addr}");
 
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        if !ping_response.borrow_mut().remove(&addr) {
+        if !ping_response.borrow_mut().remove(&(addr, session)) {
             log::warn!("{addr} did not respond, closing connection");
+            disconnect(
+                &client_manager,
+                handle,
+                addr,
+                session,
+                &conns,
+                &sessions,
+                &ping_response,
+                &ping_sent_at,
+                &tx,
+            )
+            .await;
             let _ = conn.close().await;
             return;
         }
@@ -579,17 +1021,18 @@ async fn receive_loop(
     client_manager: ClientManager,
     handle: ClientHandle,
     addr: SocketAddr,
-    conn: Arc<dyn Conn + Send + Sync>,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-    ping_sent_at: Rc<RefCell<HashMap<SocketAddr, Instant>>>,
+    session: ConnectionSession,
+    conn: ArcConn,
+    conns: Rc<Mutex<HashMap<SocketAddr, ConnectionSlot>>>,
+    sessions: SessionTracker,
+    tx: Sender<MousehopConnectionEvent>,
+    ping_response: Rc<RefCell<HashSet<(SocketAddr, ConnectionSession)>>>,
+    ping_sent_at: Rc<RefCell<HashMap<(SocketAddr, ConnectionSession), Instant>>>,
     hello_ok: Rc<Cell<bool>>,
 ) {
-    // Buffer sized for the largest legal clipboard frame so a single
-    // DTLS recv never gets truncated. Non-clipboard events use only
-    // the first MAX_EVENT_SIZE bytes; the rest of the buffer is
-    // unused for those datagrams.
+    // Buffer sized for the largest legal variable-length frame so a single
+    // DTLS recv never gets truncated. Fixed events use only the first
+    // MAX_EVENT_SIZE bytes; topology remains below the clipboard cap.
     let mut buf = [0u8; MAX_CLIPBOARD_SIZE];
     while let Ok(n) = conn.recv(&mut buf).await {
         if n == 0 {
@@ -608,20 +1051,34 @@ async fn receive_loop(
             }
         };
         log::trace!("{addr} <==<==<== {event}");
+        if client_manager.get_state(handle).is_none()
+            || !connection_is_current(&conns, &sessions, handle, addr, session).await
+        {
+            log::debug!("ending replaced outbound DTLS receive session {session} for {addr}");
+            break;
+        }
+        if !handshake_allows_event(hello_ok.get(), &event) {
+            log::debug!("ignoring pre-Hello event from {addr}: {event}");
+            continue;
+        }
         match event {
             ProtoEvent::Pong(b) => {
                 client_manager.set_active_addr(handle, Some(addr));
                 client_manager.set_alive(handle, b);
-                ping_response.borrow_mut().insert(addr);
+                ping_response.borrow_mut().insert((addr, session));
                 // Live RTT of the active connection over the real DTLS
                 // path — accurate and firewall-proof (unlike the TCP
                 // probe). Quantize to 100 µs to match the prober.
-                if let Some(sent) = ping_sent_at.borrow_mut().remove(&addr) {
+                if let Some(sent) = ping_sent_at.borrow_mut().remove(&(addr, session)) {
                     let us = sent.elapsed().as_micros().min(u32::MAX as u128) as u32;
                     client_manager.set_latency(handle, addr.ip(), Some(us - (us % 100)));
                 }
             }
-            ProtoEvent::Hello { magic, commit } => {
+            ProtoEvent::Hello {
+                magic,
+                commit,
+                capabilities,
+            } => {
                 if magic != PROTOCOL_MAGIC {
                     log::warn!(
                         "refusing {addr}: peer presented a foreign protocol \
@@ -639,42 +1096,651 @@ async fn receive_loop(
                 // match `get_client(addr)`, which fails when
                 // Mac dials in before Linux's outbound dial
                 // has populated `active_addr`.
-                tx.send((handle, ProtoEvent::hello(commit)))
-                    .expect("channel closed");
+                tx.send(MousehopConnectionEvent::Received {
+                    handle,
+                    addr,
+                    session,
+                    event: ProtoEvent::Hello {
+                        magic,
+                        commit,
+                        capabilities,
+                    },
+                })
+                .expect("channel closed");
             }
-            event => tx.send((handle, event)).expect("channel closed"),
+            event => tx
+                .send(MousehopConnectionEvent::Received {
+                    handle,
+                    addr,
+                    session,
+                    event,
+                })
+                .expect("channel closed"),
         }
     }
     log::debug!("{addr}: receive loop ended");
-    disconnect(&client_manager, handle, addr, &conns).await;
+    disconnect(
+        &client_manager,
+        handle,
+        addr,
+        session,
+        &conns,
+        &sessions,
+        &ping_response,
+        &ping_sent_at,
+        &tx,
+    )
+    .await;
 }
 
 /// Classify the first byte of a DTLS datagram and dispatch through
-/// either the variable-length clipboard codec or the fixed-buffer
-/// `try_into` path. Returns `None` on any decode failure (bad tag,
-/// truncated payload, oversize frame).
+/// a variable-length codec or the fixed-buffer `try_into` path. Returns
+/// `None` on any decode failure (bad tag, truncated payload, oversize frame).
 fn decode_proto_datagram(bytes: &[u8]) -> Option<ProtoEvent> {
     use mousehop_proto::EventType;
     let tag = *bytes.first()?;
     if tag == EventType::Clipboard as u8 {
         return decode_clipboard_event(bytes).ok();
     }
-    let mut fixed = [0u8; MAX_EVENT_SIZE];
-    let copy_len = bytes.len().min(MAX_EVENT_SIZE);
-    fixed[..copy_len].copy_from_slice(&bytes[..copy_len]);
-    fixed.try_into().ok()
+    if tag == EventType::DisplayLayout as u8 {
+        return decode_display_layout_event(bytes).ok();
+    }
+    decode_fixed_event(bytes).ok()
 }
 
+async fn connection_is_current(
+    conns: &Mutex<HashMap<SocketAddr, ConnectionSlot>>,
+    sessions: &SessionTracker,
+    handle: ClientHandle,
+    addr: SocketAddr,
+    session: ConnectionSession,
+) -> bool {
+    sessions.is_current(handle, session)
+        && conns
+            .lock()
+            .await
+            .get(&addr)
+            .is_some_and(|slot| slot.handle == handle && slot.session == session)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn disconnect(
     client_manager: &ClientManager,
     handle: ClientHandle,
     addr: SocketAddr,
-    conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
-) {
-    log::warn!("client ({handle}) @ {addr} connection closed");
-    conns.lock().await.remove(&addr);
-    client_manager.set_active_addr(handle, None);
-    client_manager.set_peer_commit(handle, None);
-    let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
+    session: ConnectionSession,
+    conns: &Mutex<HashMap<SocketAddr, ConnectionSlot>>,
+    sessions: &SessionTracker,
+    ping_response: &RefCell<HashSet<(SocketAddr, ConnectionSession)>>,
+    ping_sent_at: &RefCell<HashMap<(SocketAddr, ConnectionSession), Instant>>,
+    tx: &Sender<MousehopConnectionEvent>,
+) -> Option<ArcConn> {
+    log::warn!("client ({handle}) @ {addr} session {session} connection closed");
+    clear_session_ping_state(ping_response, ping_sent_at, addr, session);
+    let mut conns = conns.lock().await;
+    let removed = match conns.get(&addr) {
+        Some(slot) if slot.handle == handle && slot.session == session => {
+            conns.remove(&addr).map(|slot| slot.conn)
+        }
+        Some(_) => {
+            log::debug!(
+                "ignoring stale disconnect for client ({handle}) @ {addr}: session {session} was replaced"
+            );
+            return None;
+        }
+        None => None,
+    };
+    let active: Vec<SocketAddr> = conns.keys().copied().collect();
+    drop(conns);
+
+    // A receive task from an older address can finish after a replacement
+    // connection has already become active. Only the task that owned the
+    // current address may clear client state or release capture.
+    let manager_removed = client_manager.get_state(handle).is_none();
+    if sessions.is_current(handle, session)
+        && (manager_removed || client_manager.active_addr(handle) == Some(addr))
+    {
+        if !manager_removed {
+            client_manager.set_alive(handle, false);
+            client_manager.set_active_addr(handle, None);
+            client_manager.set_peer_commit(handle, None);
+        }
+        sessions.remove_if_current(handle, session);
+        let _ = tx.send(MousehopConnectionEvent::Disconnected { handle, session });
+    }
     log::info!("active connections: {active:?}");
+    removed
+}
+
+fn clear_session_ping_state(
+    ping_response: &RefCell<HashSet<(SocketAddr, ConnectionSession)>>,
+    ping_sent_at: &RefCell<HashMap<(SocketAddr, ConnectionSession), Instant>>,
+    addr: SocketAddr,
+    session: ConnectionSession,
+) {
+    ping_response.borrow_mut().remove(&(addr, session));
+    ping_sent_at.borrow_mut().remove(&(addr, session));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use input_event::{Event, KeyboardEvent, PointerEvent, display::DisplayLayout};
+
+    fn connection_map() -> Mutex<HashMap<SocketAddr, ConnectionSlot>> {
+        Mutex::new(HashMap::new())
+    }
+
+    async fn test_conn() -> ArcConn {
+        Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"))
+    }
+
+    async fn connected_test_conn() -> (ArcConn, UdpSocket, SocketAddr) {
+        let receiver = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("receiver socket");
+        let addr = receiver.local_addr().expect("receiver address");
+        let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender socket");
+        sender.connect(addr).await.expect("connect sender");
+        (Arc::new(sender), receiver, addr)
+    }
+
+    #[test]
+    fn variable_topology_datagram_routes_through_display_codec() {
+        let layout = DisplayLayout::new([(-1024, 0, 1024, 600), (0, 0, 3072, 1728)]);
+        let bytes = encode_display_layout_event(&ProtoEvent::display_layout(layout.clone()))
+            .expect("encode topology");
+        assert!(matches!(
+            decode_proto_datagram(&bytes),
+            Some(ProtoEvent::DisplayLayout { layout: decoded, .. }) if decoded == layout
+        ));
+
+        let mut malformed = bytes;
+        malformed[1] = mousehop_proto::DISPLAY_LAYOUT_VERSION.wrapping_add(1);
+        assert!(decode_proto_datagram(&malformed).is_none());
+    }
+
+    #[test]
+    fn handshake_rejects_all_non_hello_events_until_validated() {
+        let input = ProtoEvent::Input(Event::Pointer(PointerEvent::Motion {
+            time: 1,
+            dx: 2.0,
+            dy: 3.0,
+        }));
+        for event in [ProtoEvent::Ack(0), ProtoEvent::Pong(true), input] {
+            assert!(!handshake_allows_event(false, &event));
+            assert!(handshake_allows_event(true, &event));
+        }
+        assert!(handshake_allows_event(
+            false,
+            &ProtoEvent::hello(*b"deadbeef")
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_disconnect_notifies_capture_even_if_map_was_already_drained() {
+        let client_manager = ClientManager::default();
+        let handle = client_manager.add_client();
+        let addr: SocketAddr = "127.0.0.1:4242".parse().expect("test address");
+        client_manager.set_active_addr(handle, Some(addr));
+        client_manager.set_alive(handle, true);
+        client_manager.set_peer_commit(handle, Some(*b"deadbeef"));
+        let conns = connection_map();
+        let sessions = SessionTracker::default();
+        let session = sessions.allocate(handle);
+        let ping_response = RefCell::new(HashSet::from([(addr, session)]));
+        let ping_sent_at = RefCell::new(HashMap::from([((addr, session), Instant::now())]));
+        let (tx, mut rx) = channel();
+
+        let removed = disconnect(
+            &client_manager,
+            handle,
+            addr,
+            session,
+            &conns,
+            &sessions,
+            &ping_response,
+            &ping_sent_at,
+            &tx,
+        )
+        .await;
+
+        assert!(removed.is_none());
+        assert!(matches!(
+            rx.recv().await,
+            Some(MousehopConnectionEvent::Disconnected { handle: disconnected, session: disconnected_session })
+                if disconnected == handle && disconnected_session == session
+        ));
+        assert_eq!(client_manager.active_addr(handle), None);
+        assert!(!client_manager.alive(handle));
+        assert_eq!(sessions.current(handle), None);
+        assert!(ping_response.borrow().is_empty());
+        assert!(ping_sent_at.borrow().is_empty());
+        assert_eq!(
+            client_manager
+                .get_state(handle)
+                .expect("client state")
+                .1
+                .peer_commit,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_connection_identity_removes_and_notifies() {
+        let client_manager = ClientManager::default();
+        let handle = client_manager.add_client();
+        let addr: SocketAddr = "127.0.0.1:4242".parse().expect("test address");
+        let current = test_conn().await;
+        let conns = connection_map();
+        let sessions = SessionTracker::default();
+        let session = sessions.allocate(handle);
+        let ping_response = RefCell::new(HashSet::from([(addr, session)]));
+        let ping_sent_at = RefCell::new(HashMap::from([((addr, session), Instant::now())]));
+        conns.lock().await.insert(
+            addr,
+            ConnectionSlot {
+                handle,
+                session,
+                conn: current.clone(),
+            },
+        );
+        client_manager.set_active_addr(handle, Some(addr));
+        client_manager.set_alive(handle, true);
+        let (tx, mut rx) = channel();
+
+        let removed = disconnect(
+            &client_manager,
+            handle,
+            addr,
+            session,
+            &conns,
+            &sessions,
+            &ping_response,
+            &ping_sent_at,
+            &tx,
+        )
+        .await;
+
+        assert!(removed.is_some_and(|conn| Arc::ptr_eq(&conn, &current)));
+        assert!(matches!(
+            rx.recv().await,
+            Some(MousehopConnectionEvent::Disconnected { handle: disconnected, session: disconnected_session })
+                if disconnected == handle && disconnected_session == session
+        ));
+        assert_eq!(client_manager.active_addr(handle), None);
+        assert!(!client_manager.alive(handle));
+        assert_eq!(sessions.current(handle), None);
+        assert!(ping_response.borrow().is_empty());
+        assert!(ping_sent_at.borrow().is_empty());
+        assert!(conns.lock().await.get(&addr).is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_disconnect_does_not_clear_replacement_connection() {
+        let client_manager = ClientManager::default();
+        let handle = client_manager.add_client();
+        let old_addr: SocketAddr = "127.0.0.1:4242".parse().expect("test address");
+        let new_addr: SocketAddr = "127.0.0.2:4242".parse().expect("test address");
+        let commit = *b"cafebabe";
+        client_manager.set_active_addr(handle, Some(new_addr));
+        client_manager.set_alive(handle, true);
+        client_manager.set_peer_commit(handle, Some(commit));
+        let conns = connection_map();
+        let sessions = SessionTracker::default();
+        let session = sessions.allocate(handle);
+        let ping_response = RefCell::new(HashSet::from([(old_addr, session)]));
+        let ping_sent_at = RefCell::new(HashMap::from([((old_addr, session), Instant::now())]));
+        let (tx, _rx) = channel();
+
+        let removed = disconnect(
+            &client_manager,
+            handle,
+            old_addr,
+            session,
+            &conns,
+            &sessions,
+            &ping_response,
+            &ping_sent_at,
+            &tx,
+        )
+        .await;
+
+        assert!(removed.is_none());
+        assert_eq!(client_manager.active_addr(handle), Some(new_addr));
+        assert!(client_manager.alive(handle));
+        assert!(ping_response.borrow().is_empty());
+        assert!(ping_sent_at.borrow().is_empty());
+        assert_eq!(
+            client_manager
+                .get_state(handle)
+                .expect("client state")
+                .1
+                .peer_commit,
+            Some(commit)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_same_address_disconnect_preserves_replacement_connection() {
+        let client_manager = ClientManager::default();
+        let handle = client_manager.add_client();
+        let addr: SocketAddr = "127.0.0.1:4242".parse().expect("test address");
+        let replacement = test_conn().await;
+        let conns = connection_map();
+        let sessions = SessionTracker::default();
+        let old_session = sessions.allocate(handle);
+        let replacement_session = sessions.allocate(handle);
+        let ping_response = RefCell::new(HashSet::from([
+            (addr, old_session),
+            (addr, replacement_session),
+        ]));
+        let ping_sent_at = RefCell::new(HashMap::from([
+            ((addr, old_session), Instant::now()),
+            ((addr, replacement_session), Instant::now()),
+        ]));
+        conns.lock().await.insert(
+            addr,
+            ConnectionSlot {
+                handle,
+                session: replacement_session,
+                conn: replacement.clone(),
+            },
+        );
+        client_manager.set_active_addr(handle, Some(addr));
+        client_manager.set_alive(handle, true);
+        let commit = *b"cafebabe";
+        client_manager.set_peer_commit(handle, Some(commit));
+        let (tx, _rx) = channel();
+
+        let removed = disconnect(
+            &client_manager,
+            handle,
+            addr,
+            old_session,
+            &conns,
+            &sessions,
+            &ping_response,
+            &ping_sent_at,
+            &tx,
+        )
+        .await;
+
+        assert!(removed.is_none());
+        assert_eq!(client_manager.active_addr(handle), Some(addr));
+        assert!(client_manager.alive(handle));
+        assert_eq!(
+            ping_response.borrow().iter().copied().collect::<Vec<_>>(),
+            vec![(addr, replacement_session)]
+        );
+        assert_eq!(ping_sent_at.borrow().len(), 1);
+        assert!(
+            ping_sent_at
+                .borrow()
+                .contains_key(&(addr, replacement_session))
+        );
+        assert_eq!(
+            client_manager
+                .get_state(handle)
+                .expect("client state")
+                .1
+                .peer_commit,
+            Some(commit)
+        );
+        let current = conns
+            .lock()
+            .await
+            .get(&addr)
+            .cloned()
+            .expect("replacement remains");
+        assert_eq!(current.session, replacement_session);
+        assert!(Arc::ptr_eq(&current.conn, &replacement));
+    }
+
+    #[tokio::test]
+    async fn queued_old_session_is_rejected_after_replacement() {
+        let handle = 7;
+        let addr: SocketAddr = "127.0.0.1:4242".parse().expect("test address");
+        let sessions = SessionTracker::default();
+        let old_session = sessions.allocate(handle);
+        let current_session = sessions.allocate(handle);
+        let conns = connection_map();
+        let current_conn = test_conn().await;
+        conns.lock().await.insert(
+            addr,
+            ConnectionSlot {
+                handle,
+                session: current_session,
+                conn: current_conn,
+            },
+        );
+
+        assert!(!sessions.is_current(handle, old_session));
+        assert!(!connection_is_current(&conns, &sessions, handle, addr, old_session).await);
+        assert!(connection_is_current(&conns, &sessions, handle, addr, current_session).await);
+    }
+
+    #[tokio::test]
+    async fn deleted_client_terminal_disconnect_removes_slot_and_tracker() {
+        let client_manager = ClientManager::default();
+        let handle = client_manager.add_client();
+        let addr: SocketAddr = "127.0.0.1:4242".parse().expect("test address");
+        let current = test_conn().await;
+        let conns = Rc::new(connection_map());
+        let sessions = SessionTracker::default();
+        let session = sessions.allocate(handle);
+        conns.lock().await.insert(
+            addr,
+            ConnectionSlot {
+                handle,
+                session,
+                conn: current.clone(),
+            },
+        );
+        let ping_response = Rc::new(RefCell::new(HashSet::from([(addr, session)])));
+        let ping_sent_at = Rc::new(RefCell::new(HashMap::from([(
+            (addr, session),
+            Instant::now(),
+        )])));
+        let (tx, mut rx) = channel();
+        client_manager
+            .remove_client(handle)
+            .expect("remove configured client");
+
+        ping_pong(
+            client_manager,
+            handle,
+            addr,
+            session,
+            current,
+            conns.clone(),
+            sessions.clone(),
+            tx,
+            ping_response.clone(),
+            ping_sent_at.clone(),
+        )
+        .await;
+
+        assert!(conns.lock().await.is_empty());
+        assert_eq!(sessions.current(handle), None);
+        assert!(ping_response.borrow().is_empty());
+        assert!(ping_sent_at.borrow().is_empty());
+        assert!(matches!(
+            rx.recv().await,
+            Some(MousehopConnectionEvent::Disconnected {
+                handle: disconnected,
+                session: disconnected_session,
+            }) if disconnected == handle && disconnected_session == session
+        ));
+    }
+
+    #[tokio::test]
+    async fn reset_handle_invalidates_inflight_dial_before_handle_reuse() {
+        let client_manager = ClientManager::default();
+        let handle = client_manager.add_client();
+        let cert = Certificate::generate_self_signed(["mousehop-dial-reset-test".to_owned()])
+            .expect("test certificate");
+        let connection =
+            MousehopConnection::new(cert, client_manager.clone(), PrimaryCache::default());
+        let session = connection.sessions.allocate(handle);
+        connection.connecting.lock().await.insert(handle, session);
+
+        connection.reset_handle(handle).await;
+
+        assert_eq!(connection.sessions.current(handle), None);
+        assert!(!connection.connecting.lock().await.contains_key(&handle));
+    }
+
+    #[tokio::test]
+    async fn old_dial_completion_cannot_clear_replacement_attempt_token() {
+        let handle = 7;
+        let connecting = Mutex::new(HashMap::new());
+        let sessions = SessionTracker::default();
+        let old_session = sessions.allocate(handle);
+        let replacement_session = sessions.allocate(handle);
+        connecting.lock().await.insert(handle, replacement_session);
+
+        finish_failed_dial(&connecting, &sessions, handle, old_session).await;
+
+        assert_eq!(sessions.current(handle), Some(replacement_session));
+        assert_eq!(
+            connecting.lock().await.get(&handle).copied(),
+            Some(replacement_session)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_pinned_send_never_falls_through_to_replacement() {
+        let client_manager = ClientManager::default();
+        let handle = client_manager.add_client();
+        let addr: SocketAddr = "127.0.0.1:4242".parse().expect("test address");
+        let cert = Certificate::generate_self_signed(["mousehop-session-send-test".to_owned()])
+            .expect("test certificate");
+        let connection =
+            MousehopConnection::new(cert, client_manager.clone(), PrimaryCache::default());
+        let old_session = connection.sessions.allocate(handle);
+        let replacement_session = connection.sessions.allocate(handle);
+        connection.conns.lock().await.insert(
+            addr,
+            ConnectionSlot {
+                handle,
+                session: replacement_session,
+                conn: test_conn().await,
+            },
+        );
+        client_manager.set_active_addr(handle, Some(addr));
+        client_manager.set_alive(handle, true);
+
+        assert!(matches!(
+            connection
+                .send_on_session(ProtoEvent::Ack(17), handle, old_session)
+                .await,
+            Err(MousehopConnectionError::NotConnected)
+        ));
+        assert_eq!(
+            connection.current_session(handle),
+            Some(replacement_session)
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_release_cleanup_survives_client_manager_removal() {
+        let client_manager = ClientManager::default();
+        let handle = client_manager.add_client();
+        let cert = Certificate::generate_self_signed(["mousehop-release-cleanup-test".to_owned()])
+            .expect("test certificate");
+        let connection =
+            MousehopConnection::new(cert, client_manager.clone(), PrimaryCache::default());
+        let session = connection.sessions.allocate(handle);
+        let (conn, receiver, addr) = connected_test_conn().await;
+        connection.conns.lock().await.insert(
+            addr,
+            ConnectionSlot {
+                handle,
+                session,
+                conn,
+            },
+        );
+        client_manager.set_active_addr(handle, Some(addr));
+        client_manager.set_alive(handle, true);
+        client_manager
+            .remove_client(handle)
+            .expect("remove configured client before asynchronous capture cleanup");
+
+        let cleanup = [
+            ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key: 30,
+                state: 0,
+            })),
+            ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed: 0,
+                latched: 0,
+                locked: 0,
+                group: 0,
+            })),
+            ProtoEvent::Leave(0),
+            ProtoEvent::HandoverInput {
+                serial: 47,
+                event: Event::Keyboard(KeyboardEvent::Key {
+                    time: 0,
+                    key: 30,
+                    state: 0,
+                }),
+            },
+            ProtoEvent::HandoverInput {
+                serial: 47,
+                event: Event::Keyboard(KeyboardEvent::Modifiers {
+                    depressed: 0,
+                    latched: 0,
+                    locked: 0,
+                    group: 0,
+                }),
+            },
+            ProtoEvent::HandoverLeave {
+                serial: 47,
+                mode: mousehop_proto::LEAVE_HANDOVER,
+            },
+        ];
+        for expected in cleanup {
+            connection
+                .send_on_session(expected.clone(), handle, session)
+                .await
+                .expect("exact-session cleanup remains deliverable");
+            let mut bytes = [0u8; MAX_EVENT_SIZE];
+            let n = tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut bytes))
+                .await
+                .expect("cleanup datagram timeout")
+                .expect("receive cleanup datagram");
+            let decoded = decode_fixed_event(&bytes[..n]).expect("decode cleanup datagram");
+            assert_eq!(format!("{decoded}"), format!("{expected}"));
+        }
+
+        let stale_key_down = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+            time: 1,
+            key: 30,
+            state: 1,
+        }));
+        assert!(matches!(
+            connection
+                .send_on_session(stale_key_down, handle, session)
+                .await,
+            Err(MousehopConnectionError::NotConnected)
+        ));
+
+        let stale_transactional_key_down = ProtoEvent::HandoverInput {
+            serial: 47,
+            event: Event::Keyboard(KeyboardEvent::Key {
+                time: 1,
+                key: 30,
+                state: 1,
+            }),
+        };
+        assert!(matches!(
+            connection
+                .send_on_session(stale_transactional_key_down, handle, session)
+                .await,
+            Err(MousehopConnectionError::NotConnected)
+        ));
+    }
 }

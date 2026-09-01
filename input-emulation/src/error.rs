@@ -15,6 +15,9 @@ use ashpd::{Error::Response, desktop::ResponseError};
 use std::io;
 use thiserror::Error;
 
+#[cfg(target_os = "macos")]
+use core_graphics::base::CGError;
+
 #[cfg(all(unix, feature = "wlroots", not(target_os = "macos")))]
 use wayland_client::{
     ConnectError, DispatchError,
@@ -26,6 +29,8 @@ use wayland_client::{
 pub enum EmulationError {
     #[error("event stream closed")]
     EndOfStream,
+    #[error("display topology is unavailable for an absolute cursor warp")]
+    DisplayTopologyUnavailable,
     #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
     #[error("libei error: `{0}`")]
     Libei(#[from] reis::Error),
@@ -41,6 +46,9 @@ pub enum EmulationError {
     Ashpd(#[from] ashpd::Error),
     #[error("io error: `{0}`")]
     Io(#[from] io::Error),
+    #[cfg(target_os = "macos")]
+    #[error("core-graphics error: {0}")]
+    CoreGraphics(CGError),
 }
 
 #[derive(Debug, Error)]

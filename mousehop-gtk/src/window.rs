@@ -1,6 +1,6 @@
 mod imp;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, net::SocketAddr};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -12,12 +12,13 @@ use gtk::{
 
 use mousehop_ipc::{
     ClientConfig, ClientHandle, ClientState, ConnectionMode, DEFAULT_PORT, FrontendRequest,
-    FrontendRequestWriter, Position,
+    FrontendRequestWriter, Position, RemoteHostState,
 };
 
 use crate::{
     authorization_window::AuthorizationWindow, clipboard_privacy_window::ClipboardPrivacyWindow,
     fingerprint_window::FingerprintWindow, key_object::KeyObject, key_row::KeyRow,
+    lock_recovery_window::LockRecoveryWindow,
 };
 
 use super::{client_object::ClientObject, client_row::ClientRow};
@@ -962,5 +963,52 @@ impl Window {
         );
         window.present();
         self.imp().authorization_window.replace(Some(window));
+    }
+
+    pub(super) fn set_remote_host_state(
+        &self,
+        fingerprint: &str,
+        addr: SocketAddr,
+        state: RemoteHostState,
+    ) {
+        let imp = self.imp();
+        if state == RemoteHostState::Unlocked {
+            let matches_open_window = imp
+                .lock_recovery_window
+                .borrow()
+                .as_ref()
+                .is_some_and(|window| window.fingerprint() == fingerprint);
+            if matches_open_window {
+                if let Some(window) = imp.lock_recovery_window.borrow_mut().take() {
+                    window.close();
+                }
+                self.show_toast(
+                    "Mac unlocked. Move across the configured screen edge to resume forwarding.",
+                );
+            }
+            return;
+        }
+
+        let replace = imp
+            .lock_recovery_window
+            .borrow()
+            .as_ref()
+            .is_none_or(|window| window.fingerprint() != fingerprint);
+        if replace {
+            if let Some(window) = imp.lock_recovery_window.borrow_mut().take() {
+                window.close();
+            }
+            let window = LockRecoveryWindow::new(fingerprint, addr, state);
+            window.set_transient_for(Some(self));
+            let parent_w = self.width();
+            if parent_w > 0 {
+                window.set_default_width((parent_w - 40).clamp(320, 520));
+            }
+            window.present();
+            imp.lock_recovery_window.replace(Some(window));
+        } else if let Some(window) = imp.lock_recovery_window.borrow().as_ref() {
+            window.set_state(addr, state);
+            window.present();
+        }
     }
 }

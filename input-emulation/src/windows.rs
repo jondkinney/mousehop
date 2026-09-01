@@ -143,7 +143,7 @@ impl Emulation for WindowsEmulation {
 
     async fn terminate(&mut self) {}
 
-    fn display_bounds(&self) -> Option<(u32, u32)> {
+    fn display_bounds(&mut self) -> Option<(u32, u32)> {
         // Virtual-screen metrics cover the union of every monitor
         // attached to the system, matching the host-side capture
         // model that uses the union of all displays. Also the sole
@@ -161,6 +161,10 @@ impl Emulation for WindowsEmulation {
         self.virtual_screen_origin
             .set(Some(virtual_screen_origin()));
         Some((w as u32, h as u32))
+    }
+
+    fn supports_edge_warp(&self) -> bool {
+        true
     }
 
     async fn warp_cursor(&mut self, x: i32, y: i32) -> Result<(), EmulationError> {
