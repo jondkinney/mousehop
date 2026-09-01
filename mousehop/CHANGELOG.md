@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/jondkinney/mousehop/compare/v0.15.6...v0.16.0) - 2026-09-01
+
+### Added
+
+- *(recovery)* guide peers through macOS lock recovery
+
+### Fixed
+
+- *(input)* restore keyboard and topology-aware handoff
+- *(libei)* reuse portal session for barrier updates
+
 ### Added
 
 - *(macos/gtk)* report confirmed Mac lock state to the controlled peer, release capture, and show password-safe recovery guidance
