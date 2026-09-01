@@ -148,7 +148,7 @@ impl Emulation for X11Emulation {
         /* nothing to do */
     }
 
-    fn display_bounds(&self) -> Option<(u32, u32)> {
+    fn display_bounds(&mut self) -> Option<(u32, u32)> {
         unsafe {
             // DisplayWidth/DisplayHeight on the default screen
             // returns the union extent of the X server's logical
@@ -161,6 +161,10 @@ impl Emulation for X11Emulation {
             }
             Some((w as u32, h as u32))
         }
+    }
+
+    fn supports_edge_warp(&self) -> bool {
+        true
     }
 
     async fn warp_cursor(&mut self, x: i32, y: i32) -> Result<(), EmulationError> {

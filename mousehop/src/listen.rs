@@ -3,10 +3,12 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use mousehop_ipc::IncomingPeerConfig;
 use mousehop_proto::{
     MAX_CLIPBOARD_SIZE, MAX_EVENT_SIZE, PROTOCOL_MAGIC, ProtoEvent, decode_clipboard_event,
+    decode_display_layout_event, decode_fixed_event, encode_clipboard_event,
+    encode_display_layout_event,
 };
 use rustls::pki_types::CertificateDer;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     rc::Rc,
@@ -27,7 +29,7 @@ use webrtc_dtls::{
 };
 use webrtc_util::{Conn, Error, conn::Listener};
 
-use crate::crypto;
+use crate::{connect::handshake_allows_event, crypto};
 
 #[derive(Error, Debug)]
 pub enum ListenerCreationError {
@@ -41,15 +43,58 @@ pub enum ListenerCreationError {
 
 type ArcConn = Arc<dyn Conn + Send + Sync>;
 type DynListener = Box<dyn Listener + Send + Sync>;
+pub(crate) type ListenerSession = u64;
+
+#[derive(Clone)]
+struct AcceptedConnection {
+    session: ListenerSession,
+    conn: ArcConn,
+}
+
+#[derive(Clone, Default)]
+struct ListenerSessions {
+    next: Rc<Cell<ListenerSession>>,
+    current: Rc<RefCell<HashMap<SocketAddr, ListenerSession>>>,
+}
+
+impl ListenerSessions {
+    fn allocate(&self, addr: SocketAddr) -> ListenerSession {
+        let mut session = self.next.get().wrapping_add(1);
+        if session == 0 {
+            session = 1;
+        }
+        self.next.set(session);
+        self.current.borrow_mut().insert(addr, session);
+        session
+    }
+
+    fn is_current(&self, addr: SocketAddr, session: ListenerSession) -> bool {
+        self.current.borrow().get(&addr).copied() == Some(session)
+    }
+
+    fn remove_if_current(&self, addr: SocketAddr, session: ListenerSession) -> bool {
+        if !self.is_current(addr, session) {
+            return false;
+        }
+        self.current.borrow_mut().remove(&addr);
+        true
+    }
+}
 
 pub(crate) enum ListenEvent {
     Msg {
         event: ProtoEvent,
         addr: SocketAddr,
+        session: ListenerSession,
     },
     Accept {
         addr: SocketAddr,
+        session: ListenerSession,
         fingerprint: String,
+    },
+    Disconnected {
+        addr: SocketAddr,
+        session: ListenerSession,
     },
     Rejected {
         fingerprint: String,
@@ -60,7 +105,8 @@ pub(crate) struct MousehopListener {
     listen_rx: Receiver<ListenEvent>,
     listen_tx: Sender<ListenEvent>,
     listen_task: JoinHandle<()>,
-    conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
+    conns: Rc<AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>>,
+    sessions: ListenerSessions,
     request_port_change: Sender<u16>,
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
     /// macOS-only: held for its `Drop` side effect (stops the
@@ -143,8 +189,9 @@ impl MousehopListener {
             ..Default::default()
         };
 
-        let conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>> =
-            Rc::new(AsyncMutex::new(Vec::new()));
+        let conns: Rc<AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>> =
+            Rc::new(AsyncMutex::new(HashMap::new()));
+        let sessions = ListenerSessions::default();
 
         // Bind one listener per local address (v4 + v6, skipping
         // loopback / link-local / multicast) instead of a single
@@ -170,6 +217,7 @@ impl MousehopListener {
                         listener,
                         listen_tx.clone(),
                         conns.clone(),
+                        sessions.clone(),
                         connection_attempts.clone(),
                     );
                     listeners.insert(*ip, ListenerSlot { accept_task: task });
@@ -189,6 +237,7 @@ impl MousehopListener {
                         listener,
                         listen_tx.clone(),
                         conns.clone(),
+                        sessions.clone(),
                         connection_attempts.clone(),
                     );
                     listeners.insert(fallback, ListenerSlot { accept_task: task });
@@ -218,6 +267,7 @@ impl MousehopListener {
             listeners,
             listen_tx.clone(),
             conns.clone(),
+            sessions.clone(),
             connection_attempts,
             request_port_change_rx,
             port_changed_tx,
@@ -226,6 +276,7 @@ impl MousehopListener {
 
         Ok(Self {
             conns,
+            sessions,
             listen_rx,
             listen_tx,
             listen_task,
@@ -244,35 +295,74 @@ impl MousehopListener {
         self.port_changed.recv().await.expect("channel closed")
     }
 
+    pub(crate) fn current_session(&self, addr: SocketAddr) -> Option<ListenerSession> {
+        self.sessions.current.borrow().get(&addr).copied()
+    }
+
     pub(crate) async fn terminate(&mut self) {
         self.listen_task.abort();
         let conns = self.conns.lock().await;
-        for (_, conn) in conns.iter() {
-            let _ = conn.close().await;
+        for slot in conns.values() {
+            let _ = slot.conn.close().await;
         }
         self.listen_tx.close();
     }
 
-    pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
-        log::trace!("reply {event} >=>=>=>=>=> {addr}");
-        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
-        let conns = self.conns.lock().await;
-        for (a, conn) in conns.iter() {
-            if *a == addr {
-                let _ = conn.send(&buf[..len]).await;
+    pub(crate) async fn reply(
+        &self,
+        addr: SocketAddr,
+        session: ListenerSession,
+        event: ProtoEvent,
+    ) {
+        log::trace!("reply {event} >=>=>=>=>=> {addr} session {session}");
+        let bytes_owned = match &event {
+            ProtoEvent::Clipboard { .. } => encode_clipboard_event(&event),
+            ProtoEvent::DisplayLayout { .. } => encode_display_layout_event(&event),
+            _ => Ok(Vec::new()),
+        };
+        let bytes_owned = match bytes_owned {
+            Ok(bytes) if !bytes.is_empty() => Some(bytes),
+            Ok(_) => None,
+            Err(e) => {
+                log::warn!("dropping invalid reply to {addr}: {e}");
+                return;
             }
-        }
-    }
-
-    pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
-        if let Some(conn) = self
+        };
+        let bytes_fixed: ([u8; MAX_EVENT_SIZE], usize) = if bytes_owned.is_some() {
+            ([0u8; MAX_EVENT_SIZE], 0)
+        } else {
+            event.into()
+        };
+        let buf: &[u8] = if let Some(bytes) = bytes_owned.as_deref() {
+            bytes
+        } else {
+            &bytes_fixed.0[..bytes_fixed.1]
+        };
+        let conn = self
             .conns
             .lock()
             .await
-            .iter()
-            .find(|(a, _)| *a == addr)
-            .map(|(_, c)| c.clone())
-        {
+            .get(&addr)
+            .filter(|slot| slot.session == session)
+            .map(|slot| slot.conn.clone());
+        if let Some(conn) = conn {
+            let _ = conn.send(buf).await;
+        }
+    }
+
+    pub(crate) async fn get_certificate_fingerprint(
+        &self,
+        addr: SocketAddr,
+        session: ListenerSession,
+    ) -> Option<String> {
+        let conn = self
+            .conns
+            .lock()
+            .await
+            .get(&addr)
+            .filter(|slot| slot.session == session)
+            .map(|slot| slot.conn.clone());
+        if let Some(conn) = conn {
             let conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
             let certs = conn.connection_state().await.peer_certificates;
             let cert = certs.first()?;
@@ -291,7 +381,31 @@ impl Stream for MousehopListener {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.listen_rx.poll_next_unpin(cx)
+        loop {
+            match self.listen_rx.poll_next_unpin(cx) {
+                std::task::Poll::Ready(Some(event)) => {
+                    let current = listen_event_is_current(&self.sessions, &event);
+                    if current {
+                        return std::task::Poll::Ready(Some(event));
+                    }
+                    log::debug!("dropping queued event from a replaced inbound DTLS session");
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
+fn listen_event_is_current(sessions: &ListenerSessions, event: &ListenEvent) -> bool {
+    match event {
+        ListenEvent::Msg { addr, session, .. } | ListenEvent::Accept { addr, session, .. } => {
+            sessions.is_current(*addr, *session)
+        }
+        // The read loop removes the current token before it publishes this
+        // terminal event. Accept it only while no replacement generation has
+        // appeared.
+        ListenEvent::Disconnected { addr, .. } => sessions.current.borrow().get(addr).is_none(),
+        ListenEvent::Rejected { .. } => true,
     }
 }
 
@@ -357,7 +471,8 @@ async fn try_bind_listener(
 fn spawn_accept_task(
     listener: DynListener,
     listen_tx: Sender<ListenEvent>,
-    conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
+    conns: Rc<AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>>,
+    sessions: ListenerSessions,
     connection_attempts: Arc<Mutex<VecDeque<String>>>,
 ) -> JoinHandle<()> {
     spawn_local(async move {
@@ -369,18 +484,43 @@ fn spawn_accept_task(
                 c = listener.accept() => match c {
                     Ok((conn, addr)) => {
                         log::info!("dtls client connected, ip: {addr}");
-                        {
+                        let session = sessions.allocate(addr);
+                        let replaced = {
                             let mut conns_guard = conns.lock().await;
-                            conns_guard.push((addr, conn.clone()));
+                            conns_guard.insert(
+                                addr,
+                                AcceptedConnection {
+                                    session,
+                                    conn: conn.clone(),
+                                },
+                            )
+                        };
+                        if let Some(replaced) = replaced {
+                            log::info!(
+                                "replacing prior DTLS session {} for reused peer address {addr}",
+                                replaced.session
+                            );
+                            let _ = replaced.conn.close().await;
                         }
                         let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
                         let certs = dtls_conn.connection_state().await.peer_certificates;
                         let cert = certs.first().expect("cert");
                         let fingerprint = crypto::generate_fingerprint(cert);
                         listen_tx
-                            .send(ListenEvent::Accept { addr, fingerprint })
+                            .send(ListenEvent::Accept {
+                                addr,
+                                session,
+                                fingerprint,
+                            })
                             .expect("channel closed");
-                        spawn_local(read_loop(conns.clone(), addr, conn, listen_tx.clone()));
+                        spawn_local(read_loop(
+                            conns.clone(),
+                            sessions.clone(),
+                            addr,
+                            session,
+                            conn,
+                            listen_tx.clone(),
+                        ));
                     }
                     Err(e) => {
                         if let Error::Std(ref se) = e {
@@ -421,7 +561,8 @@ fn spawn_supervisor_task(
     cfg: Config,
     initial_listeners: HashMap<IpAddr, ListenerSlot>,
     listen_tx: Sender<ListenEvent>,
-    conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
+    conns: Rc<AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>>,
+    sessions: ListenerSessions,
     connection_attempts: Arc<Mutex<VecDeque<String>>>,
     mut request_port_change_rx: Receiver<u16>,
     port_changed_tx: Sender<Result<u16, ListenerCreationError>>,
@@ -490,6 +631,7 @@ fn spawn_supervisor_task(
                                         l,
                                         listen_tx.clone(),
                                         conns.clone(),
+                                        sessions.clone(),
                                         connection_attempts.clone(),
                                     );
                                     slot.insert(ListenerSlot { accept_task: task });
@@ -520,6 +662,7 @@ fn spawn_supervisor_task(
                                         l,
                                         listen_tx.clone(),
                                         conns.clone(),
+                                        sessions.clone(),
                                         connection_attempts.clone(),
                                     );
                                     listeners.insert(ip, ListenerSlot { accept_task: task });
@@ -562,7 +705,7 @@ fn spawn_supervisor_task(
                             );
                             for (a, c) in g.iter() {
                                 log::debug!("post-wake close: {a}");
-                                let _ = c.close().await;
+                                let _ = c.conn.close().await;
                             }
                         }
                         None => {
@@ -586,6 +729,7 @@ fn spawn_supervisor_task(
                                     l,
                                     listen_tx.clone(),
                                     conns.clone(),
+                                    sessions.clone(),
                                     connection_attempts.clone(),
                                 );
                                 listeners.insert(*ip, ListenerSlot { accept_task: task });
@@ -624,13 +768,16 @@ fn spawn_supervisor_task(
 const RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(8);
 
 async fn read_loop(
-    conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
+    conns: Rc<AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>>,
+    sessions: ListenerSessions,
     addr: SocketAddr,
+    session: ListenerSession,
     conn: ArcConn,
     dtls_tx: Sender<ListenEvent>,
 ) -> Result<(), Error> {
-    // Buffer sized for the largest legal clipboard frame; mouse /
-    // keyboard datagrams use only the first MAX_EVENT_SIZE bytes.
+    // Buffer sized for the largest legal variable-length frame; fixed
+    // mouse/keyboard datagrams use only the first MAX_EVENT_SIZE bytes and
+    // topology remains below the clipboard cap.
     let mut b = [0u8; MAX_CLIPBOARD_SIZE];
 
     // Handshake gate: the peer must present a `Hello` carrying
@@ -658,9 +805,20 @@ async fn read_loop(
         if n == 0 {
             continue;
         }
+        if !accepted_connection_is_current(&conns, addr, session).await {
+            log::debug!("ending replaced inbound DTLS read session {session} for {addr}");
+            break;
+        }
         let datagram = &b[..n];
         match decode_listen_datagram(datagram) {
-            Some(ProtoEvent::Hello { magic, commit }) => {
+            Some(event) if !handshake_allows_event(hello_ok.get(), &event) => {
+                log::debug!("ignoring pre-Hello event from {addr}: {event}");
+            }
+            Some(ProtoEvent::Hello {
+                magic,
+                commit,
+                capabilities,
+            }) => {
                 if magic != PROTOCOL_MAGIC {
                     log::warn!(
                         "refusing {addr}: peer presented a foreign protocol \
@@ -671,13 +829,22 @@ async fn read_loop(
                 hello_ok.set(true);
                 dtls_tx
                     .send(ListenEvent::Msg {
-                        event: ProtoEvent::hello(commit),
+                        event: ProtoEvent::Hello {
+                            magic,
+                            commit,
+                            capabilities,
+                        },
                         addr,
+                        session,
                     })
                     .expect("channel closed");
             }
             Some(event) => dtls_tx
-                .send(ListenEvent::Msg { event, addr })
+                .send(ListenEvent::Msg {
+                    event,
+                    addr,
+                    session,
+                })
                 .expect("channel closed"),
             None => {
                 // Skip the malformed/unknown datagram and keep
@@ -695,18 +862,42 @@ async fn read_loop(
     }
     log::info!("dtls client disconnected {addr:?}");
     let mut conns = conns.lock().await;
-    // A peer reconnecting on the same 4-tuple (common after a
-    // screensaver / sleep cycle) combined with the wake handler's
-    // close-all can leave this slot already evicted by the time the
-    // read loop unwinds. Tolerate a missing entry: a stray `.expect`
-    // here would panic, and `panic = "abort"` would take the whole
-    // daemon down.
-    if let Some(index) = conns.iter().position(|(a, _)| *a == addr) {
-        conns.remove(index);
+    // A peer can reconnect with the same UDP 4-tuple before the old
+    // read loop observes its close. Remove this slot only if it still
+    // belongs to our exact Arc; a stale loop must never evict the
+    // replacement connection.
+    if remove_connection_if_current(&mut conns, addr, session).is_none() {
+        log::debug!("ignoring stale disconnect for replaced DTLS client {addr:?}");
     } else {
-        log::debug!("dtls client {addr:?} already evicted from conns");
+        sessions.remove_if_current(addr, session);
+        drop(conns);
+        let _ = dtls_tx.send(ListenEvent::Disconnected { addr, session });
     }
     Ok(())
+}
+
+async fn accepted_connection_is_current(
+    conns: &AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>,
+    addr: SocketAddr,
+    session: ListenerSession,
+) -> bool {
+    conns
+        .lock()
+        .await
+        .get(&addr)
+        .is_some_and(|slot| slot.session == session)
+}
+
+fn remove_connection_if_current(
+    conns: &mut HashMap<SocketAddr, AcceptedConnection>,
+    addr: SocketAddr,
+    session: ListenerSession,
+) -> Option<AcceptedConnection> {
+    conns
+        .get(&addr)
+        .is_some_and(|current| current.session == session)
+        .then(|| conns.remove(&addr))
+        .flatten()
 }
 
 /// Connection-establishment deadline. A peer that has not presented
@@ -732,17 +923,95 @@ async fn hello_watchdog(addr: SocketAddr, conn: ArcConn, hello_ok: Rc<Cell<bool>
 }
 
 /// Classify a DTLS datagram by its first-byte event-type tag and
-/// route through the variable-length clipboard codec or the fixed-
-/// buffer `try_into` path. Mirrors `decode_proto_datagram` on the
-/// connect side so both directions accept the same wire formats.
+/// route through a variable-length codec or the fixed-buffer `try_into` path.
+/// Mirrors `decode_proto_datagram` on the connect side so both directions
+/// accept the same wire formats.
 fn decode_listen_datagram(bytes: &[u8]) -> Option<ProtoEvent> {
     use mousehop_proto::EventType;
     let tag = *bytes.first()?;
     if tag == EventType::Clipboard as u8 {
         return decode_clipboard_event(bytes).ok();
     }
-    let mut fixed = [0u8; MAX_EVENT_SIZE];
-    let copy_len = bytes.len().min(MAX_EVENT_SIZE);
-    fixed[..copy_len].copy_from_slice(&bytes[..copy_len]);
-    fixed.try_into().ok()
+    if tag == EventType::DisplayLayout as u8 {
+        return decode_display_layout_event(bytes).ok();
+    }
+    decode_fixed_event(bytes).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UdpSocket;
+
+    async fn test_conn() -> ArcConn {
+        Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"))
+    }
+
+    #[tokio::test]
+    async fn stale_same_address_read_loop_cannot_remove_replacement() {
+        let addr: SocketAddr = "127.0.0.1:4242".parse().expect("test address");
+        let replacement = test_conn().await;
+        let old_session = 1;
+        let replacement_session = 2;
+        let mut conns = HashMap::from([(
+            addr,
+            AcceptedConnection {
+                session: replacement_session,
+                conn: replacement.clone(),
+            },
+        )]);
+
+        assert!(remove_connection_if_current(&mut conns, addr, old_session).is_none());
+        assert!(Arc::ptr_eq(
+            &conns.get(&addr).expect("replacement remains").conn,
+            &replacement,
+        ));
+    }
+
+    #[tokio::test]
+    async fn current_read_loop_removes_only_its_connection() {
+        let addr: SocketAddr = "127.0.0.1:4242".parse().expect("test address");
+        let current = test_conn().await;
+        let session = 7;
+        let mut conns = HashMap::from([(
+            addr,
+            AcceptedConnection {
+                session,
+                conn: current.clone(),
+            },
+        )]);
+
+        let removed = remove_connection_if_current(&mut conns, addr, session)
+            .expect("current connection removed");
+        assert_eq!(removed.session, session);
+        assert!(Arc::ptr_eq(&removed.conn, &current));
+        assert!(!conns.contains_key(&addr));
+    }
+
+    #[test]
+    fn queued_old_session_is_filtered_after_same_address_accept() {
+        let addr: SocketAddr = "127.0.0.1:4242".parse().expect("test address");
+        let sessions = ListenerSessions::default();
+        let old = sessions.allocate(addr);
+        let replacement = sessions.allocate(addr);
+
+        assert!(!sessions.is_current(addr, old));
+        assert!(sessions.is_current(addr, replacement));
+    }
+
+    #[test]
+    fn terminal_event_is_dropped_if_same_address_was_replaced() {
+        let addr: SocketAddr = "127.0.0.1:4242".parse().expect("test address");
+        let sessions = ListenerSessions::default();
+        let ended = sessions.allocate(addr);
+        assert!(sessions.remove_if_current(addr, ended));
+        let disconnected = ListenEvent::Disconnected {
+            addr,
+            session: ended,
+        };
+        assert!(listen_event_is_current(&sessions, &disconnected));
+
+        let _replacement = sessions.allocate(addr);
+        assert!(!listen_event_is_current(&sessions, &disconnected));
+    }
 }

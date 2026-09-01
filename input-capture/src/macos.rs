@@ -1,5 +1,6 @@
 use super::{
-    Capture, CaptureError, CaptureEvent, HostInputState, Position, error::MacosCaptureCreationError,
+    Capture, CaptureError, CaptureEvent, HostInputState, Position,
+    error::MacosCaptureCreationError, normalize_cursor_in_layout,
 };
 use async_trait::async_trait;
 use bitflags::bitflags;
@@ -23,6 +24,8 @@ use futures_core::Stream;
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent,
     MACOS_KEEP_AWAKE_EVENT_TAG, PointerEvent,
+    display::{DisplayEdge, DisplayLayout},
+    scancode,
 };
 use keycode::{KeyMap, KeyMapping};
 use libc::c_void;
@@ -49,18 +52,149 @@ struct Bounds {
     ymax: f64,
 }
 
+fn display_edge(position: Position) -> DisplayEdge {
+    match position {
+        Position::Left => DisplayEdge::Left,
+        Position::Right => DisplayEdge::Right,
+        Position::Top => DisplayEdge::Top,
+        Position::Bottom => DisplayEdge::Bottom,
+    }
+}
+
+/// Build the Quartz display layout in the integer logical-point coordinate
+/// space used by cursor events. Floor/ceil retain an entire display if macOS
+/// ever reports fractional bounds while keeping contour operations exact.
+fn display_layout_from_ids(ids: impl IntoIterator<Item = u32>) -> DisplayLayout {
+    DisplayLayout::new(ids.into_iter().filter_map(|id| {
+        let bounds = CGDisplay::new(id).bounds();
+        let left = bounds.origin.x.floor();
+        let top = bounds.origin.y.floor();
+        let right = (bounds.origin.x + bounds.size.width).ceil();
+        let bottom = (bounds.origin.y + bounds.size.height).ceil();
+        if !left.is_finite()
+            || !top.is_finite()
+            || !right.is_finite()
+            || !bottom.is_finite()
+            || left < f64::from(i32::MIN)
+            || top < f64::from(i32::MIN)
+            || right > f64::from(i32::MAX)
+            || bottom > f64::from(i32::MAX)
+        {
+            return None;
+        }
+        let x = left as i32;
+        let y = top as i32;
+        let width = u32::try_from((right - left) as i64).ok()?;
+        let height = u32::try_from((bottom - top) as i64).ok()?;
+        Some((x, y, width, height))
+    }))
+}
+
+fn query_display_layout() -> Result<DisplayLayout, CGError> {
+    CGDisplay::active_displays().map(display_layout_from_ids)
+}
+
+fn layout_bounds(layout: &DisplayLayout) -> Option<Bounds> {
+    let bounds = layout.bounds()?;
+    Some(Bounds {
+        xmin: f64::from(bounds.x()),
+        xmax: f64::from(bounds.right()),
+        ymin: f64::from(bounds.y()),
+        ymax: f64::from(bounds.bottom()),
+    })
+}
+
+fn point_coordinate(value: f64) -> Option<i32> {
+    let value = value.floor();
+    (value.is_finite() && value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX))
+        .then_some(value as i32)
+}
+
+/// Return whether one Quartz mouse event is parked on the actual display
+/// contour while still moving outward.
+///
+/// `CGEvent::location()` is already the current location of this event;
+/// `MOUSE_EVENT_DELTA_*` describes movement since the preceding event. Adding
+/// that delta to the current location predicts a second movement and can fire
+/// early near a stepped monitor seam. WindowServer clamps a real outward move
+/// onto the contour, so the delta is used only for its direction here.
+fn crosses_display_contour(
+    layout: &DisplayLayout,
+    position: Position,
+    location: (f64, f64),
+    delta: (f64, f64),
+) -> bool {
+    if !delta.0.is_finite() || !delta.1.is_finite() {
+        return false;
+    }
+    let Some(desired) = point_coordinate(location.0).zip(point_coordinate(location.1)) else {
+        return false;
+    };
+    let Some(edge_point) = layout.project_point(display_edge(position), desired) else {
+        return false;
+    };
+
+    match position {
+        Position::Left => delta.0 < 0.0 && location.0 <= f64::from(edge_point.0),
+        Position::Right => delta.0 > 0.0 && location.0 >= f64::from(edge_point.0),
+        Position::Top => delta.1 < 0.0 && location.1 <= f64::from(edge_point.1),
+        Position::Bottom => delta.1 > 0.0 && location.1 >= f64::from(edge_point.1),
+    }
+}
+
+/// Cursor anchor used while capture is active. Left/top move one logical
+/// point inward, matching the old exclusive-boundary behavior; the fallback
+/// retains the contour pixel for an unusually one-point-wide display.
+fn capture_anchor(
+    layout: &DisplayLayout,
+    position: Position,
+    location: (f64, f64),
+) -> Option<(f64, f64)> {
+    let desired = point_coordinate(location.0).zip(point_coordinate(location.1))?;
+    let edge = layout.project_point(display_edge(position), desired)?;
+    let inward = match position {
+        Position::Left => (edge.0.saturating_add(1), edge.1),
+        Position::Top => (edge.0, edge.1.saturating_add(1)),
+        Position::Right | Position::Bottom => edge,
+    };
+    let anchor = if layout.rectangles().any(|(_, rect)| rect.contains(inward)) {
+        inward
+    } else {
+        edge
+    };
+    Some((f64::from(anchor.0), f64::from(anchor.1)))
+}
+
 #[derive(Debug)]
 struct InputCaptureState {
     /// active capture positions
     active_clients: Lazy<HashSet<Position>>,
     /// the currently entered capture position, if any
     current_pos: Option<Position>,
+    /// Whether this backend has successfully hidden the Quartz cursor. Keep
+    /// this separate from `current_pos`: a disabled event tap must surrender
+    /// capture ownership before it knows whether showing the cursor succeeded.
+    /// The producer and periodic lifecycle poll can then retry a failed show
+    /// without allowing local input to remain swallowed.
+    cursor_hidden: bool,
+    /// Generation of the most recently observed disabled-tap notification.
+    /// Generations let an older producer completion avoid clearing a newer
+    /// recovery that raced in behind it.
+    tap_recovery_generation: u64,
+    /// While present, the re-enabled event tap passes host input through but
+    /// cannot begin another boundary crossing. This closes the ordering gap
+    /// between the callback's direct `Begin` channel and the producer's later
+    /// `AutoRelease` lifecycle event.
+    tap_recovery_pending: Option<TapRecovery>,
     /// position where the cursor was captured
     enter_position: Option<CGPoint>,
     /// bounds of the input capture area
     bounds: Bounds,
-    /// current state of modifier keys
-    modifier_state: XMods,
+    /// Every active display rectangle in Quartz's global logical-point space.
+    /// Boundary detection uses this contour rather than treating the bounding
+    /// union as a filled rectangle, which would create dead edges in stepped
+    /// multi-monitor layouts.
+    display_layout: DisplayLayout,
 }
 
 #[derive(Debug)]
@@ -76,9 +210,103 @@ enum ProducerEvent {
     Create(Position),
     Destroy(Position),
     Grab(Position),
-    EventTapDisabled,
+    EventTapDisabled {
+        recovery_generation: u64,
+        interrupted_pos: Option<Position>,
+    },
     ScreenUnlocked,
     DisplayReconfigured,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TapRecovery {
+    generation: u64,
+    /// Capture edge whose direct-channel `Begin` needs a matching
+    /// `AutoRelease`. This may be filled later by a `Grab` that was queued
+    /// immediately before the disabled-tap notification.
+    interrupted_pos: Option<Position>,
+    /// Set while holding the shared state lock before publishing AutoRelease.
+    /// Carrying this bit into a superseding recovery generation prevents two
+    /// rapid tap-disable notifications from releasing the same Begin twice.
+    auto_release_claimed: bool,
+}
+
+/// Stop callback-side capture ownership while preserving the interrupted edge
+/// for the producer task's wire-visible cleanup. This transition must happen
+/// before a disabled event tap is re-enabled: otherwise a racing event can
+/// still see `current_pos` and be swallowed as captured input.
+fn event_tap_disabled_transition(
+    current_pos: &mut Option<Position>,
+    recovery_generation: &mut u64,
+    recovery_pending: &mut Option<TapRecovery>,
+) -> ProducerEvent {
+    *recovery_generation = recovery_generation.wrapping_add(1);
+    if *recovery_generation == 0 {
+        *recovery_generation = 1;
+    }
+    let previous = recovery_pending.take();
+    let interrupted_pos = current_pos
+        .take()
+        .or(previous.and_then(|recovery| recovery.interrupted_pos));
+    let auto_release_claimed = previous.is_some_and(|recovery| recovery.auto_release_claimed);
+    *recovery_pending = Some(TapRecovery {
+        generation: *recovery_generation,
+        interrupted_pos,
+        auto_release_claimed,
+    });
+    ProducerEvent::EventTapDisabled {
+        recovery_generation: *recovery_generation,
+        interrupted_pos,
+    }
+}
+
+fn complete_event_tap_recovery(pending: &mut Option<TapRecovery>, generation: u64) -> bool {
+    if pending.as_ref().map(|recovery| recovery.generation) != Some(generation) {
+        return false;
+    }
+    *pending = None;
+    true
+}
+
+fn defer_grab_during_tap_recovery(pending: &mut Option<TapRecovery>, position: Position) -> bool {
+    let Some(recovery) = pending.as_mut() else {
+        return false;
+    };
+    recovery.interrupted_pos.get_or_insert(position);
+    true
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TapRecoveryClaim {
+    SupersededOrClaimed,
+    NoCapture,
+    AutoRelease(Position),
+}
+
+fn claim_tap_recovery_auto_release(
+    pending: &mut Option<TapRecovery>,
+    generation: u64,
+) -> TapRecoveryClaim {
+    let Some(recovery) = pending
+        .as_mut()
+        .filter(|recovery| recovery.generation == generation)
+    else {
+        return TapRecoveryClaim::SupersededOrClaimed;
+    };
+    if recovery.auto_release_claimed {
+        return TapRecoveryClaim::SupersededOrClaimed;
+    }
+    let Some(position) = recovery.interrupted_pos else {
+        return TapRecoveryClaim::NoCapture;
+    };
+    recovery.auto_release_claimed = true;
+    TapRecoveryClaim::AutoRelease(position)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ProducerOutcome {
+    host_input_state: Option<HostInputState>,
+    auto_release: Option<Position>,
 }
 
 impl InputCaptureState {
@@ -86,12 +314,23 @@ impl InputCaptureState {
         let mut res = Self {
             active_clients: Lazy::new(HashSet::new),
             current_pos: None,
+            cursor_hidden: false,
+            tap_recovery_generation: 0,
+            tap_recovery_pending: None,
             enter_position: None,
             bounds: Bounds::default(),
-            modifier_state: Default::default(),
+            display_layout: DisplayLayout::default(),
         };
         res.update_bounds()?;
         Ok(res)
+    }
+
+    fn begin_event_tap_recovery(&mut self) -> ProducerEvent {
+        event_tap_disabled_transition(
+            &mut self.current_pos,
+            &mut self.tap_recovery_generation,
+            &mut self.tap_recovery_pending,
+        )
     }
 
     fn crossed(&mut self, event: &CGEvent) -> Option<Position> {
@@ -100,11 +339,12 @@ impl InputCaptureState {
         let relative_y = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
 
         for &position in self.active_clients.iter() {
-            if (position == Position::Left && (location.x + relative_x) <= self.bounds.xmin)
-                || (position == Position::Right && (location.x + relative_x) >= self.bounds.xmax)
-                || (position == Position::Top && (location.y + relative_y) <= self.bounds.ymin)
-                || (position == Position::Bottom && (location.y + relative_y) >= self.bounds.ymax)
-            {
+            if crosses_display_contour(
+                &self.display_layout,
+                position,
+                (location.x, location.y),
+                (relative_x, relative_y),
+            ) {
                 log::debug!("Crossed barrier into position: {position:?}");
                 return Some(position);
             }
@@ -114,56 +354,58 @@ impl InputCaptureState {
 
     // Get the max bounds of all displays
     fn update_bounds(&mut self) -> Result<(), MacosCaptureCreationError> {
-        let active_ids =
-            CGDisplay::active_displays().map_err(MacosCaptureCreationError::ActiveDisplays)?;
+        let layout = query_display_layout().map_err(MacosCaptureCreationError::ActiveDisplays)?;
 
-        // Recompute from scratch every call. Folding into the previous
-        // `self.bounds` (the old behavior) meant `xmax`/`ymax` could
-        // only ever grow — so removing a large display (e.g. clamshell
-        // on a 6K external → lid-open built-in) left a stale, too-wide
-        // `xmax`, and the rightmost band of the real screen became an
-        // unreachable dead zone (`crossed`/`start_capture` clamp to it).
-        // Seeding with infinities lets the bounds shrink, and also fixes
-        // the first-call case for displays with a negative origin (the
-        // old `Bounds::default()` seed of 0.0 was wrong there too).
-        let mut bounds = Bounds {
-            xmin: f64::INFINITY,
-            xmax: f64::NEG_INFINITY,
-            ymin: f64::INFINITY,
-            ymax: f64::NEG_INFINITY,
-        };
-        active_ids.iter().for_each(|d| {
-            let b = CGDisplay::new(*d).bounds();
-            bounds.xmin = bounds.xmin.min(b.origin.x);
-            bounds.xmax = bounds.xmax.max(b.origin.x + b.size.width);
-            bounds.ymin = bounds.ymin.min(b.origin.y);
-            bounds.ymax = bounds.ymax.max(b.origin.y + b.size.height);
-        });
-
-        // Only commit if at least one display contributed. A transient
-        // zero-display snapshot mid-reconfiguration would otherwise
-        // leave ±infinity bounds; keep the previous bounds instead.
-        if bounds.xmax.is_finite() && bounds.ymax.is_finite() {
-            self.bounds = bounds;
-        } else {
-            log::warn!("update_bounds: no active displays; keeping previous bounds");
-        }
-
+        self.commit_display_layout(layout);
         log::debug!("Updated displays bounds: {0:?}", self.bounds);
         Ok(())
     }
 
+    /// Commit one complete geometry generation. If a monitor changes while
+    /// capture is active, move the hidden-cursor anchor onto the equivalent
+    /// cross-axis point of the new contour before the next event resets it.
+    /// Otherwise an unplugged/rearranged display leaves `enter_position`
+    /// pointing into empty space for the rest of the capture session.
+    fn commit_display_layout(&mut self, layout: DisplayLayout) -> bool {
+        // Only commit a complete, non-empty snapshot. A transient zero-display
+        // result during reconfiguration otherwise destroys every capture
+        // edge; retaining the last good topology self-heals at the next poll.
+        let Some(bounds) = layout_bounds(&layout) else {
+            log::warn!("update_bounds: no usable active displays; keeping previous topology");
+            return false;
+        };
+
+        let geometry_changed = layout != self.display_layout;
+        let refreshed_anchor = geometry_changed
+            .then(|| self.current_pos.zip(self.enter_position))
+            .flatten()
+            .and_then(|(position, anchor)| {
+                capture_anchor(&layout, position, (anchor.x, anchor.y))
+                    .map(|(x, y)| CGPoint { x, y })
+            });
+        self.display_layout = layout;
+        self.bounds = bounds;
+        if let Some(anchor) = refreshed_anchor {
+            log::info!(
+                "display changed during capture; moved hidden cursor anchor to ({:.0}, {:.0})",
+                anchor.x,
+                anchor.y,
+            );
+            self.enter_position = Some(anchor);
+        }
+        true
+    }
+
     /// start the input capture by
     fn start_capture(&mut self, event: &CGEvent, position: Position) -> Result<(), CaptureError> {
-        let mut location = event.location();
-        let edge_offset = 1.0;
-        // move cursor location to display bounds
-        match position {
-            Position::Left => location.x = self.bounds.xmin + edge_offset,
-            Position::Right => location.x = self.bounds.xmax - edge_offset,
-            Position::Top => location.y = self.bounds.ymin + edge_offset,
-            Position::Bottom => location.y = self.bounds.ymax - edge_offset,
-        };
+        let event_location = event.location();
+        let (x, y) = capture_anchor(
+            &self.display_layout,
+            position,
+            (event_location.x, event_location.y),
+        )
+        .ok_or(CaptureError::DisplayTopologyUnavailable)?;
+        let location = CGPoint { x, y };
         self.enter_position = Some(location);
         self.reset_cursor()
     }
@@ -175,31 +417,52 @@ impl InputCaptureState {
         CGDisplay::warp_mouse_cursor_position(pos).map_err(CaptureError::WarpCursor)
     }
 
-    fn hide_cursor(&self) -> Result<(), CaptureError> {
-        CGDisplay::hide_cursor(&CGDisplay::main()).map_err(CaptureError::CoreGraphics)
+    fn hide_cursor(&mut self) -> Result<(), CaptureError> {
+        if self.cursor_hidden {
+            return Ok(());
+        }
+        CGDisplay::hide_cursor(&CGDisplay::main()).map_err(CaptureError::CoreGraphics)?;
+        self.cursor_hidden = true;
+        Ok(())
     }
 
-    fn show_cursor(&self) -> Result<(), CaptureError> {
-        CGDisplay::show_cursor(&CGDisplay::main()).map_err(CaptureError::CoreGraphics)
+    fn show_cursor(&mut self) -> Result<(), CaptureError> {
+        if !self.cursor_hidden {
+            return Ok(());
+        }
+        CGDisplay::show_cursor(&CGDisplay::main()).map_err(CaptureError::CoreGraphics)?;
+        self.cursor_hidden = false;
+        Ok(())
+    }
+
+    /// A display/session transition can make the first show request fail. Once
+    /// capture ownership is gone, retry opportunistically so the cursor cannot
+    /// remain hidden until the whole backend is recreated.
+    fn retry_show_cursor_if_unowned(&mut self, context: &str) {
+        if self.current_pos.is_none() && self.cursor_hidden {
+            if let Err(error) = self.show_cursor() {
+                log::warn!("failed to show cursor during {context}; will retry: {error}");
+            }
+        }
     }
 
     async fn handle_producer_event(
         &mut self,
         producer_event: ProducerEvent,
-    ) -> Result<Option<HostInputState>, CaptureError> {
+    ) -> Result<ProducerOutcome, CaptureError> {
         log::debug!("handling event: {producer_event:?}");
+        let mut outcome = ProducerOutcome::default();
         match producer_event {
             ProducerEvent::Release { warp_target } => {
                 log::info!(
                     "[release-warp] handle_producer_event Release: current_pos={:?} warp_target={warp_target:?}",
                     self.current_pos
                 );
-                if self.current_pos.is_some() {
-                    // Warp BEFORE clearing current_pos so the
-                    // event-tap callback can't see Some(pos) and
-                    // re-snap the cursor to the entry edge before we
-                    // make it visible again. Then show_cursor() reveals
-                    // it at the warped point.
+                if self.current_pos.take().is_some() {
+                    // We hold the callback's state mutex for this whole
+                    // transition, so clearing ownership first prevents any
+                    // later callback from swallowing input. Warp while the
+                    // cursor is still hidden, then reveal it at that point.
                     if let Some((x, y)) = warp_target {
                         log::info!("[release-warp] warping local cursor to ({x}, {y})");
                         if let Err(e) = CGDisplay::warp_mouse_cursor_position(CGPoint {
@@ -210,11 +473,23 @@ impl InputCaptureState {
                         }
                     }
                     self.show_cursor()?;
-                    self.current_pos = None;
+                } else {
+                    // A disabled-tap transition clears `current_pos`
+                    // synchronously. If its first show request failed, the
+                    // ordinary outer release is another chance to repair it.
+                    self.retry_show_cursor_if_unowned("capture release");
                 }
             }
             ProducerEvent::Grab(pos) => {
-                if self.current_pos.is_none() {
+                if defer_grab_during_tap_recovery(&mut self.tap_recovery_pending, pos) {
+                    // `Begin` travels on the direct event channel, while Grab
+                    // travels on the producer channel. A tap disable can set
+                    // the shared recovery gate after Begin but before this
+                    // queued Grab is consumed. Record the edge for the
+                    // disabled event's AutoRelease, but do not re-hide the
+                    // cursor or restore capture ownership.
+                    log::debug!("discarding queued Grab({pos:?}) during CGEventTap recovery");
+                } else if self.current_pos.is_none() {
                     self.hide_cursor()?;
                     self.current_pos = Some(pos);
                 }
@@ -223,22 +498,36 @@ impl InputCaptureState {
                 self.active_clients.insert(p);
             }
             ProducerEvent::Destroy(p) => {
-                if let Some(current) = self.current_pos {
-                    if current == p {
-                        self.show_cursor()?;
-                        self.current_pos = None;
-                    };
-                }
                 self.active_clients.remove(&p);
+                if self.current_pos == Some(p) {
+                    self.current_pos = None;
+                    self.show_cursor()?;
+                }
             }
-            ProducerEvent::EventTapDisabled => {
+            ProducerEvent::EventTapDisabled {
+                recovery_generation,
+                interrupted_pos: _,
+            } => {
                 // Tap death can happen mid-capture (TCC Accessibility
                 // revoked, tap-timeout, etc). Release state so we
                 // don't leave the cursor hidden even if the outer
                 // task only logs this error rather than propagating.
-                if self.current_pos.is_some() {
-                    self.show_cursor()?;
-                    self.current_pos = None;
+                if let Some(pos) = self.current_pos.take() {
+                    if let Some(recovery) = self.tap_recovery_pending.as_mut() {
+                        recovery.interrupted_pos.get_or_insert(pos);
+                    }
+                }
+                self.retry_show_cursor_if_unowned("disabled event-tap cleanup");
+
+                let recovery_claim = claim_tap_recovery_auto_release(
+                    &mut self.tap_recovery_pending,
+                    recovery_generation,
+                );
+                if let TapRecoveryClaim::AutoRelease(pos) = recovery_claim {
+                    // The helper claims before this task drops the shared state
+                    // lock to publish. A superseding disabled notification
+                    // carries the claim and cannot release this Begin twice.
+                    outcome.auto_release = Some(pos);
                 }
                 // A tap disabled while the host screen is locked is
                 // the lock screen's secure-input mode, not a
@@ -254,7 +543,8 @@ impl InputCaptureState {
                     log::info!(
                         "CGEventTap disabled while screen locked — will re-enable on unlock"
                     );
-                    return Ok(Some(HostInputState::Locked));
+                    outcome.host_input_state = Some(HostInputState::Locked);
+                    return Ok(outcome);
                 }
                 // Distinguish AX revocation from a recoverable cause
                 // (secure-input mode while typing in a password field
@@ -275,7 +565,9 @@ impl InputCaptureState {
                     );
                     std::process::exit(0);
                 }
-                return Err(CaptureError::EventTapDisabled);
+                if recovery_claim == TapRecoveryClaim::NoCapture {
+                    return Err(CaptureError::EventTapDisabled);
+                }
             }
             ProducerEvent::ScreenUnlocked => {
                 // The distributed notification is authoritative in normal
@@ -286,7 +578,9 @@ impl InputCaptureState {
                 if is_screen_locked() {
                     log::warn!("screen-unlocked notification arrived while session still locked");
                 } else {
-                    return Ok(Some(HostInputState::Unlocked));
+                    self.retry_show_cursor_if_unowned("screen unlock");
+                    outcome.host_input_state = Some(HostInputState::Unlocked);
+                    return Ok(outcome);
                 }
             }
             ProducerEvent::DisplayReconfigured => {
@@ -304,7 +598,7 @@ impl InputCaptureState {
                 }
             }
         };
-        Ok(None)
+        Ok(outcome)
     }
 }
 
@@ -324,11 +618,127 @@ async fn publish_host_input_state(
     }
 }
 
+// Device-dependent modifier bits from IOKit/hidsystem/IOLLEvent.h. Unlike
+// Quartz's device-independent Shift/Control/Alternate/Command flags, these
+// identify both the side and the current physical state. A FlagsChanged event
+// can therefore be decoded without comparing a potentially stale aggregate
+// mask (and while both keys of the same modifier are held).
+const NX_DEVICE_LCTRL_KEY_MASK: u64 = 0x0000_0001;
+const NX_DEVICE_LSHIFT_KEY_MASK: u64 = 0x0000_0002;
+const NX_DEVICE_RSHIFT_KEY_MASK: u64 = 0x0000_0004;
+const NX_DEVICE_LCOMMAND_KEY_MASK: u64 = 0x0000_0008;
+const NX_DEVICE_RCOMMAND_KEY_MASK: u64 = 0x0000_0010;
+const NX_DEVICE_LALT_KEY_MASK: u64 = 0x0000_0020;
+const NX_DEVICE_RALT_KEY_MASK: u64 = 0x0000_0040;
+const NX_DEVICE_RCTRL_KEY_MASK: u64 = 0x0000_2000;
+
+const STANDARD_MODIFIER_KEYS: [(scancode::Linux, u64); 8] = [
+    (scancode::Linux::KeyLeftShift, NX_DEVICE_LSHIFT_KEY_MASK),
+    (scancode::Linux::KeyRightShift, NX_DEVICE_RSHIFT_KEY_MASK),
+    (scancode::Linux::KeyLeftCtrl, NX_DEVICE_LCTRL_KEY_MASK),
+    (scancode::Linux::KeyRightCtrl, NX_DEVICE_RCTRL_KEY_MASK),
+    (scancode::Linux::KeyLeftAlt, NX_DEVICE_LALT_KEY_MASK),
+    (scancode::Linux::KeyRightalt, NX_DEVICE_RALT_KEY_MASK),
+    (scancode::Linux::KeyLeftMeta, NX_DEVICE_LCOMMAND_KEY_MASK),
+    (scancode::Linux::KeyRightmeta, NX_DEVICE_RCOMMAND_KEY_MASK),
+];
+
+fn modifier_masks(flags: CGEventFlags) -> (XMods, XMods) {
+    let mut depressed = XMods::empty();
+    let mut locked = XMods::empty();
+
+    if flags.contains(CGEventFlags::CGEventFlagShift) {
+        depressed |= XMods::ShiftMask;
+    }
+    if flags.contains(CGEventFlags::CGEventFlagControl) {
+        depressed |= XMods::ControlMask;
+    }
+    if flags.contains(CGEventFlags::CGEventFlagAlternate) {
+        depressed |= XMods::Mod1Mask;
+    }
+    if flags.contains(CGEventFlags::CGEventFlagCommand) {
+        depressed |= XMods::Mod4Mask;
+    }
+    if flags.contains(CGEventFlags::CGEventFlagAlphaShift) {
+        locked |= XMods::LockMask;
+    }
+
+    (depressed, locked)
+}
+
+/// Snapshot the post-remapping modifier state carried by the mouse event that
+/// crossed the boundary. A Session event tap sees Karabiner's virtual-HID
+/// output, so these are deliberately the logical keys macOS currently exposes
+/// rather than an attempt to bypass the user's remaps.
+fn modifier_snapshot(flags: CGEventFlags) -> Vec<CaptureEvent> {
+    let mut events = STANDARD_MODIFIER_KEYS
+        .into_iter()
+        .filter(|(_, mask)| flags.bits() & mask != 0)
+        .map(|(key, _)| {
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key: key as u32,
+                state: 1,
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    let (depressed, locked) = modifier_masks(flags);
+    events.push(CaptureEvent::Input(Event::Keyboard(
+        KeyboardEvent::Modifiers {
+            depressed: depressed.bits(),
+            latched: 0,
+            locked: locked.bits(),
+            group: 0,
+        },
+    )));
+    events
+}
+
+fn modifier_key_state(key: u32, flags: CGEventFlags) -> u8 {
+    use scancode::Linux::{
+        KeyCapsLock, KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift, KeyRightCtrl,
+        KeyRightShift, KeyRightalt, KeyRightmeta,
+    };
+
+    let Ok(key) = scancode::Linux::try_from(key) else {
+        return 0;
+    };
+
+    let device_mask = match key {
+        KeyLeftCtrl => NX_DEVICE_LCTRL_KEY_MASK,
+        KeyLeftShift => NX_DEVICE_LSHIFT_KEY_MASK,
+        KeyRightShift => NX_DEVICE_RSHIFT_KEY_MASK,
+        KeyLeftMeta => NX_DEVICE_LCOMMAND_KEY_MASK,
+        KeyRightmeta => NX_DEVICE_RCOMMAND_KEY_MASK,
+        KeyLeftAlt => NX_DEVICE_LALT_KEY_MASK,
+        KeyRightalt => NX_DEVICE_RALT_KEY_MASK,
+        KeyRightCtrl => NX_DEVICE_RCTRL_KEY_MASK,
+        // Caps Lock is handled as an atomic down/up tap by `get_events`.
+        KeyCapsLock => return 0,
+        // Fn/Globe has no evdev mapping in the shared keycode table and is not
+        // synthesized here. Any future FlagsChanged key must get an explicit
+        // physical-state source rather than reviving aggregate-mask ordering.
+        _ => return 0,
+    };
+
+    u8::from(flags.bits() & device_mask != 0)
+}
+
+fn modifier_key_states(key: u32, flags: CGEventFlags) -> ([u8; 2], usize) {
+    let is_caps_lock =
+        scancode::Linux::try_from(key).is_ok_and(|key| key == scancode::Linux::KeyCapsLock);
+    if is_caps_lock {
+        ([1, 0], 2)
+    } else {
+        ([modifier_key_state(key, flags), 0], 1)
+    }
+}
+
 fn get_events(
     ev_type: &CGEventType,
     ev: &CGEvent,
     result: &mut Vec<CaptureEvent>,
-    modifier_state: &mut XMods,
 ) -> Result<(), CaptureError> {
     fn map_pointer_event(ev: &CGEvent) -> PointerEvent {
         PointerEvent::Motion {
@@ -374,38 +784,22 @@ fn get_events(
             })));
         }
         CGEventType::FlagsChanged => {
-            let mut depressed = XMods::empty();
-            let mut mods_locked = XMods::empty();
             let cg_flags = ev.get_flags();
-
-            if cg_flags.contains(CGEventFlags::CGEventFlagShift) {
-                depressed |= XMods::ShiftMask;
-            }
-            if cg_flags.contains(CGEventFlags::CGEventFlagControl) {
-                depressed |= XMods::ControlMask;
-            }
-            if cg_flags.contains(CGEventFlags::CGEventFlagAlternate) {
-                depressed |= XMods::Mod1Mask;
-            }
-            if cg_flags.contains(CGEventFlags::CGEventFlagCommand) {
-                depressed |= XMods::Mod4Mask;
-            }
-            if cg_flags.contains(CGEventFlags::CGEventFlagAlphaShift) {
-                depressed |= XMods::LockMask;
-                mods_locked |= XMods::LockMask;
-            }
-
-            // check if pressed or released
-            let state = if depressed > *modifier_state { 1 } else { 0 };
-            *modifier_state = depressed;
+            let (depressed, mods_locked) = modifier_masks(cg_flags);
 
             if let Ok(key) = map_key(ev) {
-                let key_event = CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
-                    time: 0,
-                    key,
-                    state,
+                // macOS emits one FlagsChanged event per Caps Lock toggle,
+                // not separate physical down/up events. `modifier_key_states`
+                // returns an atomic tap for Caps on both toggle-on and
+                // toggle-off; standard modifiers return their one live phase.
+                let (states, count) = modifier_key_states(key, cg_flags);
+                result.extend(states[..count].iter().map(|&state| {
+                    CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                        time: 0,
+                        key,
+                        state,
+                    }))
                 }));
-                result.push(key_event);
             }
 
             let modifier_event = KeyboardEvent::Modifiers {
@@ -612,7 +1006,7 @@ fn create_event_tap<'a>(
     // because raw pointers aren't `Send`, but the integer
     // representation is — and CGEventTapEnable is documented as
     // thread-safe. Set immediately after CGEventTap::new returns;
-    // read by the callback to recover from a TapDisabledByTimeout.
+    // read by the callback to recover from either disabled-tap notification.
     let tap_mach_port: Arc<OnceLock<usize>> = Arc::new(OnceLock::new());
     let tap_mach_port_cb = Arc::clone(&tap_mach_port);
 
@@ -651,65 +1045,64 @@ fn create_event_tap<'a>(
         let mut capture_position = None;
         let mut res_events = vec![];
 
-        if matches!(event_type, CGEventType::TapDisabledByTimeout) {
-            // The kernel disables the tap when our callback runs
-            // longer than ~1s on a single event — typical causes
-            // are heavy load, scheduler contention, or this
-            // process being briefly suspended (e.g. App Nap on a
-            // long idle). It is NOT a fatal condition: Apple's
-            // documented recovery is to call CGEventTapEnable
-            // and resume processing. Re-enable in place and KEEP
-            // existing capture state so the user doesn't see the
-            // cursor pop back to the local screen mid-session.
+        if matches!(
+            event_type,
+            CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+        ) {
+            // A disabled tap cannot safely retain capture ownership. Even a
+            // recoverable timeout creates a gap in the forwarded input stream;
+            // keeping `current_pos` would swallow local events after Quartz
+            // resumes and could leave wire-visible keys held on the peer.
+            // Clear capture state and reveal the cursor synchronously, then
+            // queue AutoRelease cleanup before asking Quartz to re-enable the
+            // tap. The user-input path uses the same ordering for secure-input
+            // and Accessibility transitions.
+            let reason = match event_type {
+                CGEventType::TapDisabledByTimeout => "timeout",
+                CGEventType::TapDisabledByUserInput => "user input",
+                _ => unreachable!("non-disabled event entered disabled-tap handling"),
+            };
+            log::warn!("CGEventTap disabled by {reason} — releasing capture state");
+            let producer_event = state.begin_event_tap_recovery();
+            let interrupted_pos = match &producer_event {
+                ProducerEvent::EventTapDisabled {
+                    interrupted_pos, ..
+                } => *interrupted_pos,
+                _ => unreachable!("tap-disabled transition returned the wrong event"),
+            };
+            if let Some(Err(error)) = interrupted_pos.map(|_| state.show_cursor()) {
+                log::error!("failed to show cursor after CGEventTap disable: {error}");
+            }
+
+            // Never block the producer while holding its state mutex: it must
+            // acquire the same lock to turn this event into AutoRelease.
+            drop(state);
+            notify_tx
+                .blocking_send(producer_event)
+                .unwrap_or_else(|error| {
+                    log::error!("failed to send CGEventTap-disabled notification: {error}");
+                });
+
+            // Re-enable last so no racing callback observes the stale capture
+            // state and so the producer cleanup is already queued if Quartz
+            // immediately delivers another event.
             if let Some(&port) = tap_mach_port_cb.get() {
-                log::warn!("CGEventTap disabled by timeout — re-enabling");
+                log::warn!("requesting CGEventTap re-enable after {reason}");
                 unsafe {
                     CGEventTapEnable(port as *mut c_void, true);
                 }
             } else {
                 log::error!(
-                    "CGEventTap disabled by timeout, but mach port not yet stored — cannot re-enable"
+                    "CGEventTap disabled by {reason}, but mach port is unavailable for re-enable"
                 );
             }
-            return CallbackResult::Keep;
-        }
-
-        if matches!(event_type, CGEventType::TapDisabledByUserInput) {
-            // Deliberate kill — secure-input mode (e.g. password
-            // field), TCC Accessibility revoked mid-session, or
-            // the user disabling event-monitoring. We can't
-            // recover from this; drop captured state synchronously
-            // and return Keep on this event. Otherwise the
-            // `current_pos.is_some()` branch below would drop this
-            // event (and any racing callback still in flight) back
-            // into `CallbackResult::Drop`, silently eating the
-            // user's clicks and keypresses while the tap winds
-            // down. Clear state + show the cursor here, then
-            // notify the producer loop so the service can tear
-            // down cleanly.
-            log::error!("CGEventTap disabled by user input, releasing capture state");
-            if state.current_pos.is_some() {
-                let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                state.current_pos = None;
-            }
-            notify_tx
-                .blocking_send(ProducerEvent::EventTapDisabled)
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to send notification: {e}");
-                });
             return CallbackResult::Keep;
         }
 
         // Are we in a client?
         if let Some(current_pos) = state.current_pos {
             capture_position = Some(current_pos);
-            get_events(
-                &event_type,
-                cg_ev,
-                &mut res_events,
-                &mut state.modifier_state,
-            )
-            .unwrap_or_else(|e| {
+            get_events(&event_type, cg_ev, &mut res_events).unwrap_or_else(|e| {
                 log::error!("Failed to get events: {e}");
             });
 
@@ -723,7 +1116,9 @@ fn create_event_tap<'a>(
             ) {
                 state.reset_cursor().unwrap_or_else(|e| log::warn!("{e}"));
             }
-        } else if matches!(event_type, CGEventType::MouseMoved) {
+        } else if matches!(event_type, CGEventType::MouseMoved)
+            && state.tap_recovery_pending.is_none()
+        {
             // Did we cross a barrier?
             if let Some(new_pos) = state.crossed(cg_ev) {
                 // About to commit the cross — final gate: skip if the
@@ -745,11 +1140,22 @@ fn create_event_tap<'a>(
                     // this for the visually-corresponding warp on Enter
                     // so the cursor doesn't jump to the entry-edge midpoint.
                     let cross_loc = cg_ev.location();
-                    let cursor = Some((cross_loc.x as i32, cross_loc.y as i32));
+                    let cursor_point = (cross_loc.x as i32, cross_loc.y as i32);
+                    let normalized_cursor =
+                        normalize_cursor_in_layout(&state.display_layout, cursor_point);
+                    let cursor = Some(cursor_point);
                     state
                         .start_capture(cg_ev, new_pos)
                         .unwrap_or_else(|e| log::warn!("{e}"));
-                    res_events.push(CaptureEvent::Begin { cursor });
+                    // The crossing is a MouseMoved event, but Quartz carries
+                    // the currently-held per-side modifier device bits on it.
+                    // Emit this snapshot immediately after Begin so modifiers
+                    // held before crossing are represented on the peer too.
+                    res_events.push(CaptureEvent::Begin {
+                        cursor,
+                        normalized_cursor,
+                    });
+                    res_events.extend(modifier_snapshot(cg_ev.get_flags()));
                     notify_tx
                         .blocking_send(ProducerEvent::Grab(new_pos))
                         .expect("Failed to send notification");
@@ -814,7 +1220,7 @@ fn create_event_tap<'a>(
     .map_err(|_| MacosCaptureCreationError::EventTapCreation)?;
 
     // Hand the mach port pointer to the callback so it can re-enable
-    // the tap on TapDisabledByTimeout. The pointer is valid for the
+    // the tap after a disabled-tap notification. The pointer is valid for the
     // lifetime of `tap` (which lives on the event-tap thread until
     // the run loop exits).
     let port_ptr = tap.mach_port().as_concrete_TypeRef() as usize;
@@ -1203,25 +1609,62 @@ impl MacOSInputCapture {
                         let Some(producer_event) = producer_event else {
                             break;
                         };
-                        let mut state = state.lock().await;
-                        let transition = match state.handle_producer_event(producer_event).await {
-                            Ok(Some(next)) if next != last_host_input_state => {
-                                last_host_input_state = next;
-                                Some((next, state.active_clients.iter().copied().collect()))
-                            }
-                            Ok(_) => None,
+                        let tap_recovery_generation = match &producer_event {
+                            ProducerEvent::EventTapDisabled {
+                                recovery_generation,
+                                ..
+                            } => Some(*recovery_generation),
+                            _ => None,
+                        };
+                        let mut capture_state = state.lock().await;
+                        let outcome = match capture_state.handle_producer_event(producer_event).await {
+                            Ok(outcome) => outcome,
                             Err(e) => {
                                 log::error!("Failed to handle producer event: {e}");
-                                None
+                                ProducerOutcome::default()
                             }
                         };
-                        drop(state);
+                        let transition = match outcome.host_input_state {
+                            Some(next) if next != last_host_input_state => {
+                                last_host_input_state = next;
+                                Some((
+                                    next,
+                                    capture_state.active_clients.iter().copied().collect(),
+                                ))
+                            }
+                            _ => None,
+                        };
+                        let auto_release = outcome.auto_release;
+                        drop(capture_state);
+                        if let Some(pos) = auto_release {
+                            if lifecycle_event_tx
+                                .send((pos, CaptureEvent::AutoRelease))
+                                .await
+                                .is_err()
+                            {
+                                log::debug!(
+                                    "outer capture task exited before tap interruption was delivered"
+                                );
+                            }
+                        }
                         if let Some((next, positions)) = transition {
                             publish_host_input_state(&lifecycle_event_tx, positions, next).await;
+                        }
+                        if let Some(generation) = tap_recovery_generation {
+                            let mut state = state.lock().await;
+                            if complete_event_tap_recovery(
+                                &mut state.tap_recovery_pending,
+                                generation,
+                            ) {
+                                log::debug!(
+                                    "completed CGEventTap recovery generation {generation}"
+                                );
+                            }
                         }
                     }
                     _ = bounds_poll.tick() => {
                         let mut state = state.lock().await;
+                        state.retry_show_cursor_if_unowned("periodic lifecycle poll");
                         let prev = state.bounds;
                         match state.update_bounds() {
                             Ok(()) if state.bounds != prev => log::info!(
@@ -1336,6 +1779,417 @@ mod permission_tests {
     }
 }
 
+#[cfg(test)]
+mod event_tap_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_tap_transition_clears_capture_and_reports_it_exactly_once() {
+        let mut current_pos = Some(Position::Bottom);
+        let mut generation = 0;
+        let mut pending = None;
+
+        let first = event_tap_disabled_transition(&mut current_pos, &mut generation, &mut pending);
+        assert_eq!(current_pos, None);
+        assert_eq!(generation, 1);
+        assert_eq!(
+            pending,
+            Some(TapRecovery {
+                generation: 1,
+                interrupted_pos: Some(Position::Bottom),
+                auto_release_claimed: false,
+            })
+        );
+        assert!(matches!(
+            first,
+            ProducerEvent::EventTapDisabled {
+                recovery_generation: 1,
+                interrupted_pos: Some(Position::Bottom)
+            }
+        ));
+
+        // A second disabled notification before another Begin must not emit a
+        // duplicate AutoRelease for capture ownership already surrendered, but
+        // it does supersede the first recovery gate.
+        let second = event_tap_disabled_transition(&mut current_pos, &mut generation, &mut pending);
+        assert_eq!(generation, 2);
+        assert_eq!(
+            pending,
+            Some(TapRecovery {
+                generation: 2,
+                interrupted_pos: Some(Position::Bottom),
+                auto_release_claimed: false,
+            })
+        );
+        assert!(matches!(
+            second,
+            ProducerEvent::EventTapDisabled {
+                recovery_generation: 2,
+                interrupted_pos: Some(Position::Bottom)
+            }
+        ));
+
+        // Completing the older producer event must not reopen crossing while
+        // the newer disabled notification is still queued.
+        assert!(!complete_event_tap_recovery(&mut pending, 1));
+        assert_eq!(
+            pending.as_ref().map(|recovery| recovery.generation),
+            Some(2)
+        );
+        assert!(complete_event_tap_recovery(&mut pending, 2));
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn disabled_tap_generation_never_uses_zero_after_wrap() {
+        let mut current_pos = None;
+        let mut generation = u64::MAX;
+        let mut pending = None;
+
+        let event = event_tap_disabled_transition(&mut current_pos, &mut generation, &mut pending);
+
+        assert_eq!(generation, 1);
+        assert_eq!(
+            pending.as_ref().map(|recovery| recovery.generation),
+            Some(1)
+        );
+        assert!(matches!(
+            event,
+            ProducerEvent::EventTapDisabled {
+                recovery_generation: 1,
+                interrupted_pos: None
+            }
+        ));
+    }
+
+    #[test]
+    fn queued_grab_is_folded_into_the_shared_recovery_gate() {
+        let mut current_pos = None;
+        let mut generation = 0;
+        let mut pending = None;
+        let _ = event_tap_disabled_transition(&mut current_pos, &mut generation, &mut pending);
+
+        assert!(defer_grab_during_tap_recovery(&mut pending, Position::Left));
+        assert_eq!(
+            pending,
+            Some(TapRecovery {
+                generation: 1,
+                interrupted_pos: Some(Position::Left),
+                auto_release_claimed: false,
+            })
+        );
+        assert_eq!(
+            claim_tap_recovery_auto_release(&mut pending, 1),
+            TapRecoveryClaim::AutoRelease(Position::Left)
+        );
+        assert_eq!(
+            claim_tap_recovery_auto_release(&mut pending, 1),
+            TapRecoveryClaim::SupersededOrClaimed
+        );
+
+        // A second disabled notification racing with publication carries the
+        // claim forward, so its newer generation cannot publish a duplicate.
+        let _ = event_tap_disabled_transition(&mut current_pos, &mut generation, &mut pending);
+        assert_eq!(
+            claim_tap_recovery_auto_release(&mut pending, 2),
+            TapRecoveryClaim::SupersededOrClaimed
+        );
+
+        let mut no_recovery = None;
+        assert!(!defer_grab_during_tap_recovery(
+            &mut no_recovery,
+            Position::Right
+        ));
+    }
+}
+
+#[cfg(test)]
+mod modifier_tests {
+    use super::*;
+    use scancode::Linux::{
+        KeyCapsLock, KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift, KeyRightCtrl,
+        KeyRightShift, KeyRightalt, KeyRightmeta,
+    };
+
+    fn flags(bits: u64) -> CGEventFlags {
+        CGEventFlags::from_bits_retain(bits)
+    }
+
+    #[test]
+    fn device_flags_report_each_physical_modifier_key_independently() {
+        let cases = [
+            (KeyLeftCtrl, NX_DEVICE_LCTRL_KEY_MASK),
+            (KeyLeftShift, NX_DEVICE_LSHIFT_KEY_MASK),
+            (KeyRightShift, NX_DEVICE_RSHIFT_KEY_MASK),
+            (KeyLeftMeta, NX_DEVICE_LCOMMAND_KEY_MASK),
+            (KeyRightmeta, NX_DEVICE_RCOMMAND_KEY_MASK),
+            (KeyLeftAlt, NX_DEVICE_LALT_KEY_MASK),
+            (KeyRightalt, NX_DEVICE_RALT_KEY_MASK),
+            (KeyRightCtrl, NX_DEVICE_RCTRL_KEY_MASK),
+        ];
+
+        for (key, device_mask) in cases {
+            assert_eq!(
+                modifier_key_state(key as u32, flags(device_mask)),
+                1,
+                "{key:?} should be pressed when its device bit is set",
+            );
+            assert_eq!(
+                modifier_key_state(key as u32, flags(0)),
+                0,
+                "{key:?} should be released when its device bit is clear",
+            );
+        }
+    }
+
+    #[test]
+    fn one_shift_can_be_released_while_the_other_remains_pressed() {
+        let right_only = flags(NX_DEVICE_RSHIFT_KEY_MASK | CGEventFlags::CGEventFlagShift.bits());
+
+        assert_eq!(modifier_key_state(KeyLeftShift as u32, right_only), 0,);
+        assert_eq!(modifier_key_state(KeyRightShift as u32, right_only), 1,);
+    }
+
+    #[test]
+    fn aggregate_flags_do_not_turn_a_released_key_into_a_press() {
+        let aggregate_shift_only = CGEventFlags::CGEventFlagShift;
+
+        assert_eq!(
+            modifier_key_state(KeyLeftShift as u32, aggregate_shift_only),
+            0,
+        );
+    }
+
+    #[test]
+    fn crossing_snapshot_emits_every_held_side_then_aggregate_modifiers() {
+        let all_device_bits = STANDARD_MODIFIER_KEYS
+            .iter()
+            .fold(0, |bits, (_, mask)| bits | mask);
+        let aggregate_bits = CGEventFlags::CGEventFlagShift.bits()
+            | CGEventFlags::CGEventFlagControl.bits()
+            | CGEventFlags::CGEventFlagAlternate.bits()
+            | CGEventFlags::CGEventFlagCommand.bits()
+            | CGEventFlags::CGEventFlagAlphaShift.bits();
+        let snapshot = modifier_snapshot(flags(all_device_bits | aggregate_bits));
+
+        let keys = snapshot[..STANDARD_MODIFIER_KEYS.len()]
+            .iter()
+            .map(|event| match event {
+                CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                    key, state: 1, ..
+                })) => scancode::Linux::try_from(*key).expect("known modifier"),
+                other => panic!("expected held modifier key-down, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            STANDARD_MODIFIER_KEYS
+                .iter()
+                .map(|(key, _)| *key)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            snapshot.last(),
+            Some(&CaptureEvent::Input(Event::Keyboard(
+                KeyboardEvent::Modifiers {
+                    depressed: (XMods::ShiftMask
+                        | XMods::ControlMask
+                        | XMods::Mod1Mask
+                        | XMods::Mod4Mask)
+                        .bits(),
+                    latched: 0,
+                    locked: XMods::LockMask.bits(),
+                    group: 0,
+                }
+            )))
+        );
+    }
+
+    #[test]
+    fn crossing_snapshot_reports_both_shifts_without_duplicating_the_mask() {
+        let snapshot = modifier_snapshot(flags(
+            NX_DEVICE_LSHIFT_KEY_MASK
+                | NX_DEVICE_RSHIFT_KEY_MASK
+                | CGEventFlags::CGEventFlagShift.bits(),
+        ));
+
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(
+            snapshot[0],
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key: KeyLeftShift as u32,
+                state: 1,
+            }))
+        );
+        assert_eq!(
+            snapshot[1],
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key: KeyRightShift as u32,
+                state: 1,
+            }))
+        );
+        assert_eq!(
+            snapshot[2],
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed: XMods::ShiftMask.bits(),
+                latched: 0,
+                locked: 0,
+                group: 0,
+            }))
+        );
+    }
+
+    #[test]
+    fn caps_lock_emits_a_down_up_pair_on_both_lock_cycles() {
+        assert_eq!(
+            modifier_key_states(KeyCapsLock as u32, CGEventFlags::CGEventFlagAlphaShift),
+            ([1, 0], 2),
+        );
+        assert_eq!(
+            modifier_key_states(KeyCapsLock as u32, CGEventFlags::empty()),
+            ([1, 0], 2),
+        );
+    }
+
+    #[test]
+    fn standard_modifier_still_emits_one_phase() {
+        assert_eq!(
+            modifier_key_states(KeyLeftCtrl as u32, flags(NX_DEVICE_LCTRL_KEY_MASK),),
+            ([1, 0], 1),
+        );
+    }
+
+    fn stepped_mac_layout() -> DisplayLayout {
+        DisplayLayout::new([(0, 0, 3072, 1728), (-1728, 0, 1728, 1117)])
+    }
+
+    #[test]
+    fn crossing_uses_the_exposed_contour_not_the_union_rectangle() {
+        let layout = stepped_mac_layout();
+        assert_eq!(layout.origin(), Some((-1728, 0)));
+        assert_eq!(layout.size(), Some((4800, 1728)));
+
+        // Above the built-in display's bottom, x=0 is an internal seam and
+        // must not capture. Below it, x=0 is the main display's true left edge.
+        assert!(!crosses_display_contour(
+            &layout,
+            Position::Left,
+            (0.0, 500.0),
+            (-1.0, 0.0),
+        ));
+        assert!(crosses_display_contour(
+            &layout,
+            Position::Left,
+            (0.0, 1500.0),
+            (-1.0, 0.0),
+        ));
+        assert!(crosses_display_contour(
+            &layout,
+            Position::Left,
+            (-1728.0, 500.0),
+            (-1.0, 0.0),
+        ));
+
+        // Merely moving parallel while parked on an edge is not a crossing.
+        assert!(!crosses_display_contour(
+            &layout,
+            Position::Left,
+            (-1728.0, 500.0),
+            (0.0, 20.0),
+        ));
+
+        // Quartz locations are post-delta. Predicting another move from a
+        // near-edge event would capture before the cursor actually reaches
+        // the main display's exposed lower step.
+        assert!(!crosses_display_contour(
+            &layout,
+            Position::Left,
+            (10.0, 1120.0),
+            (-20.0, -20.0),
+        ));
+        // Once that diagonal move lands on the built-in display, its left
+        // contour is the built-in's outer edge rather than the internal seam.
+        assert!(!crosses_display_contour(
+            &layout,
+            Position::Left,
+            (-10.0, 1100.0),
+            (-20.0, -20.0),
+        ));
+
+        assert!(!crosses_display_contour(
+            &layout,
+            Position::Right,
+            (3066.0, 500.0),
+            (10.0, 0.0),
+        ));
+        assert!(crosses_display_contour(
+            &layout,
+            Position::Right,
+            (3071.0, 500.0),
+            (10.0, 0.0),
+        ));
+    }
+
+    #[test]
+    fn capture_anchor_tracks_each_step_of_the_mac_contour() {
+        let layout = stepped_mac_layout();
+        assert_eq!(
+            capture_anchor(&layout, Position::Left, (-1728.0, 500.0)),
+            Some((-1727.0, 500.0)),
+        );
+        assert_eq!(
+            capture_anchor(&layout, Position::Left, (0.0, 1500.0)),
+            Some((1.0, 1500.0)),
+        );
+        assert_eq!(
+            capture_anchor(&layout, Position::Bottom, (-1000.0, 1116.0)),
+            Some((-1000.0, 1116.0)),
+        );
+        assert_eq!(
+            capture_anchor(&layout, Position::Bottom, (1000.0, 1727.0)),
+            Some((1000.0, 1727.0)),
+        );
+    }
+
+    #[test]
+    fn active_capture_anchor_is_reprojected_after_display_reconfiguration() {
+        let old_layout = DisplayLayout::new([(0, 0, 1920, 1080)]);
+        let mut state = InputCaptureState {
+            active_clients: Lazy::new(HashSet::new),
+            current_pos: Some(Position::Right),
+            cursor_hidden: true,
+            tap_recovery_generation: 0,
+            tap_recovery_pending: None,
+            enter_position: Some(CGPoint {
+                x: 1919.0,
+                y: 900.0,
+            }),
+            bounds: layout_bounds(&old_layout).expect("old bounds"),
+            display_layout: old_layout,
+        };
+
+        // The old display was replaced by a smaller display shifted right.
+        // The prior hidden anchor is now outside every screen, so both axes
+        // must be projected onto the new right contour.
+        let new_layout = DisplayLayout::new([(100, 0, 1000, 700)]);
+        assert!(state.commit_display_layout(new_layout));
+
+        let anchor = state.enter_position.expect("reprojected anchor");
+        assert_eq!((anchor.x, anchor.y), (1099.0, 699.0));
+        assert_eq!(
+            state.bounds,
+            Bounds {
+                xmin: 100.0,
+                xmax: 1100.0,
+                ymin: 0.0,
+                ymax: 700.0,
+            }
+        );
+    }
+}
+
 fn request_accessibility_permission() -> bool {
     // Silent check. The GUI owns the one-time user-visible prompt at
     // startup (see mousehop_gtk::macos_privacy) so retries triggered by
@@ -1358,32 +2212,32 @@ impl Drop for MacOSInputCapture {
 #[async_trait]
 impl Capture for MacOSInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("creating capture, {pos}");
-            let _ = notify_tx.send(ProducerEvent::Create(pos)).await;
-            log::debug!("done !");
-        });
+        log::debug!("creating capture, {pos}");
+        self.notify_tx
+            .send(ProducerEvent::Create(pos))
+            .await
+            .map_err(|_| CaptureError::CaptureUpdatesClosed)?;
+        log::debug!("done !");
         Ok(())
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("destroying capture {pos}");
-            let _ = notify_tx.send(ProducerEvent::Destroy(pos)).await;
-            log::debug!("done !");
-        });
+        log::debug!("destroying capture {pos}");
+        self.notify_tx
+            .send(ProducerEvent::Destroy(pos))
+            .await
+            .map_err(|_| CaptureError::CaptureUpdatesClosed)?;
+        log::debug!("done !");
         Ok(())
     }
 
     async fn release(&mut self, warp_target: Option<(i32, i32)>) -> Result<(), CaptureError> {
         log::info!("[release-warp] macOS backend release(warp_target={warp_target:?})");
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("notifying Release");
-            let _ = notify_tx.send(ProducerEvent::Release { warp_target }).await;
-        });
+        log::debug!("notifying Release");
+        self.notify_tx
+            .send(ProducerEvent::Release { warp_target })
+            .await
+            .map_err(|_| CaptureError::CaptureUpdatesClosed)?;
         Ok(())
     }
 
@@ -1392,26 +2246,7 @@ impl Capture for MacOSInputCapture {
     }
 
     fn display_bounds(&self) -> Option<(u32, u32)> {
-        // Mirror the InputEmulation-side implementation: the union of
-        // every active display's rectangle, in points (which match
-        // the units used by CGEvent.location() so the
-        // MotionAbsolute math stays internally consistent).
-        let displays = CGDisplay::active_displays().ok()?;
-        let mut xmin = f64::INFINITY;
-        let mut xmax = f64::NEG_INFINITY;
-        let mut ymin = f64::INFINITY;
-        let mut ymax = f64::NEG_INFINITY;
-        for id in displays {
-            let bounds = CGDisplay::new(id).bounds();
-            xmin = xmin.min(bounds.origin.x);
-            xmax = xmax.max(bounds.origin.x + bounds.size.width);
-            ymin = ymin.min(bounds.origin.y);
-            ymax = ymax.max(bounds.origin.y + bounds.size.height);
-        }
-        if xmax <= xmin || ymax <= ymin {
-            return None;
-        }
-        Some(((xmax - xmin) as u32, (ymax - ymin) as u32))
+        self.display_layout()?.size()
     }
 
     fn display_origin(&self) -> (i32, i32) {
@@ -1423,20 +2258,14 @@ impl Capture for MacOSInputCapture {
         // host_normalized_cursor / peer_warp_target's clamp(0, 1)
         // silently maps every point on the external to "left edge"
         // and the receiver warps to the wrong column.
-        let Ok(displays) = CGDisplay::active_displays() else {
-            return (0, 0);
-        };
-        let mut xmin = f64::INFINITY;
-        let mut ymin = f64::INFINITY;
-        for id in displays {
-            let bounds = CGDisplay::new(id).bounds();
-            xmin = xmin.min(bounds.origin.x);
-            ymin = ymin.min(bounds.origin.y);
-        }
-        if xmin.is_infinite() || ymin.is_infinite() {
-            return (0, 0);
-        }
-        (xmin as i32, ymin as i32)
+        self.display_layout()
+            .and_then(|layout| layout.origin())
+            .unwrap_or((0, 0))
+    }
+
+    fn display_layout(&self) -> Option<DisplayLayout> {
+        let layout = query_display_layout().ok()?;
+        (!layout.is_empty()).then_some(layout)
     }
 }
 

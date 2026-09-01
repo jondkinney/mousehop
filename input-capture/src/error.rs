@@ -59,6 +59,9 @@ pub enum CaptureError {
     #[cfg(target_os = "macos")]
     #[error("Event tap disabled")]
     EventTapDisabled,
+    #[cfg(target_os = "macos")]
+    #[error("active display topology is unavailable")]
+    DisplayTopologyUnavailable,
 }
 
 #[derive(Debug, Error)]

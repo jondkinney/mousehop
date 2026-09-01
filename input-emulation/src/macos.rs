@@ -5,9 +5,7 @@ use core_foundation::base::{CFRelease, kCFAllocatorDefault};
 use core_foundation::string::{CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8};
 use core_foundation_sys::number::{CFNumberGetValue, CFNumberRef, kCFNumberSInt64Type};
 use core_graphics::base::CGFloat;
-use core_graphics::display::{
-    CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
-};
+use core_graphics::display::{CGDisplay, CGPoint};
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
     ScrollEventUnit,
@@ -15,16 +13,15 @@ use core_graphics::event::{
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
-    scancode,
+    display::DisplayLayout, scancode,
 };
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::{sync::Notify, task::JoinHandle};
+use tokio::task::JoinHandle;
 
 use super::error::MacOSEmulationCreationError;
 
@@ -113,6 +110,10 @@ pub(crate) struct MacOSEmulation {
     event_source: CGEventSource,
     /// task handle for key repeats
     repeat_task: Option<JoinHandle<()>>,
+    /// CG key code owned by `repeat_task`. Keeping the identity next to the
+    /// task prevents releasing an unrelated key from stopping the key that is
+    /// actually repeating.
+    repeat_key: Option<CGKeyCode>,
     /// current state of the mouse buttons (tracked by evdev button code)
     pressed_buttons: HashSet<u32>,
     /// button previously pressed (evdev button code)
@@ -123,8 +124,10 @@ pub(crate) struct MacOSEmulation {
     button_click_state: i64,
     /// current modifier state
     modifier_state: Rc<Cell<XMods>>,
-    /// notify to cancel key repeats
-    notify_repeat_task: Arc<Notify>,
+    /// Exact physical source keys behind the aggregate modifier mask. macOS
+    /// exposes left/right key codes independently, so releasing one side must
+    /// not clear Shift/Control/Option/Command while its peer remains held.
+    physical_modifiers: Cell<PhysicalModifiers>,
     /// IOPMAssertionID returned by the most recent
     /// `IOPMAssertionDeclareUserActivity` call, kept for re-use within
     /// the system's 5-second coalesce window. Without this, a CGEvent
@@ -158,6 +161,45 @@ fn drag_event_type(button: u32) -> CGEventType {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ButtonEventSpec {
+    event_type: CGEventType,
+    mouse_button: CGMouseButton,
+    button_number: Option<i64>,
+}
+
+fn button_event_spec(button: u32, state: u32) -> Option<ButtonEventSpec> {
+    let button_number = match button {
+        BTN_BACK => Some(3),
+        BTN_FORWARD => Some(4),
+        _ => None,
+    };
+    let (event_type, mouse_button) = match (button, state) {
+        (BTN_LEFT, 1) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
+        (BTN_LEFT, 0) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
+        (BTN_RIGHT, 1) => (CGEventType::RightMouseDown, CGMouseButton::Right),
+        (BTN_RIGHT, 0) => (CGEventType::RightMouseUp, CGMouseButton::Right),
+        (BTN_MIDDLE, 1) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
+        (BTN_MIDDLE, 0) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
+        (BTN_BACK, 1) | (BTN_FORWARD, 1) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
+        (BTN_BACK, 0) | (BTN_FORWARD, 0) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
+        _ => return None,
+    };
+    Some(ButtonEventSpec {
+        event_type,
+        mouse_button,
+        button_number,
+    })
+}
+
+fn commit_button_state(pressed: &mut HashSet<u32>, button: u32, state: u32) {
+    if state == 1 {
+        pressed.insert(button);
+    } else {
+        pressed.remove(&button);
+    }
+}
+
 unsafe impl Send for MacOSEmulation {}
 
 impl MacOSEmulation {
@@ -173,8 +215,9 @@ impl MacOSEmulation {
             previous_button_click: None,
             button_click_state: 0,
             repeat_task: None,
-            notify_repeat_task: Arc::new(Notify::new()),
+            repeat_key: None,
             modifier_state: Rc::new(Cell::new(XMods::empty())),
+            physical_modifiers: Cell::new(PhysicalModifiers::empty()),
             user_activity_assertion: Cell::new(0),
             display_union_cache: Cell::new(None),
         })
@@ -214,6 +257,68 @@ impl MacOSEmulation {
         Some(event.location())
     }
 
+    fn next_button_click_state(&self, button: u32, state: u32) -> i64 {
+        if state != 1 {
+            return self.button_click_state;
+        }
+        if self.previous_button == Some(button)
+            && self
+                .previous_button_click
+                .is_some_and(|instant| instant.elapsed() < DOUBLE_CLICK_INTERVAL)
+        {
+            self.button_click_state + 1
+        } else {
+            1
+        }
+    }
+
+    /// Create and post one button transition without changing local tracking.
+    /// The caller commits `pressed_buttons` only after this succeeds, so a
+    /// locked-session/event-creation failure cannot turn later motion into a
+    /// phantom drag.
+    fn post_button_event(&self, button: u32, state: u32, click_state: i64) -> bool {
+        let Some(spec) = button_event_spec(button, state) else {
+            log::warn!("invalid button event: {button},{state}");
+            return false;
+        };
+        let Some(location) = self.get_mouse_location() else {
+            log::warn!("could not get mouse location!");
+            return false;
+        };
+        let Ok(event) = CGEvent::new_mouse_event(
+            self.event_source.clone(),
+            spec.event_type,
+            location,
+            spec.mouse_button,
+        ) else {
+            log::warn!("mouse event creation failed!");
+            return false;
+        };
+        event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_state);
+        if let Some(button_number) = spec.button_number {
+            event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, button_number);
+        }
+        event.post(CGEventTapLocation::HID);
+        true
+    }
+
+    fn release_tracked_buttons(&mut self) {
+        let mut pressed = self.pressed_buttons.iter().copied().collect::<Vec<_>>();
+        pressed.sort_unstable();
+        for button in pressed {
+            if !self.post_button_event(button, 0, self.button_click_state) {
+                log::warn!("unable to synthesize release for stuck mouse button {button}");
+            }
+        }
+
+        // Even if secure input prevented posting an up, never carry a stale
+        // drag into a later authenticated peer session.
+        self.pressed_buttons.clear();
+        self.previous_button = None;
+        self.previous_button_click = None;
+        self.button_click_state = 0;
+    }
+
     async fn spawn_repeat_task(&mut self, key: u16) {
         // there can only be one repeating key and it's
         // always the last to be pressed
@@ -226,33 +331,36 @@ impl MacOSEmulation {
         let (repeat_delay, repeat_interval) = read_key_repeat_prefs();
         // repeat task
         let event_source = self.event_source.clone();
-        let notify = self.notify_repeat_task.clone();
         let modifiers = self.modifier_state.clone();
         let repeat_task = tokio::task::spawn_local(async move {
-            let stop = tokio::select! {
-                _ = tokio::time::sleep(repeat_delay) => false,
-                _ = notify.notified() => true,
-            };
-            if !stop {
-                loop {
-                    key_event(event_source.clone(), key, 1, modifiers.get());
-                    tokio::select! {
-                        _ = tokio::time::sleep(repeat_interval) => {},
-                        _ = notify.notified() => break,
-                    }
-                }
+            tokio::time::sleep(repeat_delay).await;
+            loop {
+                key_event(event_source.clone(), key, 1, modifiers.get());
+                tokio::time::sleep(repeat_interval).await;
             }
-            // release key when cancelled
-            update_modifiers(&modifiers, key as u32, 0);
-            key_event(event_source.clone(), key, 0, modifiers.get());
         });
         self.repeat_task = Some(repeat_task);
+        self.repeat_key = Some(key);
     }
 
     async fn cancel_repeat_task(&mut self) {
         if let Some(task) = self.repeat_task.take() {
-            self.notify_repeat_task.notify_waiters();
+            task.abort();
             let _ = task.await;
+        }
+        if let Some(key) = self.repeat_key.take() {
+            key_event(self.event_source.clone(), key, 0, self.modifier_state.get());
+        }
+    }
+
+    async fn release_key(&mut self, key: CGKeyCode) {
+        if self.repeat_key == Some(key) {
+            self.cancel_repeat_task().await;
+        } else {
+            // Pressing a second character ends repeat for the first one and
+            // emits its synthetic key-up. Its later physical key-up still
+            // needs to pass through, but must not cancel the second key.
+            key_event(self.event_source.clone(), key, 0, self.modifier_state.get());
         }
     }
 }
@@ -368,64 +476,51 @@ fn modifier_event(event_source: CGEventSource, depressed: XMods) {
     log::trace!("modifiers updated: {depressed:?}");
 }
 
-fn get_display_at_point(x: CGFloat, y: CGFloat) -> Option<CGDirectDisplayID> {
-    let mut displays: [CGDirectDisplayID; 16] = [0; 16];
-    let mut display_count: u32 = 0;
-    let rect = CGRect::new(&CGPoint::new(x, y), &CGSize::new(0.0, 0.0));
-
-    let error = unsafe {
-        CGGetDisplaysWithRect(
-            rect,
-            1,
-            displays.as_mut_ptr(),
-            &mut display_count as *mut u32,
-        )
-    };
-
-    if error != 0 {
-        log::warn!("error getting displays at point ({x}, {y}): {error}");
-        return Option::None;
-    }
-
-    if display_count == 0 {
-        log::debug!("no displays found at point ({x}, {y})");
-        return Option::None;
-    }
-
-    displays.first().copied()
-}
-
-fn get_display_bounds(display: CGDirectDisplayID) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
-    unsafe {
-        let bounds = CGDisplayBounds(display);
-        let min_x = bounds.origin.x;
-        let max_x = bounds.origin.x + bounds.size.width;
-        let min_y = bounds.origin.y;
-        let max_y = bounds.origin.y + bounds.size.height;
-        (min_x as f64, min_y as f64, max_x as f64, max_y as f64)
-    }
-}
-
 /// Union of every active display's rectangle, as `(origin_x,
 /// origin_y, width, height)` in global display coordinates. `None`
 /// when no active display reports a usable rectangle.
 fn display_union() -> Option<(CGFloat, CGFloat, CGFloat, CGFloat)> {
+    let bounds = active_display_layout()?.bounds()?;
+    let (x, y) = bounds.origin();
+    let (width, height) = bounds.size();
+    Some((
+        CGFloat::from(x),
+        CGFloat::from(y),
+        CGFloat::from(width),
+        CGFloat::from(height),
+    ))
+}
+
+/// Every active Quartz display in the same integer logical-point coordinate
+/// space used by cursor events. Floor/ceil keeps a rare fractional display
+/// bound fully represented instead of creating an empty sliver in the
+/// contour.
+fn active_display_layout() -> Option<DisplayLayout> {
     let displays = CGDisplay::active_displays().ok()?;
-    let mut xmin = f64::INFINITY;
-    let mut xmax = f64::NEG_INFINITY;
-    let mut ymin = f64::INFINITY;
-    let mut ymax = f64::NEG_INFINITY;
-    for id in displays {
+    let layout = DisplayLayout::new(displays.into_iter().filter_map(|id| {
         let bounds = CGDisplay::new(id).bounds();
-        xmin = xmin.min(bounds.origin.x);
-        xmax = xmax.max(bounds.origin.x + bounds.size.width);
-        ymin = ymin.min(bounds.origin.y);
-        ymax = ymax.max(bounds.origin.y + bounds.size.height);
-    }
-    if xmax <= xmin || ymax <= ymin {
-        return None;
-    }
-    Some((xmin, ymin, xmax - xmin, ymax - ymin))
+        let left = bounds.origin.x.floor();
+        let top = bounds.origin.y.floor();
+        let right = (bounds.origin.x + bounds.size.width).ceil();
+        let bottom = (bounds.origin.y + bounds.size.height).ceil();
+        if !left.is_finite()
+            || !top.is_finite()
+            || !right.is_finite()
+            || !bottom.is_finite()
+            || left < f64::from(i32::MIN)
+            || top < f64::from(i32::MIN)
+            || right > f64::from(i32::MAX)
+            || bottom > f64::from(i32::MAX)
+        {
+            return None;
+        }
+        let x = left as i32;
+        let y = top as i32;
+        let width = u32::try_from((right - left) as i64).ok()?;
+        let height = u32::try_from((bottom - top) as i64).ok()?;
+        Some((x, y, width, height))
+    }));
+    (!layout.is_empty()).then_some(layout)
 }
 
 /// Convert a union-relative warp target into global display
@@ -449,31 +544,13 @@ fn clamp_to_screen_space(
     dx: CGFloat,
     dy: CGFloat,
 ) -> (CGFloat, CGFloat) {
-    // Check which display the mouse is currently on
-    // Determine what the location of the mouse would be after applying the move
-    // Get the display at the new location
-    // If the point is not on a display
-    //   Clamp the mouse to the current display
-    // Else If the point is on a display
-    //   Clamp the mouse to the new display
-    let current_display = match get_display_at_point(current_x, current_y) {
-        Some(display) => display,
-        None => {
-            log::warn!("could not get current display!");
-            return (current_x, current_y);
-        }
+    let Some(layout) = active_display_layout() else {
+        log::warn!("could not get active display layout");
+        return (current_x, current_y);
     };
-
-    let new_x = current_x + dx;
-    let new_y = current_y + dy;
-
-    let final_display = get_display_at_point(new_x, new_y).unwrap_or(current_display);
-    let (min_x, min_y, max_x, max_y) = get_display_bounds(final_display);
-
-    (
-        new_x.clamp(min_x, max_x - 1.),
-        new_y.clamp(min_y, max_y - 1.),
-    )
+    layout
+        .clamp_to_nearest_display((current_x + dx, current_y + dy))
+        .unwrap_or((current_x, current_y))
 }
 
 #[async_trait]
@@ -538,94 +615,21 @@ impl Emulation for MacOSEmulation {
                         button,
                         state,
                     } => {
-                        // button number for OtherMouse events (3 = back, 4 = forward, etc.)
-                        let cg_button_number: Option<i64> = match button {
-                            BTN_BACK => Some(3),
-                            BTN_FORWARD => Some(4),
-                            _ => None,
-                        };
-                        let (event_type, mouse_button) = match (button, state) {
-                            (BTN_LEFT, 1) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
-                            (BTN_LEFT, 0) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
-                            (BTN_RIGHT, 1) => (CGEventType::RightMouseDown, CGMouseButton::Right),
-                            (BTN_RIGHT, 0) => (CGEventType::RightMouseUp, CGMouseButton::Right),
-                            (BTN_MIDDLE, 1) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
-                            (BTN_MIDDLE, 0) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
-                            (BTN_BACK, 1) | (BTN_FORWARD, 1) => {
-                                (CGEventType::OtherMouseDown, CGMouseButton::Center)
-                            }
-                            (BTN_BACK, 0) | (BTN_FORWARD, 0) => {
-                                (CGEventType::OtherMouseUp, CGMouseButton::Center)
-                            }
-                            _ => {
-                                log::warn!("invalid button event: {button},{state}");
-                                return Ok(());
-                            }
-                        };
-                        // store button state using the evdev button code so
-                        // back, forward, and middle are tracked independently
-                        if state == 1 {
-                            self.pressed_buttons.insert(button);
-                        } else {
-                            self.pressed_buttons.remove(&button);
+                        let click_state = self.next_button_click_state(button, state);
+                        if !self.post_button_event(button, state, click_state) {
+                            return Ok(());
                         }
 
-                        // update double-click tracking using the evdev button
-                        // code so that back/forward don't alias with middle
+                        // Commit state only after CoreGraphics accepted the
+                        // event creation/post path. In particular, secure-input
+                        // failures must not leave phantom drag or click state.
+                        commit_button_state(&mut self.pressed_buttons, button, state);
                         if state == 1 {
-                            if self.previous_button == Some(button)
-                                && self
-                                    .previous_button_click
-                                    .is_some_and(|i| i.elapsed() < DOUBLE_CLICK_INTERVAL)
-                            {
-                                self.button_click_state += 1;
-                            } else {
-                                self.button_click_state = 1;
-                            }
+                            self.button_click_state = click_state;
                             self.previous_button = Some(button);
                             self.previous_button_click = Some(Instant::now());
                         }
-
                         log::debug!("click_state: {}", self.button_click_state);
-                        // `get_mouse_location` returns `None` when
-                        // `CGEvent::new` fails — which it does once the
-                        // sink's screen is locked / the screensaver has
-                        // engaged secure event input. Mirror the motion
-                        // arm and drop the click instead of unwrapping:
-                        // an `.unwrap()` here panics, and `panic =
-                        // "abort"` would take the whole daemon down (the
-                        // screensaver-lockup crash).
-                        let location = match self.get_mouse_location() {
-                            Some(l) => l,
-                            None => {
-                                log::warn!("could not get mouse location!");
-                                return Ok(());
-                            }
-                        };
-                        let event = match CGEvent::new_mouse_event(
-                            self.event_source.clone(),
-                            event_type,
-                            location,
-                            mouse_button,
-                        ) {
-                            Ok(e) => e,
-                            Err(()) => {
-                                log::warn!("mouse event creation failed!");
-                                return Ok(());
-                            }
-                        };
-                        event.set_integer_value_field(
-                            EventField::MOUSE_EVENT_CLICK_STATE,
-                            self.button_click_state,
-                        );
-                        // Set the button number for extra buttons (back=3, forward=4)
-                        if let Some(btn_num) = cg_button_number {
-                            event.set_integer_value_field(
-                                EventField::MOUSE_EVENT_BUTTON_NUMBER,
-                                btn_num,
-                            );
-                        }
-                        event.post(CGEventTapLocation::HID);
                     }
                     // A macOS sink replays the source's momentum coast verbatim
                     // (so a Mac->Mac session still glides) — momentum is applied,
@@ -702,14 +706,56 @@ impl Emulation for MacOSEmulation {
                             return Ok(());
                         }
                     };
-                    let is_modifier = update_modifiers(&self.modifier_state, key, state);
+
+                    // macOS represents Caps Lock as a toggle, while Linux
+                    // sends an ordinary down/up pair (and some compositors
+                    // include a locked Caps key in their boundary-entry
+                    // snapshot). Turn each accepted down into one complete
+                    // tap and ignore its matching up. It must never enter the
+                    // repeat task: doing so floods the guest with Caps key
+                    // downs until the connection closes.
+                    if is_caps_lock(key) {
+                        if state == 1 {
+                            key_event(
+                                self.event_source.clone(),
+                                code,
+                                1,
+                                self.modifier_state.get(),
+                            );
+                            key_event(
+                                self.event_source.clone(),
+                                code,
+                                0,
+                                self.modifier_state.get(),
+                            );
+                            toggle_caps_lock(&self.modifier_state);
+                        }
+                        return Ok(());
+                    }
+
+                    let is_modifier = update_modifiers(
+                        &self.physical_modifiers,
+                        &self.modifier_state,
+                        key,
+                        state,
+                    );
                     if is_modifier {
                         modifier_event(self.event_source.clone(), self.modifier_state.get());
+                        // Modifier presses are state transitions, not
+                        // repeatable characters. Preserve the key event that
+                        // applications expect without creating a repeat task.
+                        key_event(
+                            self.event_source.clone(),
+                            code,
+                            state,
+                            self.modifier_state.get(),
+                        );
+                        return Ok(());
                     }
                     match state {
                         // pressed
                         1 => self.spawn_repeat_task(code).await,
-                        _ => self.cancel_repeat_task().await,
+                        _ => self.release_key(code).await,
                     }
                 }
                 KeyboardEvent::Modifiers {
@@ -718,7 +764,14 @@ impl Emulation for MacOSEmulation {
                     locked,
                     group,
                 } => {
-                    set_modifiers(&self.modifier_state, depressed, latched, locked, group);
+                    set_modifiers(
+                        &self.physical_modifiers,
+                        &self.modifier_state,
+                        depressed,
+                        latched,
+                        locked,
+                        group,
+                    );
                     modifier_event(self.event_source.clone(), self.modifier_state.get());
                 }
             },
@@ -734,11 +787,21 @@ impl Emulation for MacOSEmulation {
 
     async fn create(&mut self, _handle: EmulationHandle) {}
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {}
+    async fn destroy(&mut self, _handle: EmulationHandle) {
+        self.cancel_repeat_task().await;
+        self.release_tracked_buttons();
+        self.physical_modifiers.set(PhysicalModifiers::empty());
+        self.modifier_state.set(XMods::empty());
+    }
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.cancel_repeat_task().await;
+        self.release_tracked_buttons();
+        self.physical_modifiers.set(PhysicalModifiers::empty());
+        self.modifier_state.set(XMods::empty());
+    }
 
-    fn display_bounds(&self) -> Option<(u32, u32)> {
+    fn display_bounds(&mut self) -> Option<(u32, u32)> {
         // Union of every active display's rectangle. Matches the
         // shape used on the input-capture side so the host's
         // wall-press model is consistent across both ends. Also the
@@ -748,6 +811,42 @@ impl Emulation for MacOSEmulation {
         self.display_union_cache.set(union);
         let (_, _, width, height) = union?;
         Some((width as u32, height as u32))
+    }
+
+    fn display_layout(&mut self) -> Option<DisplayLayout> {
+        let layout = active_display_layout()?;
+        let bounds = layout.bounds()?;
+        let (origin_x, origin_y) = bounds.origin();
+        let (width, height) = bounds.size();
+        self.display_union_cache.set(Some((
+            CGFloat::from(origin_x),
+            CGFloat::from(origin_y),
+            CGFloat::from(width),
+            CGFloat::from(height),
+        )));
+        Some(layout)
+    }
+
+    fn supports_edge_warp(&self) -> bool {
+        true
+    }
+
+    async fn warp_cursor_in_layout(
+        &mut self,
+        x: i32,
+        y: i32,
+        layout: &DisplayLayout,
+    ) -> Result<(), EmulationError> {
+        let (origin_x, origin_y) = layout
+            .origin()
+            .ok_or(EmulationError::DisplayTopologyUnavailable)?;
+        let (global_x, global_y) =
+            union_to_global((CGFloat::from(origin_x), CGFloat::from(origin_y)), x, y);
+        CGDisplay::warp_mouse_cursor_position(CGPoint {
+            x: global_x,
+            y: global_y,
+        })
+        .map_err(EmulationError::CoreGraphics)
     }
 
     async fn warp_cursor(&mut self, x: i32, y: i32) -> Result<(), EmulationError> {
@@ -763,51 +862,124 @@ impl Emulation for MacOSEmulation {
         };
         // CGDisplay::warp_mouse_cursor_position is a global Quartz
         // call; it doesn't matter which CGDisplay receiver we use.
-        let _ = CGDisplay::warp_mouse_cursor_position(pt);
-        Ok(())
+        CGDisplay::warp_mouse_cursor_position(pt).map_err(EmulationError::CoreGraphics)
     }
 }
 
-fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
-    if let Ok(key) = scancode::Linux::try_from(key) {
-        let mask = match key {
-            scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => XMods::ShiftMask,
-            scancode::Linux::KeyCapsLock => XMods::LockMask,
-            scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => XMods::ControlMask,
-            scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt => XMods::Mod1Mask,
-            scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => XMods::Mod4Mask,
-            _ => XMods::empty(),
-        };
-        // unchanged
-        if mask.is_empty() {
-            return false;
-        }
-        let mut mods = modifiers.get();
-        match state {
-            1 => mods.insert(mask),
-            _ => mods.remove(mask),
-        }
-        modifiers.set(mods);
-        true
-    } else {
-        false
-    }
+fn modifier_source(key: scancode::Linux) -> Option<(PhysicalModifiers, PhysicalModifiers, XMods)> {
+    let (source, group, mask) = match key {
+        scancode::Linux::KeyLeftShift => (
+            PhysicalModifiers::LEFT_SHIFT,
+            PhysicalModifiers::SHIFT,
+            XMods::ShiftMask,
+        ),
+        scancode::Linux::KeyRightShift => (
+            PhysicalModifiers::RIGHT_SHIFT,
+            PhysicalModifiers::SHIFT,
+            XMods::ShiftMask,
+        ),
+        scancode::Linux::KeyLeftCtrl => (
+            PhysicalModifiers::LEFT_CONTROL,
+            PhysicalModifiers::CONTROL,
+            XMods::ControlMask,
+        ),
+        scancode::Linux::KeyRightCtrl => (
+            PhysicalModifiers::RIGHT_CONTROL,
+            PhysicalModifiers::CONTROL,
+            XMods::ControlMask,
+        ),
+        scancode::Linux::KeyLeftAlt => (
+            PhysicalModifiers::LEFT_OPTION,
+            PhysicalModifiers::OPTION,
+            XMods::Mod1Mask,
+        ),
+        scancode::Linux::KeyRightalt => (
+            PhysicalModifiers::RIGHT_OPTION,
+            PhysicalModifiers::OPTION,
+            XMods::Mod1Mask,
+        ),
+        scancode::Linux::KeyLeftMeta => (
+            PhysicalModifiers::LEFT_COMMAND,
+            PhysicalModifiers::COMMAND,
+            XMods::Mod4Mask,
+        ),
+        scancode::Linux::KeyRightmeta => (
+            PhysicalModifiers::RIGHT_COMMAND,
+            PhysicalModifiers::COMMAND,
+            XMods::Mod4Mask,
+        ),
+        _ => return None,
+    };
+    Some((source, group, mask))
+}
+
+fn update_modifiers(
+    physical: &Cell<PhysicalModifiers>,
+    modifiers: &Cell<XMods>,
+    key: u32,
+    state: u8,
+) -> bool {
+    let Ok(key) = scancode::Linux::try_from(key) else {
+        return false;
+    };
+    let Some((source, group, mask)) = modifier_source(key) else {
+        return false;
+    };
+
+    let mut physical_state = physical.get();
+    physical_state.set(source, state == 1);
+    physical.set(physical_state);
+
+    let mut aggregate = modifiers.get();
+    aggregate.set(mask, physical_state.intersects(group));
+    modifiers.set(aggregate);
+    true
+}
+
+fn is_caps_lock(key: u32) -> bool {
+    scancode::Linux::try_from(key).is_ok_and(|key| key == scancode::Linux::KeyCapsLock)
+}
+
+fn toggle_caps_lock(modifiers: &Cell<XMods>) {
+    let mut state = modifiers.get();
+    state.toggle(XMods::LockMask);
+    modifiers.set(state);
 }
 
 fn set_modifiers(
+    physical: &Cell<PhysicalModifiers>,
     active_modifiers: &Cell<XMods>,
     depressed: u32,
     latched: u32,
     locked: u32,
     group: u32,
 ) {
-    let depressed = XMods::from_bits(depressed).unwrap_or_default();
-    let _latched = XMods::from_bits(latched).unwrap_or_default();
-    let _locked = XMods::from_bits(locked).unwrap_or_default();
-    let _group = XMods::from_bits(group).unwrap_or_default();
+    // Modifier indices beyond the conventional low eight bits are valid with
+    // custom XKB keymaps. Preserve every known bit instead of dropping the
+    // entire field when an unknown bit accompanies it.
+    let depressed = XMods::from_bits_truncate(depressed);
+    let latched = XMods::from_bits_truncate(latched);
+    let locked = XMods::from_bits_truncate(locked);
+    let _group = XMods::from_bits_truncate(group);
 
-    // we only care about the depressed modifiers for now
-    active_modifiers.replace(depressed);
+    let snapshot = depressed | latched | locked;
+    active_modifiers.replace(snapshot);
+
+    // A modifier snapshot is authoritative for aggregate state, but cannot
+    // identify a physical side. Retain a known side only while its aggregate
+    // bit is still present so a later key-up cannot revive stale state.
+    let mut physical_state = physical.get();
+    for (group, mask) in [
+        (PhysicalModifiers::SHIFT, XMods::ShiftMask),
+        (PhysicalModifiers::CONTROL, XMods::ControlMask),
+        (PhysicalModifiers::OPTION, XMods::Mod1Mask),
+        (PhysicalModifiers::COMMAND, XMods::Mod4Mask),
+    ] {
+        if !snapshot.contains(mask) {
+            physical_state.remove(group);
+        }
+    }
+    physical.set(physical_state);
 }
 
 fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {
@@ -831,6 +1003,25 @@ fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {
     flags
 }
 
+bitflags! {
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct PhysicalModifiers: u16 {
+        const LEFT_SHIFT = 1 << 0;
+        const RIGHT_SHIFT = 1 << 1;
+        const LEFT_CONTROL = 1 << 2;
+        const RIGHT_CONTROL = 1 << 3;
+        const LEFT_OPTION = 1 << 4;
+        const RIGHT_OPTION = 1 << 5;
+        const LEFT_COMMAND = 1 << 6;
+        const RIGHT_COMMAND = 1 << 7;
+
+        const SHIFT = Self::LEFT_SHIFT.bits() | Self::RIGHT_SHIFT.bits();
+        const CONTROL = Self::LEFT_CONTROL.bits() | Self::RIGHT_CONTROL.bits();
+        const OPTION = Self::LEFT_OPTION.bits() | Self::RIGHT_OPTION.bits();
+        const COMMAND = Self::LEFT_COMMAND.bits() | Self::RIGHT_COMMAND.bits();
+    }
+}
+
 // From X11/X.h
 bitflags! {
     #[repr(C)]
@@ -849,7 +1040,19 @@ bitflags! {
 
 #[cfg(test)]
 mod tests {
-    use super::union_to_global;
+    use super::{
+        PhysicalModifiers, XMods, button_event_spec, commit_button_state, is_caps_lock,
+        set_modifiers, toggle_caps_lock, union_to_global, update_modifiers,
+    };
+    use input_event::{
+        BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT,
+        scancode::Linux::{
+            self, KeyCapsLock, KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift, KeyRightCtrl,
+            KeyRightShift, KeyRightalt, KeyRightmeta,
+        },
+    };
+    use std::cell::Cell;
+    use std::collections::HashSet;
 
     #[test]
     fn union_to_global_is_identity_when_the_primary_is_top_left() {
@@ -868,5 +1071,162 @@ mod tests {
         assert_eq!(union_to_global(origin, 1920, 120), (0.0, 0.0));
         // The far corner of the union: the primary's bottom-right.
         assert_eq!(union_to_global(origin, 3839, 1199), (1919.0, 1079.0));
+    }
+
+    #[test]
+    fn caps_lock_is_a_tap_not_a_repeatable_modifier() {
+        let physical = Cell::new(PhysicalModifiers::empty());
+        let modifiers = Cell::new(XMods::empty());
+
+        assert!(is_caps_lock(KeyCapsLock as u32));
+        assert!(!update_modifiers(
+            &physical,
+            &modifiers,
+            KeyCapsLock as u32,
+            1
+        ));
+        assert!(physical.get().is_empty());
+        assert!(modifiers.get().is_empty());
+
+        toggle_caps_lock(&modifiers);
+        assert_eq!(modifiers.get(), XMods::LockMask);
+        toggle_caps_lock(&modifiers);
+        assert!(modifiers.get().is_empty());
+    }
+
+    #[test]
+    fn ordinary_modifiers_still_track_key_state() {
+        let physical = Cell::new(PhysicalModifiers::empty());
+        let modifiers = Cell::new(XMods::empty());
+
+        assert!(update_modifiers(
+            &physical,
+            &modifiers,
+            KeyLeftShift as u32,
+            1
+        ));
+        assert_eq!(physical.get(), PhysicalModifiers::LEFT_SHIFT);
+        assert_eq!(modifiers.get(), XMods::ShiftMask);
+        assert!(update_modifiers(
+            &physical,
+            &modifiers,
+            KeyLeftShift as u32,
+            0
+        ));
+        assert!(physical.get().is_empty());
+        assert!(modifiers.get().is_empty());
+    }
+
+    #[test]
+    fn releasing_one_modifier_side_preserves_the_other_side() {
+        for (left, right, mask) in [
+            (KeyLeftShift, KeyRightShift, XMods::ShiftMask),
+            (KeyLeftCtrl, KeyRightCtrl, XMods::ControlMask),
+            (KeyLeftAlt, KeyRightalt, XMods::Mod1Mask),
+            (KeyLeftMeta, KeyRightmeta, XMods::Mod4Mask),
+        ] {
+            let physical = Cell::new(PhysicalModifiers::empty());
+            let modifiers = Cell::new(XMods::empty());
+
+            for (key, state) in [(left, 1), (right, 1), (left, 0)] {
+                assert!(update_modifiers(&physical, &modifiers, key as u32, state));
+            }
+            assert_eq!(modifiers.get() & mask, mask, "{left:?}/{right:?}");
+
+            assert!(update_modifiers(&physical, &modifiers, right as u32, 0));
+            assert!(modifiers.get().is_empty(), "{left:?}/{right:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_modifier_snapshot_discards_stale_physical_sides() {
+        let physical = Cell::new(PhysicalModifiers::empty());
+        let modifiers = Cell::new(XMods::empty());
+        assert!(update_modifiers(
+            &physical,
+            &modifiers,
+            Linux::KeyLeftShift as u32,
+            1
+        ));
+
+        set_modifiers(&physical, &modifiers, 0, 0, 0, 0);
+        assert!(physical.get().is_empty());
+        assert!(modifiers.get().is_empty());
+
+        assert!(update_modifiers(
+            &physical,
+            &modifiers,
+            Linux::KeyLeftShift as u32,
+            0
+        ));
+        assert!(modifiers.get().is_empty());
+    }
+
+    #[test]
+    fn button_specs_cover_every_tracked_button_and_reject_bad_states() {
+        for button in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_BACK, BTN_FORWARD] {
+            assert!(button_event_spec(button, 1).is_some());
+            assert!(button_event_spec(button, 0).is_some());
+            assert!(button_event_spec(button, 2).is_none());
+        }
+        assert_eq!(
+            button_event_spec(BTN_BACK, 1).unwrap().button_number,
+            Some(3)
+        );
+        assert_eq!(
+            button_event_spec(BTN_FORWARD, 1).unwrap().button_number,
+            Some(4)
+        );
+        assert_eq!(
+            button_event_spec(BTN_MIDDLE, 1).unwrap().button_number,
+            None
+        );
+    }
+
+    #[test]
+    fn button_tracking_commits_down_and_up_independently() {
+        let mut pressed = HashSet::new();
+        commit_button_state(&mut pressed, BTN_LEFT, 1);
+        commit_button_state(&mut pressed, BTN_RIGHT, 1);
+        commit_button_state(&mut pressed, BTN_LEFT, 0);
+
+        assert_eq!(pressed, HashSet::from([BTN_RIGHT]));
+    }
+
+    #[test]
+    fn modifier_snapshot_uses_depressed_latched_and_locked_masks() {
+        let physical = Cell::new(PhysicalModifiers::empty());
+        let modifiers = Cell::new(XMods::empty());
+
+        set_modifiers(
+            &physical,
+            &modifiers,
+            XMods::ShiftMask.bits(),
+            XMods::ControlMask.bits(),
+            XMods::LockMask.bits(),
+            0,
+        );
+
+        assert_eq!(
+            modifiers.get(),
+            XMods::ShiftMask | XMods::ControlMask | XMods::LockMask
+        );
+    }
+
+    #[test]
+    fn modifier_snapshot_keeps_known_bits_alongside_unknown_xkb_bits() {
+        let physical = Cell::new(PhysicalModifiers::empty());
+        let modifiers = Cell::new(XMods::empty());
+
+        set_modifiers(
+            &physical,
+            &modifiers,
+            XMods::ShiftMask.bits() | (1 << 31),
+            0,
+            0,
+            0,
+        );
+
+        assert_eq!(modifiers.get(), XMods::ShiftMask);
     }
 }

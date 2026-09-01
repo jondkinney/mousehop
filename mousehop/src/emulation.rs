@@ -1,22 +1,29 @@
 use crate::config::local_commit;
-use crate::listen::{ListenEvent, ListenerCreationError, MousehopListener};
+use crate::listen::{ListenEvent, ListenerCreationError, ListenerSession, MousehopListener};
 use futures::StreamExt;
 use input_emulation::{
-    EmulationHandle, InputEmulation, InputEmulationError, ReceivePostProcessing,
+    EdgeWarpOutcome, EmulationHandle, InputEmulation, InputEmulationError, ReceivePostProcessing,
 };
-use input_event::{ClipboardEvent, Event};
+use input_event::{
+    ClipboardEvent, Event,
+    display::{DisplayEdge, DisplayLayout},
+};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use mousehop_ipc::IncomingPeerConfig;
-use mousehop_proto::{HostInputState, LEAVE_HANDOVER, LEAVE_RELEASE_ONLY, Position, ProtoEvent};
+use mousehop_proto::{
+    CAP_TRANSACTIONAL_HANDOVER, HandoverWarpStatus, HostInputState, LEAVE_HANDOVER,
+    LEAVE_RELEASE_ONLY, Position, ProtoEvent,
+};
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     net::SocketAddr,
     rc::Rc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     select,
+    sync::oneshot,
     task::{JoinHandle, spawn_local},
 };
 
@@ -43,6 +50,77 @@ fn update_locked_host(
 
 fn remote_input_allowed(locked_hosts: &HashSet<SocketAddr>, addr: SocketAddr) -> bool {
     !locked_hosts.contains(&addr)
+}
+
+fn remote_session_owns_input(
+    locked_hosts: &HashSet<SocketAddr>,
+    owners: &HashMap<(SocketAddr, ListenerSession), u32>,
+    addr: SocketAddr,
+    session: ListenerSession,
+) -> bool {
+    remote_input_allowed(locked_hosts, addr) && owners.contains_key(&(addr, session))
+}
+
+fn remote_transaction_owns_input(
+    locked_hosts: &HashSet<SocketAddr>,
+    owners: &HashMap<(SocketAddr, ListenerSession), u32>,
+    addr: SocketAddr,
+    session: ListenerSession,
+    serial: u32,
+) -> bool {
+    remote_input_allowed(locked_hosts, addr)
+        && owners.get(&(addr, session)).copied() == Some(serial)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransactionalInputDisposition {
+    Consume,
+    ReportOwnershipLost,
+}
+
+fn classify_transactional_input(
+    locked_hosts: &HashSet<SocketAddr>,
+    owners: &HashMap<(SocketAddr, ListenerSession), u32>,
+    addr: SocketAddr,
+    session: ListenerSession,
+    serial: u32,
+) -> TransactionalInputDisposition {
+    if remote_transaction_owns_input(locked_hosts, owners, addr, session, serial) {
+        TransactionalInputDisposition::Consume
+    } else {
+        TransactionalInputDisposition::ReportOwnershipLost
+    }
+}
+
+fn heartbeat_ownership_loss(
+    peer_capabilities: &HashMap<(SocketAddr, ListenerSession), u32>,
+    owners: &HashMap<(SocketAddr, ListenerSession), u32>,
+    addr: SocketAddr,
+    session: ListenerSession,
+) -> Option<ProtoEvent> {
+    peer_capabilities
+        .get(&(addr, session))
+        .is_some_and(|capabilities| capabilities & CAP_TRANSACTIONAL_HANDOVER != 0)
+        .then(|| owners.get(&(addr, session)).copied())
+        .flatten()
+        .map(|serial| ProtoEvent::OwnershipLost { serial })
+}
+
+fn refresh_topology_generation(
+    last_layout: &mut Option<DisplayLayout>,
+    generation: &mut u32,
+    current_layout: &Option<DisplayLayout>,
+) {
+    let Some(current_layout) = current_layout else {
+        // A transient unavailable query must not consume a generation or
+        // forget the last good snapshot. The emulation backend retains its
+        // previous complete layout until a new one is ready.
+        return;
+    };
+    if last_layout.as_ref() != Some(current_layout) {
+        *generation = generation.wrapping_add(1);
+        *last_layout = Some(current_layout.clone());
+    }
 }
 
 fn accept_host_input_state(
@@ -72,6 +150,51 @@ fn accept_host_input_state(
     }
 }
 
+fn serial_is_newer(candidate: u32, current: u32) -> bool {
+    candidate != current && candidate.wrapping_sub(current) < (1 << 31)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandoverDisposition {
+    Apply,
+    Reack,
+    DropStale,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompletedHandover {
+    serial: u32,
+    warp: HandoverWarpStatus,
+    layout: Option<DisplayLayout>,
+    topology_generation: u32,
+}
+
+fn classify_handover(completed: Option<u32>, candidate: u32) -> HandoverDisposition {
+    match completed {
+        None => HandoverDisposition::Apply,
+        Some(current) if candidate == current => HandoverDisposition::Reack,
+        Some(current) if serial_is_newer(candidate, current) => HandoverDisposition::Apply,
+        Some(_) => HandoverDisposition::DropStale,
+    }
+}
+
+fn handover_leave_revokes(completed: Option<u32>, owner: Option<u32>, candidate: u32) -> bool {
+    match classify_handover(completed, candidate) {
+        HandoverDisposition::Apply => true,
+        HandoverDisposition::Reack => owner == Some(candidate),
+        HandoverDisposition::DropStale => false,
+    }
+}
+
+fn entry_edge(pos: Position) -> DisplayEdge {
+    match pos {
+        Position::Left => DisplayEdge::Left,
+        Position::Right => DisplayEdge::Right,
+        Position::Top => DisplayEdge::Top,
+        Position::Bottom => DisplayEdge::Bottom,
+    }
+}
+
 /// emulation handling events received from a listener
 pub(crate) struct Emulation {
     task: JoinHandle<()>,
@@ -82,6 +205,9 @@ pub(crate) struct Emulation {
 pub(crate) enum EmulationEvent {
     Connected {
         addr: SocketAddr,
+        /// Exact inbound DTLS generation that replaced any prior connection
+        /// from the same source address.
+        session: ListenerSession,
         fingerprint: String,
     },
     ConnectionAttempt {
@@ -91,6 +217,8 @@ pub(crate) enum EmulationEvent {
     Entered {
         /// address of the connection
         addr: SocketAddr,
+        /// Exact inbound DTLS generation that owns this barrier.
+        session: ListenerSession,
         /// position of the connection
         pos: mousehop_ipc::Position,
         /// certificate fingerprint of the connection
@@ -99,6 +227,7 @@ pub(crate) enum EmulationEvent {
     /// connection closed
     Disconnected {
         addr: SocketAddr,
+        session: ListenerSession,
     },
     /// the port of the listener has changed
     PortChanged(Result<u16, ListenerCreationError>),
@@ -107,7 +236,7 @@ pub(crate) enum EmulationEvent {
     /// emulation was enabled
     EmulationEnabled,
     /// capture should be released
-    ReleaseNotify,
+    ReleaseNotify(oneshot::Sender<bool>),
     /// peer sent us a Hello with its build commit hash. Used to
     /// populate `client_manager.peer_commit` from the listen side
     /// too — without this, peer-version visibility silently fails
@@ -149,6 +278,7 @@ enum EmulationRequest {
     Reenable,
     Release {
         addr: SocketAddr,
+        session: ListenerSession,
         handover: bool,
     },
     ChangePort(u16),
@@ -186,9 +316,18 @@ impl Emulation {
         }
     }
 
-    pub(crate) fn send_leave_event(&self, addr: SocketAddr, handover: bool) {
+    pub(crate) fn send_leave_event(
+        &self,
+        addr: SocketAddr,
+        session: ListenerSession,
+        handover: bool,
+    ) {
         self.request_tx
-            .send(EmulationRequest::Release { addr, handover })
+            .send(EmulationRequest::Release {
+                addr,
+                session,
+                handover,
+            })
             .expect("channel closed");
     }
 
@@ -262,79 +401,455 @@ impl ListenTask {
             .unwrap_or_default()
     }
 
+    fn session_is_current(&self, addr: SocketAddr, session: ListenerSession) -> bool {
+        self.listener.current_session(addr) == Some(session)
+    }
+
+    async fn request_capture_release(&self) -> bool {
+        let (completion, completed) = oneshot::channel();
+        self.event_tx
+            .send(EmulationEvent::ReleaseNotify(completion))
+            .expect("channel closed");
+        tokio::time::timeout(Duration::from_secs(2), completed)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_entry_metadata(
+        &self,
+        addr: SocketAddr,
+        session: ListenerSession,
+        post_processing: ReceivePostProcessing,
+        bounds: Option<(u32, u32)>,
+        layout: Option<DisplayLayout>,
+        topology_epoch: u64,
+        topology_generation: u32,
+    ) -> bool {
+        if !self.session_is_current(addr, session) {
+            return false;
+        }
+        self.listener
+            .reply(
+                addr,
+                session,
+                ProtoEvent::ReceiverSensitivity {
+                    mouse_sensitivity: post_processing.mouse_sensitivity,
+                },
+            )
+            .await;
+        if !self.session_is_current(addr, session) {
+            return false;
+        }
+        if let Some((width, height)) = bounds {
+            self.listener
+                .reply(addr, session, ProtoEvent::Bounds { width, height })
+                .await;
+            if !self.session_is_current(addr, session) {
+                return false;
+            }
+        }
+        if let Some(layout) = layout {
+            self.listener
+                .reply(
+                    addr,
+                    session,
+                    ProtoEvent::display_layout_generation(
+                        layout,
+                        topology_epoch,
+                        topology_generation,
+                    ),
+                )
+                .await;
+            if !self.session_is_current(addr, session) {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn reply_handover_ack(
+        &self,
+        addr: SocketAddr,
+        session: ListenerSession,
+        serial: u32,
+        transactional: bool,
+        warp: HandoverWarpStatus,
+    ) {
+        let event = if transactional {
+            ProtoEvent::HandoverAck { serial, warp }
+        } else {
+            ProtoEvent::Ack(serial)
+        };
+        self.listener.reply(addr, session, event).await;
+    }
+
     async fn run(mut self) {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(5));
+        let mut topology_interval = tokio::time::interval(Duration::from_secs(2));
+        let mut leave_retry_interval = tokio::time::interval(Duration::from_millis(100));
+        leave_retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_response = HashMap::new();
         let mut rejected_connections = HashMap::new();
-        // Last display geometry pushed to peers, so a change can be
-        // re-broadcast to an in-progress session (a peer that has
-        // already entered won't otherwise see the new size until it
-        // crosses back and re-enters).
-        let mut last_bounds = self.emulation_proxy.display_bounds();
+        let mut last_topology = None;
+        let mut topology_generation = 0u32;
+        let mut completed_handovers: HashMap<(SocketAddr, ListenerSession), CompletedHandover> =
+            HashMap::new();
+        let mut legacy_enter_ready: HashSet<(SocketAddr, ListenerSession)> = HashSet::new();
+        let mut input_owner_sessions: HashMap<(SocketAddr, ListenerSession), u32> = HashMap::new();
+        let mut peer_capabilities: HashMap<(SocketAddr, ListenerSession), u32> = HashMap::new();
+        let mut pending_leaves: HashMap<(SocketAddr, ListenerSession, u32), u32> = HashMap::new();
+        // Distinguish topology counters across daemon/peer restarts. A queued
+        // datagram from an old same-address read loop can otherwise establish
+        // a high generation after Begin and make the restarted sender's gen=1
+        // refreshes look stale forever.
+        let topology_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
         loop {
             select! {
                 e = self.listener.next() => {match e {
-                    Some(ListenEvent::Msg { event, addr }) => {
-                        log::trace!("{event} <-<-<-<-<- {addr}");
-                        last_response.insert(addr, Instant::now());
+                    Some(ListenEvent::Msg { event, addr, session }) => {
+                        log::trace!("{event} <-<-<-<-<- {addr} session {session}");
+                        last_response.insert(addr, (session, Instant::now()));
                         match event {
                             ProtoEvent::Enter(pos) => {
                                 if !remote_input_allowed(&self.locked_hosts, addr) {
                                     log::debug!("dropping Enter from locked host {addr}");
-                                } else if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
-                                    log::info!("releasing capture: {addr} entered this device");
-                                    self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
-                                    self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                                    // Send the receiving device's display
-                                    // geometry so the capturing peer can
-                                    // model the guest cursor's position
-                                    // accurately. Old peers that don't
-                                    // recognize this event will skip it
-                                    // per the forward-compat fix.
-                                    if let Some((width, height)) = self.emulation_proxy.display_bounds() {
-                                        self.listener.reply(addr, ProtoEvent::Bounds { width, height }).await;
+                                } else if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr, session).await {
+                                    if !self.session_is_current(addr, session) {
+                                        continue;
                                     }
-                                    // Tell the capturing peer what
-                                    // sensitivity multiplier we'll
-                                    // apply to their motion deltas so
-                                    // their wall-press auto-release
-                                    // model can scale to match.
+                                    log::info!("releasing capture before legacy entry from {addr} session {session}");
+                                    if !self.request_capture_release().await
+                                        || !self.session_is_current(addr, session)
+                                    {
+                                        log::debug!("legacy entry was superseded while capture released");
+                                        continue;
+                                    }
+                                    // A lost prior Leave must not let a fresh
+                                    // crossing inherit held keys in the existing
+                                    // backend handle.
+                                    self.emulation_proxy.remove(addr);
                                     let pp = self.post_processing_for_addr(addr);
-                                    self.listener.reply(addr, ProtoEvent::ReceiverSensitivity {
-                                        mouse_sensitivity: pp.mouse_sensitivity,
-                                    }).await;
-                                    // No entry-edge midpoint warp here:
-                                    // the host's CursorPos (sent right
-                                    // after Enter) carries the
-                                    // proportional landing point and
-                                    // pins the on-axis dimension to the
-                                    // matching edge. Warping to the
-                                    // midpoint first would briefly
-                                    // place the cursor at center-edge
-                                    // — and a quick re-cross by the
-                                    // user would have the local
-                                    // CGEventTap (or equivalent) snap
-                                    // its `cursor=` field from the
-                                    // midpoint, masquerading as a
-                                    // mid-screen crossing on the next
-                                    // CursorPos sent back the other
-                                    // way. Trusts the host: if it
-                                    // can't compute a proportional
-                                    // point the cursor stays where it
-                                    // was, which is preferable to a
-                                    // forced midpoint.
-                                    self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
+                                    let layout = self.emulation_proxy.refresh_display_layout().await;
+                                    let bounds = layout.as_ref().and_then(DisplayLayout::size);
+                                    refresh_topology_generation(
+                                        &mut last_topology,
+                                        &mut topology_generation,
+                                        &layout,
+                                    );
+                                    if !self.send_entry_metadata(
+                                        addr,
+                                        session,
+                                        pp,
+                                        bounds,
+                                        layout,
+                                        topology_epoch,
+                                        topology_generation,
+                                    ).await {
+                                        continue;
+                                    }
+                                    legacy_enter_ready.insert((addr, session));
+                                    input_owner_sessions.insert((addr, session), 0);
+                                    self.listener.reply(addr, session, ProtoEvent::Ack(0)).await;
+                                    if self.session_is_current(addr, session) {
+                                        self.event_tx.send(EmulationEvent::Entered {
+                                            addr,
+                                            session,
+                                            pos: to_ipc_pos(pos),
+                                            fingerprint,
+                                        }).expect("channel closed");
+                                    }
                                 }
                             }
-                            ProtoEvent::Leave(_) => {
+                            ProtoEvent::HandoverEnter {
+                                serial,
+                                pos,
+                                cross_fraction,
+                            } => {
+                                let key = (addr, session);
+                                let transactional = peer_capabilities
+                                    .get(&key)
+                                    .is_some_and(|capabilities| {
+                                        capabilities & CAP_TRANSACTIONAL_HANDOVER != 0
+                                    });
+                                if !remote_input_allowed(&self.locked_hosts, addr) {
+                                    log::debug!("dropping handover {serial} from locked host {addr}");
+                                    continue;
+                                }
+                                match classify_handover(
+                                    completed_handovers.get(&key).map(|completed| completed.serial),
+                                    serial,
+                                ) {
+                                    HandoverDisposition::Reack => {
+                                        // The release and warp already completed; only the Ack
+                                        // was lost. Never apply either side effect twice. Entry
+                                        // metadata is independently lossy, though, so repeat its
+                                        // idempotent snapshot before repeating the Ack. Do not
+                                        // resurrect a transaction whose local return barrier has
+                                        // already revoked receive-side ownership.
+                                        if input_owner_sessions.get(&key).copied() != Some(serial) {
+                                            log::debug!(
+                                                "withholding Ack for revoked handover {serial} from {addr} session {session}"
+                                            );
+                                            continue;
+                                        }
+                                        let completed = completed_handovers
+                                            .get(&key)
+                                            .expect("classified completed handover")
+                                            .clone();
+                                        let pp = self.post_processing_for_addr(addr);
+                                        // Preserve the exact geometry used by
+                                        // the original warp. A hotplug after a
+                                        // lost Ack must not relabel a different
+                                        // topology as the one that was applied.
+                                        let layout = completed.layout.clone();
+                                        let bounds = layout.as_ref().and_then(DisplayLayout::size);
+                                        if self
+                                            .send_entry_metadata(
+                                                addr,
+                                                session,
+                                                pp,
+                                                bounds,
+                                                layout,
+                                                topology_epoch,
+                                                completed.topology_generation,
+                                            )
+                                            .await
+                                        {
+                                            self.reply_handover_ack(
+                                                addr,
+                                                session,
+                                                serial,
+                                                transactional,
+                                                completed.warp,
+                                            )
+                                            .await;
+                                        }
+                                        continue;
+                                    }
+                                    HandoverDisposition::DropStale => {
+                                        log::debug!(
+                                            "dropping stale handover {serial} from {addr} session {session}"
+                                        );
+                                        continue;
+                                    }
+                                    HandoverDisposition::Apply => {}
+                                }
+                                let Some(fingerprint) = self
+                                    .listener
+                                    .get_certificate_fingerprint(addr, session)
+                                    .await
+                                else {
+                                    continue;
+                                };
+                                if !self.session_is_current(addr, session) {
+                                    continue;
+                                }
+                                log::info!(
+                                    "releasing capture before atomic handover {serial} from {addr} session {session}"
+                                );
+                                if !self.request_capture_release().await
+                                    || !self.session_is_current(addr, session)
+                                {
+                                    log::debug!(
+                                        "handover {serial} was superseded while capture released"
+                                    );
+                                    continue;
+                                }
+                                // Never carry pressed-key state from a prior
+                                // crossing into this newer transaction when its
+                                // Leave was lost.
                                 self.emulation_proxy.remove(addr);
-                                self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                let (layout, warp) = if let Some(cross_fraction) = cross_fraction {
+                                    let edge = entry_edge(pos);
+                                    match self
+                                        .emulation_proxy
+                                        .warp_cursor_to_edge(edge, f64::from(cross_fraction))
+                                        .await
+                                    {
+                                        Some(EdgeWarpOutcome::Applied(layout)) => {
+                                            (Some(layout), HandoverWarpStatus::Applied)
+                                        }
+                                        Some(EdgeWarpOutcome::Unsupported) => {
+                                            // Some emulation backends cannot place the cursor,
+                                            // but can still report useful geometry for the peer.
+                                            (
+                                                self.emulation_proxy.refresh_display_layout().await,
+                                                HandoverWarpStatus::Unsupported,
+                                            )
+                                        }
+                                        None => {
+                                            log::warn!(
+                                                "handover {serial} cursor warp did not complete; withholding Ack"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    (
+                                        self.emulation_proxy.refresh_display_layout().await,
+                                        HandoverWarpStatus::NotRequested,
+                                    )
+                                };
+                                if !self.session_is_current(addr, session) {
+                                    continue;
+                                }
+                                let pp = self.post_processing_for_addr(addr);
+                                let bounds = layout.as_ref().and_then(DisplayLayout::size);
+                                refresh_topology_generation(
+                                    &mut last_topology,
+                                    &mut topology_generation,
+                                    &layout,
+                                );
+                                let completed_layout = layout.clone();
+                                if !self.send_entry_metadata(
+                                    addr,
+                                    session,
+                                    pp,
+                                    bounds,
+                                    layout,
+                                    topology_epoch,
+                                    topology_generation,
+                                ).await {
+                                    continue;
+                                }
+                                input_owner_sessions.insert(key, serial);
+                                completed_handovers.insert(
+                                    key,
+                                    CompletedHandover {
+                                        serial,
+                                        warp,
+                                        layout: completed_layout,
+                                        topology_generation,
+                                    },
+                                );
+                                self.reply_handover_ack(
+                                    addr,
+                                    session,
+                                    serial,
+                                    transactional,
+                                    warp,
+                                )
+                                .await;
+                                if self.session_is_current(addr, session) {
+                                    self.event_tx.send(EmulationEvent::Entered {
+                                        addr,
+                                        session,
+                                        pos: to_ipc_pos(pos),
+                                        fingerprint,
+                                    }).expect("channel closed");
+                                }
+                            }
+                            ProtoEvent::Leave(_)
+                                if !peer_capabilities
+                                    .get(&(addr, session))
+                                    .is_some_and(|capabilities| {
+                                        capabilities & CAP_TRANSACTIONAL_HANDOVER != 0
+                                    }) =>
+                            {
+                                self.emulation_proxy.remove(addr);
+                                legacy_enter_ready.remove(&(addr, session));
+                                input_owner_sessions.remove(&(addr, session));
+                            }
+                            ProtoEvent::Leave(mode) => {
+                                log::debug!(
+                                    "dropping unscoped Leave({mode}) from transactional peer {addr} session {session}"
+                                );
+                            }
+                            ProtoEvent::HandoverLeave { serial, .. } => {
+                                let key = (addr, session);
+                                let disposition = classify_handover(
+                                    completed_handovers
+                                        .get(&key)
+                                        .map(|completed| completed.serial),
+                                    serial,
+                                );
+                                let revoke = handover_leave_revokes(
+                                    completed_handovers
+                                        .get(&key)
+                                        .map(|completed| completed.serial),
+                                    input_owner_sessions.get(&key).copied(),
+                                    serial,
+                                );
+                                match disposition {
+                                    HandoverDisposition::Apply => {
+                                        completed_handovers.insert(
+                                            key,
+                                            CompletedHandover {
+                                                serial,
+                                                warp: HandoverWarpStatus::NotRequested,
+                                                layout: None,
+                                                topology_generation,
+                                            },
+                                        );
+                                    }
+                                    HandoverDisposition::Reack | HandoverDisposition::DropStale => {}
+                                }
+                                if revoke {
+                                    self.emulation_proxy.remove(addr);
+                                    legacy_enter_ready.remove(&key);
+                                    input_owner_sessions.remove(&key);
+                                }
+                                self.listener
+                                    .reply(
+                                        addr,
+                                        session,
+                                        ProtoEvent::HandoverLeaveAck { serial },
+                                    )
+                                    .await;
+                            }
+                            ProtoEvent::HandoverLeaveAck { serial } => {
+                                pending_leaves.remove(&(addr, session, serial));
                             }
                             ProtoEvent::Input(event) => {
-                                if !remote_input_allowed(&self.locked_hosts, addr) {
-                                    log::trace!("dropping input from locked host {addr}");
+                                let transactional = peer_capabilities
+                                    .get(&(addr, session))
+                                    .is_some_and(|capabilities| {
+                                        capabilities & CAP_TRANSACTIONAL_HANDOVER != 0
+                                    });
+                                if transactional {
+                                    log::debug!(
+                                        "dropping unscoped input from transactional peer {addr} session {session}"
+                                    );
+                                } else if !remote_session_owns_input(
+                                    &self.locked_hosts,
+                                    &input_owner_sessions,
+                                    addr,
+                                    session,
+                                ) {
+                                    log::trace!(
+                                        "dropping input without active ownership from {addr} session {session}"
+                                    );
                                 } else {
                                     self.emulation_proxy.consume(event, addr);
+                                }
+                            }
+                            ProtoEvent::HandoverInput { serial, event } => {
+                                if classify_transactional_input(
+                                    &self.locked_hosts,
+                                    &input_owner_sessions,
+                                    addr,
+                                    session,
+                                    serial,
+                                ) == TransactionalInputDisposition::Consume
+                                {
+                                    self.emulation_proxy.consume(event, addr);
+                                } else {
+                                    log::debug!(
+                                        "rejecting input for unowned handover {serial} from {addr} session {session}"
+                                    );
+                                    self.listener
+                                        .reply(
+                                            addr,
+                                            session,
+                                            ProtoEvent::OwnershipLost { serial },
+                                        )
+                                        .await;
                                 }
                             }
                             ProtoEvent::Clipboard { from_fingerprint, content } => {
@@ -390,6 +905,7 @@ impl ListenTask {
                                             // sender's following Leave or key-up
                                             // datagrams are lost.
                                             self.emulation_proxy.remove(addr);
+                                            input_owner_sessions.remove(&(addr, session));
                                         }
                                         self.event_tx
                                             .send(EmulationEvent::RemoteHostState {
@@ -401,6 +917,7 @@ impl ListenTask {
                                         self.listener
                                             .reply(
                                                 addr,
+                                                session,
                                                 ProtoEvent::HostInputStateAck {
                                                     state,
                                                     generation,
@@ -414,7 +931,7 @@ impl ListenTask {
                                     );
                                 }
                             }
-                            ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
+                            ProtoEvent::Ping => self.listener.reply(addr, session, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
                             // Peer's version handshake. Echo our own
                             // commit back so the peer's connect-side
                             // receive_loop populates its `peer_commit`,
@@ -426,8 +943,13 @@ impl ListenTask {
                             // listener down) the version display would
                             // otherwise silently say "unknown" while
                             // the peer is in fact happily talking to us.
-                            ProtoEvent::Hello { commit, .. } => {
-                                self.listener.reply(addr, ProtoEvent::hello(local_commit())).await;
+                            ProtoEvent::Hello {
+                                commit,
+                                capabilities,
+                                ..
+                            } => {
+                                peer_capabilities.insert((addr, session), capabilities);
+                                self.listener.reply(addr, session, ProtoEvent::hello(local_commit())).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
                             // Capturing peer told us where on its own
@@ -448,31 +970,47 @@ impl ListenTask {
                             ProtoEvent::CursorPos { pos, nx, ny } => {
                                 if !remote_input_allowed(&self.locked_hosts, addr) {
                                     log::trace!("dropping cursor warp from locked host {addr}");
-                                } else if let Some((w, h)) = self.emulation_proxy.display_bounds() {
-                                    let pwi = w as i32;
-                                    let phi = h as i32;
-                                    let cx = ((nx * w as f32) as i32).clamp(0, pwi.saturating_sub(1));
-                                    let cy = ((ny * h as f32) as i32).clamp(0, phi.saturating_sub(1));
-                                    let (tx, ty) = match pos {
-                                        Position::Left => (0, cy),
-                                        Position::Right => (pwi.saturating_sub(1), cy),
-                                        Position::Top => (cx, 0),
-                                        Position::Bottom => (cx, phi.saturating_sub(1)),
+                                } else if !legacy_enter_ready.contains(&(addr, session)) {
+                                    // A legacy CursorPos can be reordered ahead
+                                    // of Enter. Never warp until local capture
+                                    // release for that exact session completed.
+                                    log::debug!(
+                                        "dropping cursor-first legacy warp from {addr} session {session}"
+                                    );
+                                } else {
+                                    let (edge, cross_fraction) = match pos {
+                                        Position::Left => (DisplayEdge::Left, ny),
+                                        Position::Right => (DisplayEdge::Right, ny),
+                                        Position::Top => (DisplayEdge::Top, nx),
+                                        Position::Bottom => (DisplayEdge::Bottom, nx),
                                     };
                                     log::info!(
-                                        "[cursor-pos] recv pos={pos:?} nx={nx:.3} ny={ny:.3} display_bounds=({w},{h}) → warp=({tx},{ty})"
+                                        "[cursor-pos] recv pos={pos:?} nx={nx:.3} ny={ny:.3} — projecting onto {edge:?} display contour"
                                     );
-                                    self.emulation_proxy.warp_cursor(tx, ty);
-                                } else {
-                                    log::info!(
-                                        "[cursor-pos] recv pos={pos:?} nx={nx:.3} ny={ny:.3} but display_bounds=None — skipping warp"
-                                    );
+                                    let _ = self
+                                        .emulation_proxy
+                                        .warp_cursor_to_edge(edge, f64::from(cross_fraction))
+                                        .await;
                                 }
                             }
                             _ => {}
                         }
                     }
-                    Some(ListenEvent::Accept { addr, fingerprint }) => {
+                    Some(ListenEvent::Accept { addr, session, fingerprint }) => {
+                        // A reused UDP address is a distinct authenticated
+                        // session. Do not let the old heartbeat make it look
+                        // responsive before this connection speaks.
+                        last_response.remove(&addr);
+                        completed_handovers.retain(|(candidate, _), _| *candidate != addr);
+                        legacy_enter_ready.retain(|(candidate, _)| *candidate != addr);
+                        input_owner_sessions.retain(|(candidate, _), _| *candidate != addr);
+                        peer_capabilities.retain(|(candidate, _), _| *candidate != addr);
+                        pending_leaves.retain(|(candidate, _, _), _| *candidate != addr);
+                        // Destroy any handle owned by the prior authenticated
+                        // session before a same-address replacement can send
+                        // input. This releases its pressed keys in the backend.
+                        self.emulation_proxy.forget(addr);
+                        log::debug!("accepted inbound DTLS session {session} from {addr}");
                         // A new authenticated session starts in unknown/unlocked
                         // transport state. A still-locked sender immediately
                         // re-publishes Locked from its retained recovery state.
@@ -484,7 +1022,34 @@ impl ListenTask {
                         // first Input from this addr arrives.
                         let pp = self.post_processing_for_addr(addr);
                         self.emulation_proxy.set_post_processing(addr, pp);
-                        self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
+                        self.event_tx.send(EmulationEvent::Connected {
+                            addr,
+                            session,
+                            fingerprint,
+                        }).expect("channel closed");
+                    }
+                    Some(ListenEvent::Disconnected { addr, session }) => {
+                        if last_response
+                            .get(&addr)
+                            .is_some_and(|(current, _)| *current == session)
+                        {
+                            last_response.remove(&addr);
+                        }
+                        self.locked_hosts.remove(&addr);
+                        self.latest_host_input_states.remove(&addr);
+                        self.addr_to_fingerprint.remove(&addr);
+                        completed_handovers.remove(&(addr, session));
+                        legacy_enter_ready.remove(&(addr, session));
+                        input_owner_sessions.remove(&(addr, session));
+                        peer_capabilities.remove(&(addr, session));
+                        pending_leaves.retain(|(candidate, generation, _), _| {
+                            *candidate != addr || *generation != session
+                        });
+                        self.emulation_proxy.forget(addr);
+                        self.event_tx.send(EmulationEvent::Disconnected {
+                            addr,
+                            session,
+                        }).expect("channel closed");
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
                         if rejected_connections.insert(fingerprint.clone(), Instant::now())
@@ -501,7 +1066,7 @@ impl ListenTask {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release { addr, handover } => {
+                    EmulationRequest::Release { addr, session, handover } => {
                         // Leave(0) remains the legacy handover signal so a
                         // new sender stays safe with old receivers. Only a
                         // one-way EnterOnly edge opts into the new mode: no
@@ -512,7 +1077,35 @@ impl ListenTask {
                         } else {
                             LEAVE_RELEASE_ONLY
                         };
-                        self.listener.reply(addr, ProtoEvent::Leave(mode)).await;
+                        if self.session_is_current(addr, session) {
+                            // The local pointer crossed the exact return barrier,
+                            // so this session must stop injecting immediately.
+                            // Waiting for the reciprocal Leave makes held-key
+                            // cleanup depend on another lossy datagram and lets
+                            // stale input race the new local capture.
+                            let serial = input_owner_sessions.remove(&(addr, session));
+                            legacy_enter_ready.remove(&(addr, session));
+                            self.emulation_proxy.remove(addr);
+                            let transactional = peer_capabilities
+                                .get(&(addr, session))
+                                .is_some_and(|capabilities| {
+                                    capabilities & CAP_TRANSACTIONAL_HANDOVER != 0
+                                });
+                            if let Some(serial) = serial.filter(|_| transactional) {
+                                pending_leaves.insert((addr, session, serial), mode);
+                                self.listener
+                                    .reply(
+                                        addr,
+                                        session,
+                                        ProtoEvent::HandoverLeave { serial, mode },
+                                    )
+                                    .await;
+                            } else if !transactional {
+                                self.listener
+                                    .reply(addr, session, ProtoEvent::Leave(mode))
+                                    .await;
+                            }
+                        }
                     }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
@@ -533,39 +1126,141 @@ impl ListenTask {
                             // wall-press auto-release model matches
                             // immediately, without waiting for the
                             // next cross-back-then-cross-forward.
-                            self.listener.reply(addr, ProtoEvent::ReceiverSensitivity {
-                                mouse_sensitivity: pp.mouse_sensitivity,
-                            }).await;
+                            if let Some(session) = self.listener.current_session(addr) {
+                                self.listener.reply(addr, session, ProtoEvent::ReceiverSensitivity {
+                                    mouse_sensitivity: pp.mouse_sensitivity,
+                                }).await;
+                            }
                         }
                     }
                     EmulationRequest::Terminate => break,
                 },
-                _ = interval.tick() => {
-                    last_response.retain(|&addr,instant| {
-                        if instant.elapsed() > Duration::from_secs(1) {
-                            log::warn!("releasing keys: {addr} not responding!");
-                            self.locked_hosts.remove(&addr);
-                            self.latest_host_input_states.remove(&addr);
-                            self.emulation_proxy.remove(addr);
-                            self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
-                            false
-                        } else {
-                            true
+                _ = heartbeat_interval.tick() => {
+                    let timed_out: Vec<_> = last_response
+                        .iter()
+                        .filter_map(|(&addr, &(session, instant))| {
+                            (instant.elapsed() > Duration::from_secs(1))
+                                .then_some((addr, session))
+                        })
+                        .collect();
+                    for (addr, session) in timed_out {
+                        // The map is keyed by address, so verify the exact
+                        // generation before removing a timeout snapshot that
+                        // could have been superseded by a newer session.
+                        if !last_response.get(&addr).is_some_and(|(current, instant)| {
+                            *current == session
+                                && instant.elapsed() > Duration::from_secs(1)
+                        }) {
+                            continue;
                         }
-                    });
-                    // Push refreshed display geometry to actively
-                    // responding peers if it changed since the last
-                    // tick. Old peers ignore unrecognized events; an
-                    // idle peer picks the new size up from the cache
-                    // on its next Enter regardless.
-                    let bounds = self.emulation_proxy.display_bounds();
-                    if bounds != last_bounds {
-                        last_bounds = bounds;
-                        if let Some((width, height)) = bounds {
-                            let addrs: Vec<SocketAddr> = last_response.keys().copied().collect();
-                            for addr in addrs {
-                                self.listener.reply(addr, ProtoEvent::Bounds { width, height }).await;
+                        last_response.remove(&addr);
+                        if !self.session_is_current(addr, session) {
+                            continue;
+                        }
+
+                        // Preserve and report the exact active transaction
+                        // before clearing it. This lets an entirely idle
+                        // sender leave Sending immediately instead of waiting
+                        // for another input event to discover ownership loss.
+                        // Legacy peers receive no new control frame.
+                        if let Some(event) = heartbeat_ownership_loss(
+                            &peer_capabilities,
+                            &input_owner_sessions,
+                            addr,
+                            session,
+                        ) {
+                            self.listener.reply(addr, session, event).await;
+                            if !self.session_is_current(addr, session) {
+                                continue;
                             }
+                        }
+
+                        log::warn!(
+                            "releasing keys: {addr} session {session} not responding!"
+                        );
+                        self.locked_hosts.remove(&addr);
+                        self.latest_host_input_states.remove(&addr);
+                        self.emulation_proxy.remove(addr);
+                        // A retry on this still-authenticated session must
+                        // re-run release/warp and recreate the return barrier
+                        // after the pseudo-disconnect. Re-Acking the prior
+                        // completed serial would resume input without those
+                        // side effects.
+                        completed_handovers.remove(&(addr, session));
+                        legacy_enter_ready.remove(&(addr, session));
+                        input_owner_sessions.remove(&(addr, session));
+                        self.event_tx
+                            .send(EmulationEvent::Disconnected { addr, session })
+                            .expect("channel closed");
+                    }
+                }
+                _ = leave_retry_interval.tick() => {
+                    let retries: Vec<_> = pending_leaves
+                        .iter()
+                        .map(|(&(addr, session, serial), &mode)| {
+                            (addr, session, serial, mode)
+                        })
+                        .collect();
+                    for (addr, session, serial, mode) in retries {
+                        if self.session_is_current(addr, session) {
+                            self.listener
+                                .reply(
+                                    addr,
+                                    session,
+                                    ProtoEvent::HandoverLeave { serial, mode },
+                                )
+                                .await;
+                        } else {
+                            pending_leaves.remove(&(addr, session, serial));
+                        }
+                    }
+                }
+                _ = topology_interval.tick() => {
+                    // Republish the complete current topology to every
+                    // actively responding peer, even when it is unchanged.
+                    // These are UDP datagrams with no topology Ack; advancing
+                    // a global "last sent" cache after one fire-and-forget
+                    // send made a single lost Layout permanent until another
+                    // hotplug or Enter. The two-second refresh is cheap and
+                    // makes both packet loss and listener replacement
+                    // self-healing. Old peers ignore the extension event.
+                    let bounds = self.emulation_proxy.display_bounds();
+                    let layout = self.emulation_proxy.display_layout();
+                    refresh_topology_generation(
+                        &mut last_topology,
+                        &mut topology_generation,
+                        &layout,
+                    );
+                    let addrs: Vec<(SocketAddr, ListenerSession)> = last_response
+                        .iter()
+                        .map(|(&addr, &(session, _))| (addr, session))
+                        .collect();
+                    for &(addr, session) in &addrs {
+                        let pp = self.post_processing_for_addr(addr);
+                        self.listener.reply(
+                            addr,
+                            session,
+                            ProtoEvent::ReceiverSensitivity {
+                                mouse_sensitivity: pp.mouse_sensitivity,
+                            },
+                        ).await;
+                    }
+                    if let Some((width, height)) = bounds {
+                        for &(addr, session) in &addrs {
+                            self.listener.reply(addr, session, ProtoEvent::Bounds { width, height }).await;
+                        }
+                    }
+                    if let Some(layout) = layout {
+                        for (addr, session) in addrs {
+                            self.listener.reply(
+                                addr,
+                                session,
+                                ProtoEvent::display_layout_generation(
+                                    layout.clone(),
+                                    topology_epoch,
+                                    topology_generation,
+                                ),
+                            ).await;
                         }
                     }
                 }
@@ -589,17 +1284,28 @@ pub(crate) struct EmulationProxy {
     /// successful query, or if the active backend doesn't report
     /// geometry.
     display_bounds: Rc<Cell<Option<(u32, u32)>>>,
+    /// Cached full monitor topology paired with `display_bounds` from the same
+    /// backend query. Refreshed every two seconds while emulation is active.
+    display_layout: Rc<RefCell<Option<DisplayLayout>>>,
 }
 
 enum ProxyRequest {
     Input(Event, SocketAddr),
     Remove(SocketAddr),
+    /// Terminal DTLS teardown. Unlike `Remove`, also discard per-address
+    /// settings because a reconnect normally arrives from a new ephemeral
+    /// socket and must not leave one cache entry behind per old session.
+    Forget(SocketAddr),
     Terminate,
     Reenable,
     /// Warp the local cursor to an absolute position. Used on
     /// `Enter` to seat the cursor at the entry edge so the
     /// capturing peer's wall-press model is synchronized.
-    Warp(i32, i32),
+    WarpToEdge(DisplayEdge, f64, oneshot::Sender<Option<EdgeWarpOutcome>>),
+    /// Query and cache a fresh topology snapshot on the emulation task. Entry
+    /// metadata uses this instead of the periodic cache so a hotplug cannot
+    /// split cursor placement and advertised geometry across generations.
+    RefreshDisplayLayout(oneshot::Sender<Option<DisplayLayout>>),
     /// Set the receive-side post-processing for events arriving
     /// from `addr`. Resolved by ListenTask from the persistent
     /// authorized-peers table; cached on the EmulationTask side
@@ -615,10 +1321,12 @@ impl EmulationProxy {
         let emulation_active = Rc::new(Cell::new(false));
         let exit_requested = Rc::new(Cell::new(false));
         let display_bounds = Rc::new(Cell::new(None));
+        let display_layout = Rc::new(RefCell::new(None));
         let emulation_task = EmulationTask {
             backend,
             exit_requested: exit_requested.clone(),
             display_bounds: display_bounds.clone(),
+            display_layout: display_layout.clone(),
             post_processing: HashMap::new(),
             request_rx,
             event_tx,
@@ -633,6 +1341,7 @@ impl EmulationProxy {
             task,
             event_rx,
             display_bounds,
+            display_layout,
         }
     }
 
@@ -642,14 +1351,48 @@ impl EmulationProxy {
         self.display_bounds.get()
     }
 
-    /// Fire-and-forget cursor warp. Drops silently if emulation
-    /// isn't currently active (no live backend to receive the
-    /// request).
-    pub(crate) fn warp_cursor(&self, x: i32, y: i32) {
+    /// Full display topology paired with [`Self::display_bounds`].
+    pub(crate) fn display_layout(&self) -> Option<DisplayLayout> {
+        self.display_layout.borrow().clone()
+    }
+
+    /// Complete only after the active backend has applied the warp. The wire
+    /// Ack for an atomic handover is held behind this completion so the sender
+    /// cannot flush input while the cursor still belongs to the old screen.
+    pub(crate) async fn warp_cursor_to_edge(
+        &self,
+        edge: DisplayEdge,
+        cross_fraction: f64,
+    ) -> Option<EdgeWarpOutcome> {
         if !self.emulation_active.get() {
-            return;
+            return None;
         }
-        let _ = self.request_tx.send(ProxyRequest::Warp(x, y));
+        let (completion, completed) = oneshot::channel();
+        if self
+            .request_tx
+            .send(ProxyRequest::WarpToEdge(edge, cross_fraction, completion))
+            .is_err()
+        {
+            return None;
+        }
+        completed.await.unwrap_or(None)
+    }
+
+    /// Fetch geometry from the live backend rather than relying on the
+    /// two-second cache used for background topology announcements.
+    pub(crate) async fn refresh_display_layout(&self) -> Option<DisplayLayout> {
+        if !self.emulation_active.get() {
+            return None;
+        }
+        let (completion, completed) = oneshot::channel();
+        if self
+            .request_tx
+            .send(ProxyRequest::RefreshDisplayLayout(completion))
+            .is_err()
+        {
+            return None;
+        }
+        completed.await.unwrap_or(None)
     }
 
     /// Fire-and-forget per-addr post-processing update. Persists in
@@ -692,6 +1435,12 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
+    fn forget(&self, addr: SocketAddr) {
+        self.request_tx
+            .send(ProxyRequest::Forget(addr))
+            .expect("channel closed");
+    }
+
     fn reenable(&self) {
         self.request_tx
             .send(ProxyRequest::Reenable)
@@ -713,6 +1462,8 @@ struct EmulationTask {
     /// Shared cache; refreshed each time we (re)create the inner
     /// InputEmulation. Read by `EmulationProxy::display_bounds`.
     display_bounds: Rc<Cell<Option<(u32, u32)>>>,
+    /// Full topology cache from the same refresh as `display_bounds`.
+    display_layout: Rc<RefCell<Option<DisplayLayout>>>,
     /// Per-addr receive-side post-processing snapshots. Pushed by
     /// ListenTask via `ProxyRequest::SetPostProcessing` whenever
     /// the underlying authorized-peers table changes. Re-applied to
@@ -726,6 +1477,12 @@ struct EmulationTask {
 }
 
 impl EmulationTask {
+    fn cache_display_layout(&self, layout: Option<DisplayLayout>) {
+        self.display_bounds
+            .set(layout.as_ref().and_then(DisplayLayout::size));
+        self.display_layout.replace(layout);
+    }
+
     async fn run(mut self) {
         loop {
             if let Err(e) = self.do_emulation().await {
@@ -741,7 +1498,15 @@ impl EmulationTask {
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::Warp(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Forget(addr) => {
+                        forget_peer_state(&mut self.handles, &mut self.post_processing, addr);
+                    }
+                    ProxyRequest::WarpToEdge(_, _, completion) => {
+                        let _ = completion.send(None);
+                    }
+                    ProxyRequest::RefreshDisplayLayout(completion) => {
+                        let _ = completion.send(None);
+                    }
                     ProxyRequest::SetPostProcessing(addr, pp) => {
                         // No live backend yet, but cache the values so
                         // the next created backend picks them up the
@@ -757,14 +1522,20 @@ impl EmulationTask {
         log::info!("creating input emulation ...");
         let mut emulation = tokio::select! {
             r = InputEmulation::new(self.backend) => r?,
-            // allow termination event while requesting input emulation
-            _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
+            // Keep cache/handle teardown effective while the backend is being
+            // requested; this branch returns only for Terminate.
+            _ = wait_for_termination(
+                &mut self.request_rx,
+                &mut self.handles,
+                &mut self.post_processing,
+            ) => return Ok(()),
         };
 
-        // Refresh the shared display-bounds cache. Goes through
-        // EmulationProxy::display_bounds() so the daemon can include
-        // it in the ProtoEvent::Bounds reply on Enter.
-        self.display_bounds.set(emulation.display_bounds());
+        // Refresh the paired topology/bounds caches. Bounds are derived from
+        // this exact layout snapshot so legacy and topology-aware peers never
+        // initialize from two different monitor arrangements.
+        let layout = emulation.display_layout();
+        self.cache_display_layout(layout);
 
         // Re-apply per-handle post-processing for any handles we
         // already had before the backend was (re)created. New
@@ -784,9 +1555,16 @@ impl EmulationTask {
         );
 
         // create active handles
-        if let Err(e) = self.create_clients(&mut emulation).await {
-            emulation.terminate().await;
-            return Err(e);
+        match self.create_clients(&mut emulation).await {
+            Ok(true) => {
+                emulation.terminate().await;
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) => {
+                emulation.terminate().await;
+                return Err(e);
+            }
         }
 
         let res = self.do_emulation_session(&mut emulation).await;
@@ -798,14 +1576,36 @@ impl EmulationTask {
     async fn create_clients(
         &mut self,
         emulation: &mut InputEmulation,
-    ) -> Result<(), InputEmulationError> {
-        for handle in self.handles.values() {
+    ) -> Result<bool, InputEmulationError> {
+        // Snapshot so a terminal Forget received while create() is pending can
+        // remove the mapping without borrowing the map through the select.
+        let clients: Vec<(SocketAddr, EmulationHandle)> = self
+            .handles
+            .iter()
+            .map(|(&addr, &handle)| (addr, handle))
+            .collect();
+        for (addr, handle) in clients {
+            if self.handles.get(&addr) != Some(&handle) {
+                continue;
+            }
             tokio::select! {
-                _ = emulation.create(*handle) => {},
-                _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
+                _ = emulation.create(handle) => {
+                    // Forget/Remove may have completed concurrently with
+                    // create(). Do not leave an untracked backend handle.
+                    if self.handles.get(&addr) != Some(&handle) {
+                        emulation.destroy(handle).await;
+                    } else if let Some(&pp) = self.post_processing.get(&addr) {
+                        emulation.set_post_processing(handle, pp);
+                    }
+                },
+                _ = wait_for_termination(
+                    &mut self.request_rx,
+                    &mut self.handles,
+                    &mut self.post_processing,
+                ) => return Ok(true),
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     async fn do_emulation_session(
@@ -823,13 +1623,18 @@ impl EmulationTask {
         loop {
             tokio::select! {
                 _ = bounds_poll.tick() => {
-                    let current = emulation.display_bounds();
-                    if current != self.display_bounds.get() {
+                    let current_layout = emulation.display_layout();
+                    let current_bounds = current_layout.as_ref().and_then(DisplayLayout::size);
+                    if current_bounds != self.display_bounds.get()
+                        || self.display_layout.borrow().as_ref() != current_layout.as_ref()
+                    {
                         log::info!(
-                            "display geometry changed: {:?} -> {current:?}",
+                            "display geometry changed: bounds {:?} -> {current_bounds:?}, rects {} -> {}",
                             self.display_bounds.get(),
+                            self.display_layout.borrow().as_ref().map_or(0, DisplayLayout::len),
+                            current_layout.as_ref().map_or(0, DisplayLayout::len),
                         );
-                        self.display_bounds.set(current);
+                        self.cache_display_layout(current_layout);
                     }
                 }
                 e = self.request_rx.recv() => match e.expect("channel closed") {
@@ -871,10 +1676,38 @@ impl EmulationTask {
                         // SocketAddr (new ephemeral port), so a stale
                         // entry doesn't shadow a fresh one.
                     }
-                    ProxyRequest::Warp(x, y) => {
-                        if let Err(e) = emulation.warp_cursor(x, y).await {
-                            log::warn!("warp_cursor failed: {e}");
+                    ProxyRequest::Forget(addr) => {
+                        if let Some(handle) = forget_peer_state(
+                            &mut self.handles,
+                            &mut self.post_processing,
+                            addr,
+                        ) {
+                            emulation.destroy(handle).await;
                         }
+                    }
+                    ProxyRequest::WarpToEdge(edge, cross_fraction, completion) => {
+                        let result = emulation.warp_cursor_to_edge(edge, cross_fraction).await;
+                        let outcome = match result {
+                            Ok(EdgeWarpOutcome::Applied(layout)) => {
+                                // Preserve the exact snapshot used to calculate
+                                // the warp for the metadata sent before Ack.
+                                self.cache_display_layout(Some(layout.clone()));
+                                Some(EdgeWarpOutcome::Applied(layout))
+                            }
+                            Ok(EdgeWarpOutcome::Unsupported) => {
+                                Some(EdgeWarpOutcome::Unsupported)
+                            }
+                            Err(e) => {
+                                log::warn!("edge cursor warp failed: {e}");
+                                None
+                            }
+                        };
+                        let _ = completion.send(outcome);
+                    }
+                    ProxyRequest::RefreshDisplayLayout(completion) => {
+                        let layout = emulation.display_layout();
+                        self.cache_display_layout(layout.clone());
+                        let _ = completion.send(layout);
                     }
                     ProxyRequest::SetPostProcessing(addr, pp) => {
                         self.post_processing.insert(addr, pp);
@@ -906,17 +1739,42 @@ fn to_ipc_pos(pos: Position) -> mousehop_ipc::Position {
 /// left, the cursor entered from my left edge", so the cursor
 /// should land at x=0. Y is centered along the entry edge for
 /// Left/Right; X is centered for Top/Bottom.
-async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
+async fn wait_for_termination(
+    rx: &mut Receiver<ProxyRequest>,
+    handles: &mut HashMap<SocketAddr, EmulationHandle>,
+    post_processing: &mut HashMap<SocketAddr, ReceivePostProcessing>,
+) {
     loop {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
             ProxyRequest::Input(_, _) => continue,
-            ProxyRequest::Remove(_) => continue,
-            ProxyRequest::Warp(_, _) => continue,
-            ProxyRequest::SetPostProcessing(_, _) => continue,
+            ProxyRequest::Remove(addr) => {
+                handles.remove(&addr);
+            }
+            ProxyRequest::Forget(addr) => {
+                forget_peer_state(handles, post_processing, addr);
+            }
+            ProxyRequest::WarpToEdge(_, _, completion) => {
+                let _ = completion.send(None);
+            }
+            ProxyRequest::RefreshDisplayLayout(completion) => {
+                let _ = completion.send(None);
+            }
+            ProxyRequest::SetPostProcessing(addr, pp) => {
+                post_processing.insert(addr, pp);
+            }
             ProxyRequest::Reenable => continue,
         }
     }
+}
+
+fn forget_peer_state(
+    handles: &mut HashMap<SocketAddr, EmulationHandle>,
+    post_processing: &mut HashMap<SocketAddr, ReceivePostProcessing>,
+    addr: SocketAddr,
+) -> Option<EmulationHandle> {
+    post_processing.remove(&addr);
+    handles.remove(&addr)
 }
 
 struct DropGuard<T> {
@@ -970,6 +1828,134 @@ mod lock_state_tests {
     }
 
     #[test]
+    fn input_requires_current_handover_ownership_and_leave_revokes_it() {
+        let addr: SocketAddr = "192.0.2.8:4252".parse().expect("address");
+        let session = 9;
+        let locked_hosts = HashSet::new();
+        let mut owners = HashMap::new();
+
+        assert!(!remote_session_owns_input(
+            &locked_hosts,
+            &owners,
+            addr,
+            session
+        ));
+        owners.insert((addr, session), 41);
+        assert!(remote_session_owns_input(
+            &locked_hosts,
+            &owners,
+            addr,
+            session
+        ));
+        assert_eq!(
+            classify_transactional_input(&locked_hosts, &owners, addr, session, 41),
+            TransactionalInputDisposition::Consume
+        );
+        assert_eq!(
+            classify_transactional_input(&locked_hosts, &owners, addr, session, 40),
+            TransactionalInputDisposition::ReportOwnershipLost,
+            "late input from the previous crossing must not enter the newer owner"
+        );
+        owners.remove(&(addr, session));
+        assert!(
+            !remote_session_owns_input(&locked_hosts, &owners, addr, session),
+            "a delayed Input after Leave must not recreate an emulation handle"
+        );
+        assert_eq!(
+            classify_transactional_input(&locked_hosts, &owners, addr, session, 41),
+            TransactionalInputDisposition::ReportOwnershipLost,
+            "heartbeat teardown must tell the still-sending owner to release"
+        );
+    }
+
+    #[test]
+    fn heartbeat_proactively_reports_only_the_exact_transactional_owner() {
+        let addr: SocketAddr = "192.0.2.8:4252".parse().expect("address");
+        let other_addr: SocketAddr = "192.0.2.9:4252".parse().expect("address");
+        let session = 9;
+        let mut capabilities = HashMap::from([
+            ((addr, session), CAP_TRANSACTIONAL_HANDOVER),
+            ((other_addr, session), 0),
+        ]);
+        let owners = HashMap::from([((addr, session), 41), ((other_addr, session), 42)]);
+
+        assert!(matches!(
+            heartbeat_ownership_loss(&capabilities, &owners, addr, session),
+            Some(ProtoEvent::OwnershipLost { serial: 41 })
+        ));
+        assert!(
+            heartbeat_ownership_loss(&capabilities, &owners, addr, session + 1).is_none(),
+            "a replacement listener session must not inherit the old serial"
+        );
+        assert!(
+            heartbeat_ownership_loss(&capabilities, &owners, other_addr, session).is_none(),
+            "legacy peers must not receive transactional control frames"
+        );
+
+        capabilities.remove(&(addr, session));
+        assert!(heartbeat_ownership_loss(&capabilities, &owners, addr, session).is_none());
+    }
+
+    #[test]
+    fn serialled_leave_never_revokes_a_newer_handover() {
+        assert!(handover_leave_revokes(Some(41), Some(41), 41));
+        assert!(
+            handover_leave_revokes(Some(41), Some(41), 42),
+            "a leave reordered ahead of its newer Enter closes the old owner"
+        );
+        assert!(
+            !handover_leave_revokes(Some(42), Some(42), 41),
+            "a delayed old Leave must preserve the newer owner"
+        );
+        assert!(
+            !handover_leave_revokes(Some(41), None, 41),
+            "a duplicate Leave is idempotent once ownership was removed"
+        );
+    }
+
+    #[test]
+    fn lost_ack_reuses_the_exact_applied_topology_snapshot() {
+        let applied = DisplayLayout::new([(0, 0, 1920, 1080)]);
+        let hotplugged = DisplayLayout::new([(-1024, 0, 1024, 768), (0, 0, 1920, 1080)]);
+        let completed = CompletedHandover {
+            serial: 17,
+            warp: HandoverWarpStatus::Applied,
+            layout: Some(applied.clone()),
+            topology_generation: 3,
+        };
+
+        assert_ne!(completed.layout.as_ref(), Some(&hotplugged));
+        assert_eq!(completed.layout, Some(applied));
+        assert_eq!(completed.topology_generation, 3);
+    }
+
+    #[test]
+    fn terminal_forget_removes_only_the_disconnected_peers_cached_state() {
+        let disconnected: SocketAddr = "192.0.2.8:4252".parse().expect("address");
+        let current: SocketAddr = "192.0.2.9:4252".parse().expect("address");
+        let mut handles = HashMap::from([(disconnected, 3), (current, 4)]);
+        let mut post_processing = HashMap::from([
+            (
+                disconnected,
+                ReceivePostProcessing {
+                    natural_scroll: true,
+                    mouse_sensitivity: 1.25,
+                },
+            ),
+            (current, ReceivePostProcessing::default()),
+        ]);
+
+        assert_eq!(
+            forget_peer_state(&mut handles, &mut post_processing, disconnected),
+            Some(3)
+        );
+        assert!(!handles.contains_key(&disconnected));
+        assert!(!post_processing.contains_key(&disconnected));
+        assert_eq!(handles.get(&current), Some(&4));
+        assert!(post_processing.contains_key(&current));
+    }
+
+    #[test]
     fn stale_lock_cannot_override_newer_unlock() {
         let addr: SocketAddr = "192.0.2.8:4252".parse().expect("address");
         let mut latest_states = HashMap::new();
@@ -1003,6 +1989,70 @@ mod lock_state_tests {
         assert_eq!(
             latest_states.get(&addr),
             Some(&(8, HostInputState::Unlocked))
+        );
+    }
+
+    #[test]
+    fn topology_generation_changes_once_per_complete_layout() {
+        let first = DisplayLayout::new([(0, 0, 1920, 1080)]);
+        let second = DisplayLayout::new([(-1024, 0, 1024, 600), (0, 0, 1920, 1080)]);
+        let mut last = None;
+        let mut generation = 0;
+
+        refresh_topology_generation(&mut last, &mut generation, &Some(first.clone()));
+        assert_eq!(generation, 1);
+        refresh_topology_generation(&mut last, &mut generation, &Some(first));
+        assert_eq!(generation, 1, "periodic resend retains its generation");
+        refresh_topology_generation(&mut last, &mut generation, &None);
+        assert_eq!(generation, 1, "transient unavailable query is ignored");
+        refresh_topology_generation(&mut last, &mut generation, &Some(second.clone()));
+        assert_eq!(generation, 2);
+        assert_eq!(last, Some(second));
+    }
+
+    #[test]
+    fn atomic_handover_retries_reack_without_reapplying_side_effects() {
+        assert_eq!(classify_handover(None, 41), HandoverDisposition::Apply);
+        assert_eq!(classify_handover(Some(41), 41), HandoverDisposition::Reack);
+        assert_eq!(
+            classify_handover(Some(41), 40),
+            HandoverDisposition::DropStale
+        );
+        assert_eq!(classify_handover(Some(41), 42), HandoverDisposition::Apply);
+
+        let addr: SocketAddr = "192.0.2.9:4242".parse().expect("address");
+        let session = 7;
+        let mut completed = HashMap::from([(
+            (addr, session),
+            CompletedHandover {
+                serial: 41,
+                warp: HandoverWarpStatus::Applied,
+                layout: Some(DisplayLayout::new([(0, 0, 1920, 1080)])),
+                topology_generation: 7,
+            },
+        )]);
+        completed.remove(&(addr, session));
+        assert_eq!(
+            classify_handover(
+                completed
+                    .get(&(addr, session))
+                    .map(|completed| completed.serial),
+                41,
+            ),
+            HandoverDisposition::Apply,
+            "heartbeat teardown must make a same-serial retry rebuild ownership"
+        );
+    }
+
+    #[test]
+    fn atomic_handover_serial_order_wraps_across_zero() {
+        assert_eq!(
+            classify_handover(Some(u32::MAX), 1),
+            HandoverDisposition::Apply
+        );
+        assert_eq!(
+            classify_handover(Some(1), u32::MAX),
+            HandoverDisposition::DropStale
         );
     }
 }

@@ -3,7 +3,7 @@ use ashpd::{
         Session,
         input_capture::{
             Activated, ActivatedBarrier, Barrier, BarrierID, Capabilities, CreateSessionOptions,
-            InputCapture, Region, ReleaseOptions, Zones, ZonesChanged,
+            InputCapture, Region, ReleaseOptions, ZonesChanged,
         },
     },
     enumflags2::BitFlags,
@@ -23,7 +23,7 @@ use std::{
     os::unix::net::UnixStream,
     pin::Pin,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -31,6 +31,7 @@ use tokio::{
     sync::{
         Notify,
         mpsc::{self, Receiver, Sender},
+        oneshot,
     },
     task::JoinHandle,
 };
@@ -38,9 +39,12 @@ use tokio_util::sync::CancellationToken;
 
 use futures_core::Stream;
 
-use input_event::Event;
+use input_event::{
+    Event,
+    display::{DisplayEdge, DisplayLayout, EdgeSegment},
+};
 
-use crate::CaptureEvent;
+use crate::{CaptureEvent, normalize_cursor_in_layout};
 
 use super::{
     Capture as MousehopInputCapture, Position,
@@ -75,20 +79,88 @@ pub struct LibeiInputCapture {
     capture_task: JoinHandle<Result<(), CaptureError>>,
     event_rx: Receiver<(Position, CaptureEvent)>,
     notify_capture: Sender<LibeiNotifyEvent>,
-    notify_release: Arc<Notify>,
+    release_capture: Sender<ReleaseRequest>,
+    display_layout: Arc<Mutex<Option<DisplayLayout>>>,
     cancellation_token: CancellationToken,
     terminated: bool,
 }
 
-/// returns (start pos, end pos), inclusive
-fn pos_to_barrier(r: &Region, pos: Position) -> (i32, i32, i32, i32) {
-    let (x, y) = (r.x_offset(), r.y_offset());
-    let (w, h) = (r.width() as i32, r.height() as i32);
+#[derive(Debug)]
+struct ReleaseRequest {
+    warp_target: Option<(i32, i32)>,
+    /// Fulfilled only after the portal release call has completed. Dropping
+    /// this sender reports a failed/aborted release to the public backend.
+    completion: oneshot::Sender<()>,
+}
+
+/// Full portal-zone topology in the logical coordinate space used by
+/// `Activated.cursor_position`. Retaining the individual output rectangles,
+/// rather than only their bounding union, lets both pointer barriers and
+/// cursor-return projection follow a stepped multi-monitor contour.
+fn portal_display_layout(regions: &[Region]) -> DisplayLayout {
+    portal_display_layout_from_rects(regions.iter().map(|region| {
+        (
+            region.x_offset(),
+            region.y_offset(),
+            region.width(),
+            region.height(),
+        )
+    }))
+}
+
+fn portal_display_layout_from_rects(
+    regions: impl IntoIterator<Item = (i32, i32, u32, u32)>,
+) -> DisplayLayout {
+    DisplayLayout::new(regions)
+}
+
+fn portal_cursor_position(cursor: Option<(f32, f32)>) -> Option<(i32, i32)> {
+    cursor.and_then(|(x, y)| {
+        (x.is_finite() && y.is_finite()).then(|| (x.round() as i32, y.round() as i32))
+    })
+}
+
+fn display_edge(pos: Position) -> DisplayEdge {
     match pos {
-        Position::Left => (x, y, x, y + h - 1),
-        Position::Right => (x + w, y, x + w, y + h - 1),
-        Position::Top => (x, y, x + w - 1, y),
-        Position::Bottom => (x, y + h, x + w - 1, y + h),
+        Position::Left => DisplayEdge::Left,
+        Position::Right => DisplayEdge::Right,
+        Position::Top => DisplayEdge::Top,
+        Position::Bottom => DisplayEdge::Bottom,
+    }
+}
+
+/// Convert a contained contour segment to the inclusive endpoint convention
+/// used by the portal's pointer-barrier protocol. DisplayLayout represents
+/// right and bottom edges at their final contained pixel; the portal places
+/// those barriers at the rectangle's exclusive coordinate instead.
+fn segment_to_barrier(segment: EdgeSegment) -> (i32, i32, i32, i32) {
+    match segment.edge {
+        DisplayEdge::Left => (
+            segment.coordinate,
+            segment.start,
+            segment.coordinate,
+            segment.end - 1,
+        ),
+        DisplayEdge::Right => {
+            let x = segment
+                .coordinate
+                .checked_add(1)
+                .expect("validated display right edge must have an exclusive coordinate");
+            (x, segment.start, x, segment.end - 1)
+        }
+        DisplayEdge::Top => (
+            segment.start,
+            segment.coordinate,
+            segment.end - 1,
+            segment.coordinate,
+        ),
+        DisplayEdge::Bottom => {
+            let y = segment
+                .coordinate
+                .checked_add(1)
+                .expect("validated display bottom edge must have an exclusive coordinate");
+            (segment.start, y, segment.end - 1, y)
+        }
     }
 }
 
@@ -119,6 +191,8 @@ struct BarrierConfiguration {
     barriers: Vec<ICBarrier>,
     pos_for_barrier_id: HashMap<BarrierID, Position>,
     zone_set: u32,
+    /// Exact portal-zone topology used to create `barriers`.
+    layout: DisplayLayout,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,7 +202,7 @@ enum CaptureSessionExit {
 }
 
 fn select_barriers(
-    zones: &Zones,
+    layout: &DisplayLayout,
     clients: &[Position],
     next_barrier_id: &mut NonZeroU32,
 ) -> (Vec<ICBarrier>, HashMap<BarrierID, Position>) {
@@ -136,15 +210,19 @@ fn select_barriers(
     let mut barriers: Vec<ICBarrier> = vec![];
 
     for pos in clients {
-        let mut client_barriers = zones
-            .regions()
-            .iter()
-            .map(|r| {
+        let mut client_barriers = layout
+            .exposed_segments(display_edge(*pos))
+            .into_iter()
+            // A barrier must contain more than one point. Transient 1x1
+            // wl_output fallbacks occur while Hyprland is enumerating a
+            // monitor and would otherwise produce an invalid point barrier.
+            .filter(|segment| segment.len() > 1)
+            .map(|segment| {
                 let id = *next_barrier_id;
                 *next_barrier_id = next_barrier_id
                     .checked_add(1)
                     .expect("barrier id out of range");
-                let position = pos_to_barrier(r, *pos);
+                let position = segment_to_barrier(segment);
                 pos_for_barrier.insert(id, *pos);
                 ICBarrier::new(id, position)
             })
@@ -158,6 +236,7 @@ async fn update_barriers(
     input_capture: &InputCapture,
     session: &Session<InputCapture>,
     active_clients: &[Position],
+    shared_layout: &Mutex<Option<DisplayLayout>>,
     next_barrier_id: &mut NonZeroU32,
 ) -> Result<BarrierConfiguration, ashpd::Error> {
     let zones = input_capture
@@ -165,8 +244,18 @@ async fn update_barriers(
         .await?
         .response()?;
     log::debug!("zones: {zones:?}");
+    let layout = portal_display_layout(zones.regions());
+    if layout.is_empty() {
+        *shared_layout.lock().expect("display layout mutex poisoned") = None;
+        log::warn!("portal returned no usable display zones; clearing cached display layout");
+    } else {
+        *shared_layout.lock().expect("display layout mutex poisoned") = Some(layout.clone());
+    }
 
-    let (barriers, id_map) = select_barriers(&zones, active_clients, next_barrier_id);
+    // Keep IDs unique across replacements. Activated is an asynchronous portal
+    // signal; a delayed activation from the previous barrier generation must
+    // not alias an ID in the current map.
+    let (barriers, id_map) = select_barriers(&layout, active_clients, next_barrier_id);
     log::debug!("barriers: {barriers:?}");
     log::debug!("client for barrier id: {id_map:?}");
 
@@ -185,6 +274,7 @@ async fn update_barriers(
         barriers,
         pos_for_barrier_id: id_map,
         zone_set: zones.zone_set(),
+        layout,
     })
 }
 
@@ -192,10 +282,17 @@ async fn configure_barriers(
     input_capture: &InputCapture,
     session: &Session<InputCapture>,
     active_clients: &[Position],
+    display_layout: &Mutex<Option<DisplayLayout>>,
     next_barrier_id: &mut NonZeroU32,
 ) -> Result<BarrierConfiguration, CaptureError> {
-    let configuration =
-        update_barriers(input_capture, session, active_clients, next_barrier_id).await?;
+    let configuration = update_barriers(
+        input_capture,
+        session,
+        active_clients,
+        display_layout,
+        next_barrier_id,
+    )
+    .await?;
 
     if active_clients.is_empty() {
         log::debug!("all pointer barriers removed; leaving input capture suspended");
@@ -311,16 +408,18 @@ impl LibeiInputCapture {
 
         let (event_tx, event_rx) = mpsc::channel(1);
         let (notify_capture, notify_rx) = mpsc::channel(1);
-        let notify_release = Arc::new(Notify::new());
+        let (release_capture, release_rx) = mpsc::channel(1);
+        let display_layout = Arc::new(Mutex::new(None));
 
         let cancellation_token = CancellationToken::new();
 
         let capture = do_capture(
             input_capture_ptr,
             notify_rx,
-            notify_release.clone(),
+            release_rx,
             first_session,
             event_tx,
+            display_layout.clone(),
             cancellation_token.clone(),
         );
         let capture_task = tokio::task::spawn_local(capture);
@@ -330,7 +429,8 @@ impl LibeiInputCapture {
             event_rx,
             capture_task,
             notify_capture,
-            notify_release,
+            release_capture,
+            display_layout,
             cancellation_token,
             terminated: false,
         };
@@ -342,9 +442,10 @@ impl LibeiInputCapture {
 async fn do_capture(
     input_capture: *const InputCapture,
     mut capture_event: Receiver<LibeiNotifyEvent>,
-    notify_release: Arc<Notify>,
+    mut release_capture: Receiver<ReleaseRequest>,
     session: Option<(Session<InputCapture>, BitFlags<Capabilities>)>,
     event_tx: Sender<(Position, CaptureEvent)>,
+    display_layout: Arc<Mutex<Option<DisplayLayout>>>,
     cancellation_token: CancellationToken,
 ) -> Result<(), CaptureError> {
     let mut session = session.map(|s| s.0);
@@ -352,7 +453,7 @@ async fn do_capture(
     /* safety: libei_task does not outlive Self */
     let input_capture = unsafe { &*input_capture };
     let mut active_clients: Vec<Position> = vec![];
-    let mut next_barrier_id = NonZeroU32::new(1).expect("id must be non-zero");
+    let mut next_barrier_id = NonZeroU32::new(1).expect("barrier id must be non-zero");
     let mut last_session_close: Option<Instant> = None;
 
     let mut zones_changed = input_capture.receive_zones_changed().await?;
@@ -385,6 +486,11 @@ async fn do_capture(
                     log::debug!("capture event: {event:?}");
                     apply_client_update(&mut active_clients, event);
                 },
+                release = release_capture.recv() => {
+                    let release = release.ok_or(CaptureError::CaptureUpdatesClosed)?;
+                    log::debug!("discarding release request while capture is inactive");
+                    let _ = release.completion.send(());
+                }
             }
         }
 
@@ -413,8 +519,9 @@ async fn do_capture(
             &session,
             &event_tx,
             &mut active_clients,
+            &display_layout,
             &mut next_barrier_id,
-            &notify_release,
+            &mut release_capture,
             &mut capture_event,
             &mut zones_changed,
             &cancellation_token,
@@ -447,8 +554,9 @@ async fn do_capture_session<Z>(
     session: &Session<InputCapture>,
     event_tx: &Sender<(Position, CaptureEvent)>,
     active_clients: &mut Vec<Position>,
+    display_layout: &Mutex<Option<DisplayLayout>>,
     next_barrier_id: &mut NonZeroU32,
-    notify_release: &Notify,
+    release_capture: &mut Receiver<ReleaseRequest>,
     capture_event: &mut Receiver<LibeiNotifyEvent>,
     zones_changed: &mut Z,
     cancellation_token: &CancellationToken,
@@ -463,8 +571,14 @@ where
     // retain this EIS connection across Enable/Disable cycles.
     let (context, _connection, ei_event_stream) = connect_to_eis(input_capture, session).await?;
 
-    let mut barrier_configuration =
-        configure_barriers(input_capture, session, active_clients, next_barrier_id).await?;
+    let mut barrier_configuration = configure_barriers(
+        input_capture,
+        session,
+        active_clients,
+        display_layout,
+        next_barrier_id,
+    )
+    .await?;
 
     let release_session = Arc::new(Notify::new());
     let event_chan = event_tx.clone();
@@ -524,13 +638,21 @@ where
                     };
                     current_pos.replace(Some(pos));
 
+                    let cursor = portal_cursor_position(activated.cursor_position());
+                    let normalized_cursor = cursor.and_then(|cursor| {
+                        normalize_cursor_in_layout(&barrier_configuration.layout, cursor)
+                    });
                     event_tx
-                        .send((pos, CaptureEvent::Begin { cursor: None }))
+                        .send((pos, CaptureEvent::Begin {
+                            cursor,
+                            normalized_cursor,
+                        }))
                         .await
                         .expect("no channel");
                     active_capture = Some((activated, pos));
                 }
-                _ = notify_release.notified() => {
+                release = release_capture.recv() => {
+                    let release = release.ok_or(CaptureError::CaptureUpdatesClosed)?;
                     if active_capture.is_some() {
                         log::debug!("capture release requested");
                         release_active_capture(
@@ -538,21 +660,26 @@ where
                             session,
                             &mut active_capture,
                             &current_pos,
+                            release.warp_target,
                         ).await?;
                     } else {
                         log::debug!("capture release requested while capture is inactive");
                     }
+                    let _ = release.completion.send(());
                 }
                 _ = release_session.notified() => {
                     log::debug!("EIS device change requires session recreation");
+                    let interrupted_pos = active_capture.as_ref().map(|(_, pos)| *pos);
                     if let Err(error) = release_active_capture(
                         input_capture,
                         session,
                         &mut active_capture,
                         &current_pos,
+                        None,
                     ).await {
                         log::warn!("failed to release active capture before session recreation: {error}");
                     }
+                    emit_forced_auto_release(event_tx, interrupted_pos).await;
                     break Ok(CaptureSessionExit::Recreate);
                 }
                 _ = cancellation_token.cancelled() => {
@@ -562,6 +689,7 @@ where
                         session,
                         &mut active_capture,
                         &current_pos,
+                        None,
                     ).await {
                         log::warn!("failed to release active capture during shutdown: {error}");
                     }
@@ -584,12 +712,21 @@ where
                         continue;
                     }
 
-                    release_active_capture(
+                    let interrupted_pos = active_capture.as_ref().map(|(_, pos)| *pos);
+                    let release_result = release_active_capture(
                         input_capture,
                         session,
                         &mut active_capture,
                         &current_pos,
-                    ).await?;
+                        None,
+                    ).await;
+                    // A zone rebuild releases the compositor-side capture
+                    // without an explicit request from the outer capture
+                    // task. Tell it to flush held keys, send Leave, and reset
+                    // its active handle even if the portal release failed and
+                    // this session is about to be discarded.
+                    emit_forced_auto_release(event_tx, interrupted_pos).await;
+                    release_result?;
                     if needs_gnome_session_recreate_workaround() {
                         log::debug!("recreating session for GNOME barrier-update workaround");
                         break Ok(CaptureSessionExit::Recreate);
@@ -602,6 +739,7 @@ where
                         input_capture,
                         session,
                         active_clients,
+                        display_layout,
                         next_barrier_id,
                     ).await?;
                 }
@@ -613,12 +751,16 @@ where
                         continue;
                     }
 
-                    release_active_capture(
+                    let interrupted_pos = active_capture.as_ref().map(|(_, pos)| *pos);
+                    let release_result = release_active_capture(
                         input_capture,
                         session,
                         &mut active_capture,
                         &current_pos,
-                    ).await?;
+                        None,
+                    ).await;
+                    emit_forced_auto_release(event_tx, interrupted_pos).await;
+                    release_result?;
                     if needs_gnome_session_recreate_workaround() {
                         log::debug!("recreating session for GNOME barrier-update workaround");
                         break Ok(CaptureSessionExit::Recreate);
@@ -627,6 +769,7 @@ where
                         input_capture,
                         session,
                         active_clients,
+                        display_layout,
                         next_barrier_id,
                     ).await?;
                 }
@@ -637,9 +780,29 @@ where
     tokio::select! {
         result = ei_task => {
             log::warn!("libei exited; recreating capture session: {result:?}");
+            // The EIS stream can disappear while the portal still owns an
+            // active barrier. Closing the session gives the local pointer
+            // back, but the outer task must also end its network epoch.
+            emit_forced_auto_release(event_tx, current_pos.take()).await;
             Ok(CaptureSessionExit::Recreate)
         }
         result = portal_task => result,
+    }
+}
+
+async fn emit_forced_auto_release(
+    event_tx: &Sender<(Position, CaptureEvent)>,
+    interrupted_pos: Option<Position>,
+) {
+    if let Some(pos) = interrupted_pos {
+        log::debug!("capture at {pos} was interrupted by portal reconfiguration");
+        if event_tx
+            .send((pos, CaptureEvent::AutoRelease))
+            .await
+            .is_err()
+        {
+            log::debug!("outer capture task exited before forced release was delivered");
+        }
     }
 }
 
@@ -648,13 +811,14 @@ async fn release_active_capture(
     session: &Session<InputCapture>,
     active_capture: &mut Option<(Activated, Position)>,
     current_pos: &Cell<Option<Position>>,
+    warp_target: Option<(i32, i32)>,
 ) -> Result<(), CaptureError> {
     let Some((activated, pos)) = active_capture.take() else {
         return Ok(());
     };
 
     current_pos.set(None);
-    release_capture(input_capture, session, activated, pos).await
+    release_capture(input_capture, session, activated, pos, warp_target).await
 }
 
 async fn release_unmapped_capture(
@@ -677,26 +841,28 @@ async fn release_capture(
     session: &Session<InputCapture>,
     activated: Activated,
     current_pos: Position,
+    warp_target: Option<(i32, i32)>,
 ) -> Result<(), CaptureError> {
     if let Some(activation_id) = activated.activation_id() {
         log::debug!("releasing input capture {activation_id}");
     }
-    let (x, y) = activated
-        .cursor_position()
-        .expect("compositor did not report cursor position!");
-    log::debug!("client entered @ ({x}, {y})");
-    let (dx, dy) = match current_pos {
-        // offset cursor position to not enter again immediately
-        Position::Left => (1., 0.),
-        Position::Right => (-1., 0.),
-        Position::Top => (0., 1.),
-        Position::Bottom => (0., -1.),
-    };
-    // release 1px to the right of the entered zone
-    let cursor_position = (x as f64 + dx, y as f64 + dy);
+    let fallback_position = activated.cursor_position().map(|(x, y)| {
+        log::debug!("client entered @ ({x}, {y})");
+        let (dx, dy) = match current_pos {
+            // Offset the cursor so it does not immediately enter again.
+            Position::Left => (1., 0.),
+            Position::Right => (-1., 0.),
+            Position::Top => (0., 1.),
+            Position::Bottom => (0., -1.),
+        };
+        (x as f64 + dx, y as f64 + dy)
+    });
+    let cursor_position = warp_target
+        .map(|(x, y)| (f64::from(x), f64::from(y)))
+        .or(fallback_position);
     let release_options = ReleaseOptions::default()
         .set_activation_id(activated.activation_id())
-        .set_cursor_position(Some(cursor_position));
+        .set_cursor_position(cursor_position);
     input_capture.release(session, release_options).await?;
     Ok(())
 }
@@ -728,15 +894,6 @@ fn distance_to_line(line: ((f32, f32), (f32, f32)), p: (f32, f32)) -> f32 {
     distance
 }
 
-static ALL_CAPABILITIES: &[DeviceCapability] = &[
-    DeviceCapability::Pointer,
-    DeviceCapability::PointerAbsolute,
-    DeviceCapability::Keyboard,
-    DeviceCapability::Touch,
-    DeviceCapability::Scroll,
-    DeviceCapability::Button,
-];
-
 /// Whether the running portal backend needs the full session-recreate dance
 /// described in the GNOME/mutter note at the top of this file.
 ///
@@ -762,13 +919,35 @@ async fn handle_ei_event(
 ) -> Result<(), CaptureError> {
     match ei_event {
         EiEvent::SeatAdded(s) => {
-            s.seat.bind_capabilities(ALL_CAPABILITIES);
+            s.seat.bind_capabilities(
+                DeviceCapability::Pointer
+                    | DeviceCapability::PointerAbsolute
+                    | DeviceCapability::Keyboard
+                    | DeviceCapability::Touch
+                    | DeviceCapability::Scroll
+                    | DeviceCapability::Button,
+            );
             context.flush().map_err(|e| io::Error::new(e.kind(), e))?;
         }
-        EiEvent::SeatRemoved(_) | /* EiEvent::DeviceAdded(_) | */ EiEvent::DeviceRemoved(_) => {
+        EiEvent::SeatRemoved(_) => {
+            // Unlike an individual device replacement, a removed seat
+            // invalidates the capability binding itself. No future keyboard
+            // or pointer can be attached to it, so every compositor needs a
+            // fresh portal/EIS generation here.
+            log::debug!("EIS seat removed; recreating capture session: {ei_event:?}");
+            // There is exactly one portal-session consumer. `notify_one`
+            // retains a permit if it is temporarily busy releasing/rebuilding
+            // barriers; `notify_waiters` would lose this lifecycle edge when
+            // no `notified()` future is currently inside the select.
+            release_session.notify_one();
+        }
+        /* EiEvent::DeviceAdded(_) | */
+        EiEvent::DeviceRemoved(_) => {
             if needs_gnome_session_recreate_workaround() {
-                log::debug!("releasing session (GNOME/mutter device-change workaround): {ei_event:?}");
-                release_session.notify_waiters();
+                log::debug!(
+                    "releasing session (GNOME/mutter device-change workaround): {ei_event:?}"
+                );
+                release_session.notify_one();
             } else {
                 // wlroots/Hyprland/etc.: a device coming or going is
                 // normal EIS lifecycle, not a reason to rebuild the
@@ -781,12 +960,15 @@ async fn handle_ei_event(
         EiEvent::DeviceStartEmulating(_) => log::debug!("START EMULATING"),
         EiEvent::DeviceStopEmulating(_) => log::debug!("STOP EMULATING"),
         EiEvent::Disconnected(d) => {
-            return Err(CaptureError::Disconnected(format!("{:?}", d.reason)))
+            return Err(CaptureError::Disconnected(format!("{:?}", d.reason)));
         }
         _ => {
             if let Some(pos) = current_client {
                 for event in Event::from_ei_event(ei_event) {
-                    event_tx.send((pos, CaptureEvent::Input(event))).await.expect("no channel");
+                    event_tx
+                        .send((pos, CaptureEvent::Input(event)))
+                        .await
+                        .expect("no channel");
                 }
             }
         }
@@ -812,9 +994,18 @@ impl MousehopInputCapture for LibeiInputCapture {
         Ok(())
     }
 
-    async fn release(&mut self, _warp_target: Option<(i32, i32)>) -> Result<(), CaptureError> {
-        self.notify_release.notify_waiters();
-        Ok(())
+    async fn release(&mut self, warp_target: Option<(i32, i32)>) -> Result<(), CaptureError> {
+        let (completion, completed) = oneshot::channel();
+        self.release_capture
+            .send(ReleaseRequest {
+                warp_target,
+                completion,
+            })
+            .await
+            .map_err(|_| CaptureError::CaptureUpdatesClosed)?;
+        completed
+            .await
+            .map_err(|_| CaptureError::CaptureUpdatesClosed)
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
@@ -829,6 +1020,23 @@ impl MousehopInputCapture for LibeiInputCapture {
         self.terminated = true;
         log::debug!("done!");
         res
+    }
+
+    fn display_bounds(&self) -> Option<(u32, u32)> {
+        self.display_layout()?.size()
+    }
+
+    fn display_origin(&self) -> (i32, i32) {
+        self.display_layout()
+            .and_then(|layout| layout.origin())
+            .unwrap_or((0, 0))
+    }
+
+    fn display_layout(&self) -> Option<DisplayLayout> {
+        self.display_layout
+            .lock()
+            .expect("display layout mutex poisoned")
+            .clone()
     }
 }
 
@@ -904,5 +1112,167 @@ mod tests {
             LibeiNotifyEvent::Destroy(Position::Right),
         ));
         assert_eq!(active_clients, vec![Position::Left]);
+    }
+
+    const LINUX_PORTAL_REGIONS: [(i32, i32, u32, u32); 3] = [
+        (0, 0, 3072, 1728),
+        (-1024, 0, 1024, 600),
+        (836, 1728, 1280, 360),
+    ];
+
+    #[test]
+    fn portal_layout_preserves_exact_stepped_linux_topology() {
+        let layout = portal_display_layout_from_rects(LINUX_PORTAL_REGIONS);
+
+        assert_eq!(layout.origin(), Some((-1024, 0)));
+        assert_eq!(layout.size(), Some((4096, 2088)));
+        assert_eq!(
+            layout
+                .rectangles()
+                .map(|(index, rect)| (index, rect.origin(), rect.size()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, (0, 0), (3072, 1728)),
+                (1, (-1024, 0), (1024, 600)),
+                (2, (836, 1728), (1280, 360)),
+            ]
+        );
+    }
+
+    #[test]
+    fn portal_barriers_follow_exposed_stepped_linux_contour() {
+        let layout = portal_display_layout_from_rects(LINUX_PORTAL_REGIONS);
+        let clients = [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ];
+        let mut next_barrier_id = NonZeroU32::new(1).expect("non-zero id");
+        let (barriers, positions_by_id) = select_barriers(&layout, &clients, &mut next_barrier_id);
+
+        assert_eq!(
+            barriers
+                .iter()
+                .map(|barrier| barrier.position)
+                .collect::<Vec<_>>(),
+            vec![
+                // Left contour: left display, primary, then lower display.
+                (-1024, 0, -1024, 599),
+                (0, 600, 0, 1727),
+                (836, 1728, 836, 2087),
+                // Right and bottom use the portal's exclusive coordinate.
+                (3072, 0, 3072, 1727),
+                (2116, 1728, 2116, 2087),
+                // Top contour is split at the output-owner boundary.
+                (-1024, 0, -1, 0),
+                (0, 0, 3071, 0),
+                // Bottom follows both steps around the lower display.
+                (-1024, 600, -1, 600),
+                (0, 1728, 835, 1728),
+                (836, 2088, 2115, 2088),
+                (2116, 1728, 3071, 1728),
+            ]
+        );
+
+        let expected_positions = [
+            Position::Left,
+            Position::Left,
+            Position::Left,
+            Position::Right,
+            Position::Right,
+            Position::Top,
+            Position::Top,
+            Position::Bottom,
+            Position::Bottom,
+            Position::Bottom,
+            Position::Bottom,
+        ];
+        assert_eq!(barriers.len(), expected_positions.len());
+        for (barrier, expected_position) in barriers.iter().zip(expected_positions) {
+            assert_eq!(
+                positions_by_id.get(&barrier.barrier_id),
+                Some(&expected_position)
+            );
+        }
+    }
+
+    #[test]
+    fn portal_layout_ignores_empty_regions_and_point_barriers() {
+        let regions = [
+            (0, 0, 3072, 1728),
+            (0, 0, 0, 1080),
+            (0, 0, 1920, 0),
+            (5000, 5000, 1, 1),
+        ];
+        let layout = portal_display_layout_from_rects(regions);
+
+        assert_eq!(layout.len(), 2);
+        let mut next_barrier_id = NonZeroU32::new(1).expect("non-zero id");
+        let (barriers, _) = select_barriers(
+            &DisplayLayout::new([(5000, 5000, 1, 1)]),
+            &[
+                Position::Left,
+                Position::Right,
+                Position::Top,
+                Position::Bottom,
+            ],
+            &mut next_barrier_id,
+        );
+        assert!(barriers.is_empty());
+    }
+
+    #[test]
+    fn barrier_ids_do_not_alias_across_reconfigurations() {
+        let layout = DisplayLayout::new([(0, 0, 1920, 1080)]);
+        let mut next_barrier_id = NonZeroU32::new(1).expect("non-zero id");
+
+        let (first, _) = select_barriers(&layout, &[Position::Right], &mut next_barrier_id);
+        let (second, _) = select_barriers(&layout, &[Position::Right], &mut next_barrier_id);
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0].barrier_id, second[0].barrier_id);
+    }
+
+    #[tokio::test]
+    async fn active_zone_reconfiguration_notifies_outer_capture() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+
+        emit_forced_auto_release(&event_tx, Some(Position::Right)).await;
+
+        let (position, event) = event_rx.recv().await.expect("forced release event");
+        assert_eq!(position, Position::Right);
+        assert!(matches!(event, CaptureEvent::AutoRelease));
+    }
+
+    #[tokio::test]
+    async fn inactive_zone_reconfiguration_emits_nothing() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+
+        emit_forced_auto_release(&event_tx, None).await;
+
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn device_recreation_notification_survives_before_waiter_registration() {
+        let release_session = Notify::new();
+
+        release_session.notify_one();
+
+        tokio::time::timeout(Duration::from_millis(10), release_session.notified())
+            .await
+            .expect("stored recreation permit");
+    }
+
+    #[test]
+    fn activated_cursor_is_rounded_and_rejects_non_finite_values() {
+        assert_eq!(
+            portal_cursor_position(Some((3072.4, 603.6))),
+            Some((3072, 604))
+        );
+        assert_eq!(portal_cursor_position(Some((f32::NAN, 10.0))), None);
+        assert_eq!(portal_cursor_position(None), None);
     }
 }
