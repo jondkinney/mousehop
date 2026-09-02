@@ -72,6 +72,35 @@
 				</property>
 			</object>
 		</child>
+		<!-- optional modifier-gated edge crossing -->
+		<child>
+			<object class="AdwActionRow">
+				<property name="title" translatable="yes">Require Modifier to Cross</property>
+				<property name="subtitle" translatable="yes">Keep this edge local unless the selected modifier is held.</property>
+				<property name="activatable">false</property>
+				<child type="suffix">
+					<object class="GtkSwitch" id="require_crossing_modifier_switch">
+						<property name="valign">center</property>
+					</object>
+				</child>
+			</object>
+		</child>
+		<child>
+			<object class="AdwComboRow" id="crossing_modifier_combo">
+				<property name="title" translatable="yes">Crossing Modifier</property>
+				<property name="subtitle" translatable="yes">Either the left or right key will allow the crossing.</property>
+				<property name="model">
+					<object class="GtkStringList">
+						<items>
+							<item translatable="yes">Control</item>
+							<item translatable="yes">Alt / Option</item>
+							<item translatable="yes">Shift</item>
+							<item translatable="yes">Super / Command / Windows</item>
+						</items>
+					</object>
+				</property>
+			</object>
+		</child>
 		<!-- connection address selector (multi-homed peers) -->
 		<child>
 			<object class="AdwComboRow" id="address_select">

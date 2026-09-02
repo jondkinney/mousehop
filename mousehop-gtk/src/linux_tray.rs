@@ -10,7 +10,10 @@
 //! `TrayService::spawn`). Menu callbacks fire on that thread, so they
 //! push commands through an `async_channel` consumed by a
 //! `glib::spawn_future_local` task on the GTK main loop.
-use std::time::{Duration, Instant};
+use std::{
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
 
 use adw::prelude::*;
 use async_channel::Sender;
@@ -34,6 +37,35 @@ enum TrayCmd {
 /// previous state. 300 ms is comfortably below human double-click
 /// cadence while still swallowing the duplicates we see in practice.
 const ACTIVATE_DEBOUNCE: Duration = Duration::from_millis(300);
+
+fn systemd_stop_command() -> Command {
+    let mut command = Command::new("systemctl");
+    command
+        .args(["--user", "stop", "mousehop.service"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// Quit the Linux frontend and stop a separately managed user service, if
+/// present. `systemctl stop` deliberately does not disable the unit, so an
+/// enabled Mousehop service still starts with the next graphical session.
+pub(crate) fn quit(app: &adw::Application) {
+    match systemd_stop_command().status() {
+        Ok(status) if status.success() => {
+            log::info!("linux_tray: stopped mousehop.service");
+        }
+        Ok(status) => {
+            // This is expected for installs that run only the GUI-owned
+            // daemon child and do not have a systemd user unit installed.
+            log::debug!("linux_tray: mousehop.service was not stopped ({status})");
+        }
+        Err(error) => {
+            log::debug!("linux_tray: could not invoke systemctl: {error}");
+        }
+    }
+    app.quit();
+}
 
 struct MousehopTray {
     tx: Sender<TrayCmd>,
@@ -319,11 +351,26 @@ pub(crate) fn setup(app: &adw::Application, window: &Window) -> gio::Application
                 }
                 TrayCmd::Quit => {
                     log::debug!("linux_tray: quit requested via tray menu");
-                    app.quit();
+                    quit(&app);
                 }
             }
         }
     });
 
     hold
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quit_stops_but_does_not_disable_user_service() {
+        let command = systemd_stop_command();
+        assert_eq!(command.get_program(), "systemctl");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["--user", "stop", "mousehop.service"]
+        );
+    }
 }

@@ -14,7 +14,7 @@ use futures_core::Stream;
 use tokio::time::Sleep;
 
 use input_event::{
-    Event, KeyboardEvent, PointerEvent,
+    CrossingModifier, Event, KeyboardEvent, PointerEvent,
     display::{DisplayEdge, DisplayLayout},
     scancode,
 };
@@ -428,6 +428,18 @@ impl InputCapture {
             self.capture.destroy(pos).await?;
         }
         Ok(())
+    }
+
+    /// Configure an optional backend-side modifier preflight for one edge.
+    /// Backends that can observe modifier state before taking ownership use
+    /// this to avoid a grab/release cycle for a blocked crossing. The outer
+    /// capture task retains its gate as a safety net for other backends.
+    pub async fn set_crossing_modifier(
+        &mut self,
+        pos: Position,
+        modifier: Option<CrossingModifier>,
+    ) -> Result<(), CaptureError> {
+        self.capture.set_crossing_modifier(pos, modifier).await
     }
 
     /// release mouse
@@ -1244,6 +1256,15 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
     /// the spot where capture started. Backends that don't hide the
     /// system cursor or can't warp it can ignore the parameter.
     async fn release(&mut self, warp_target: Option<(i32, i32)>) -> Result<(), CaptureError>;
+
+    /// Configure a modifier that must be held before this edge takes pointer
+    /// ownership. The default is intentionally a no-op: the higher-level gate
+    /// still enforces the setting for backends without a safe preflight API.
+    async fn set_crossing_modifier(
+        &mut self,
+        _pos: Position,
+        _modifier: Option<CrossingModifier>,
+    ) -> Result<(), CaptureError>;
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;

@@ -1,5 +1,7 @@
 use std::fmt::{self, Display};
 
+use serde::{Deserialize, Serialize};
+
 pub mod display;
 pub mod error;
 pub mod scancode;
@@ -19,6 +21,19 @@ pub const BTN_FORWARD: u32 = 0x114;
 /// reach WindowServer so they reset screen-saver idle, but never
 /// forwards them to a peer. The hexadecimal bytes spell `MOUSEHOP`.
 pub const MACOS_KEEP_AWAKE_EVENT_TAG: i64 = 0x4d4f_5553_4548_4f50;
+
+/// Modifier family that may gate an outgoing edge crossing. Either physical
+/// side satisfies the requirement; platform UIs label these as Control,
+/// Alt/Option, Shift, and Super/Command/Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CrossingModifier {
+    #[default]
+    Control,
+    Alt,
+    Shift,
+    Super,
+}
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum PointerEvent {

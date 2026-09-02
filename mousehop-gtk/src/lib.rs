@@ -333,7 +333,9 @@ fn setup_actions(app: &adw::Application) {
         move |_, _| {
             #[cfg(target_os = "macos")]
             request_quit_with_backstop(&app);
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "linux")]
+            linux_tray::quit(&app);
+            #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
             app.quit();
         }
     });

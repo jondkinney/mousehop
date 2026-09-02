@@ -12,6 +12,7 @@ use input_capture::{
 };
 use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use local_channel::mpsc::{Receiver, Sender, channel};
+use mousehop_ipc::CrossingModifier;
 use mousehop_proto::{
     CAP_ATOMIC_HANDOVER, CAP_TRANSACTIONAL_HANDOVER, HandoverWarpStatus,
     HostInputState as ProtoHostInputState, LEAVE_HANDOVER, LEAVE_RELEASE_ONLY, ProtoEvent,
@@ -82,7 +83,13 @@ enum CaptureRequest {
     /// racing local warp computed from stale virtual_cursor state.
     ReleaseForHandover(oneshot::Sender<bool>),
     /// add a capture client
-    Create(CaptureHandle, Position, CaptureType, bool),
+    Create(
+        CaptureHandle,
+        Position,
+        CaptureType,
+        bool,
+        Option<CrossingModifier>,
+    ),
     /// destory a capture client
     Destroy(CaptureHandle),
     /// reenable input capture
@@ -95,6 +102,8 @@ enum CaptureRequest {
     /// capture. A capture already in progress keeps its mapping until
     /// the next Begin so a configuration change cannot split a chord.
     SetCommandAsCtrl(CaptureHandle, bool),
+    /// Update the optional modifier gate for a client's next crossing.
+    SetCrossingModifier(CaptureHandle, Option<CrossingModifier>),
 }
 
 impl Capture {
@@ -125,6 +134,7 @@ impl Capture {
             command_ctrl_mapper: Default::default(),
             pending_input: Default::default(),
             pending_handover: None,
+            pending_cross: None,
             pending_leaves: Default::default(),
             active_handover_serial: None,
             modeling_disabled_for: None,
@@ -163,6 +173,7 @@ impl Capture {
         pos: mousehop_ipc::Position,
         capture_type: CaptureType,
         command_as_ctrl: bool,
+        crossing_modifier: Option<CrossingModifier>,
     ) {
         let pos = to_capture_pos(pos);
         self.request_tx
@@ -171,6 +182,7 @@ impl Capture {
                 pos,
                 capture_type,
                 command_as_ctrl,
+                crossing_modifier,
             ))
             .expect("channel closed");
     }
@@ -206,6 +218,16 @@ impl Capture {
             .request_tx
             .send(CaptureRequest::SetCommandAsCtrl(handle, enabled));
     }
+
+    pub(crate) fn set_crossing_modifier(
+        &self,
+        handle: CaptureHandle,
+        modifier: Option<CrossingModifier>,
+    ) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::SetCrossingModifier(handle, modifier));
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -228,7 +250,68 @@ macro_rules! debounce {
 // XKB/X11 modifier-mask bits used by every capture/emulation backend.
 // Command is represented as Mod4 in the cross-platform event stream.
 const CONTROL_MASK: u32 = 1 << 2;
+const SHIFT_MASK: u32 = 1 << 0;
+const ALT_MASK: u32 = 1 << 3;
 const MOD4_MASK: u32 = 1 << 6;
+
+fn crossing_modifier_keys(modifier: CrossingModifier) -> [scancode::Linux; 2] {
+    use scancode::Linux::{
+        KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift, KeyRightCtrl, KeyRightShift,
+        KeyRightalt, KeyRightmeta,
+    };
+    match modifier {
+        CrossingModifier::Control => [KeyLeftCtrl, KeyRightCtrl],
+        CrossingModifier::Alt => [KeyLeftAlt, KeyRightalt],
+        CrossingModifier::Shift => [KeyLeftShift, KeyRightShift],
+        CrossingModifier::Super => [KeyLeftMeta, KeyRightmeta],
+    }
+}
+
+fn crossing_modifier_mask(modifier: CrossingModifier) -> u32 {
+    match modifier {
+        CrossingModifier::Control => CONTROL_MASK,
+        CrossingModifier::Alt => ALT_MASK,
+        CrossingModifier::Shift => SHIFT_MASK,
+        CrossingModifier::Super => MOD4_MASK,
+    }
+}
+
+fn event_has_crossing_modifier(event: &CaptureEvent, modifier: CrossingModifier) -> bool {
+    matches!(
+        event,
+        CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers { depressed, .. }))
+            if depressed & crossing_modifier_mask(modifier) != 0
+    )
+}
+
+fn modifier_snapshot_complete(event: &CaptureEvent) -> bool {
+    matches!(
+        event,
+        CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers { .. }))
+            | CaptureEvent::Input(Event::Pointer(_))
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CrossingGateDecision {
+    Accept,
+    WaitForSnapshot,
+    Reject,
+}
+
+fn crossing_gate_decision(
+    required: Option<CrossingModifier>,
+    modifier_held: bool,
+    event: &CaptureEvent,
+) -> CrossingGateDecision {
+    if required.is_none() || modifier_held {
+        CrossingGateDecision::Accept
+    } else if modifier_snapshot_complete(event) {
+        CrossingGateDecision::Reject
+    } else {
+        CrossingGateDecision::WaitForSnapshot
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 struct AliasSide {
@@ -479,6 +562,7 @@ struct CaptureRegistration {
     pos: Position,
     capture_type: CaptureType,
     command_as_ctrl: bool,
+    crossing_modifier: Option<CrossingModifier>,
 }
 
 struct CaptureTask {
@@ -510,6 +594,10 @@ struct CaptureTask {
     pending_input: PendingInput,
     /// Exact Enter transaction being retried until the matching Ack arrives.
     pending_handover: Option<PendingHandover>,
+    /// A backend has grabbed an edge, but its authoritative held-modifier
+    /// snapshot has not arrived yet. No peer Enter is sent until the selected
+    /// modifier is confirmed.
+    pending_cross: Option<PendingCross>,
     /// Transactional cleanup retried until the exact peer serial confirms it.
     pending_leaves: HashMap<(CaptureHandle, ConnectionSession, u32), PendingLeave>,
     /// Nonzero handover serial owning live input for a transactional peer.
@@ -540,6 +628,12 @@ struct PendingHandover {
     /// peers carry it inside `enter`, so this is `None` for them.
     legacy_cursor: Option<ProtoEvent>,
     transactional: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PendingCross {
+    handle: CaptureHandle,
+    begin: CaptureEvent,
 }
 
 impl PendingHandover {
@@ -577,17 +671,22 @@ impl CaptureTask {
         pos: Position,
         capture_type: CaptureType,
         command_as_ctrl: bool,
+        crossing_modifier: Option<CrossingModifier>,
     ) {
         self.captures.push(CaptureRegistration {
             handle,
             pos,
             capture_type,
             command_as_ctrl,
+            crossing_modifier,
         });
     }
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
         self.captures.retain(|capture| capture.handle != handle);
+        if self.pending_cross.as_ref().map(|cross| cross.handle) == Some(handle) {
+            self.pending_cross = None;
+        }
     }
 
     fn is_default_capture_at(&self, pos: Position) -> bool {
@@ -657,6 +756,42 @@ impl CaptureTask {
         {
             capture.command_as_ctrl = enabled;
         }
+    }
+
+    fn crossing_modifier(&self, handle: CaptureHandle) -> Option<CrossingModifier> {
+        self.captures
+            .iter()
+            .find(|capture| capture.handle == handle)
+            .and_then(|capture| capture.crossing_modifier)
+    }
+
+    fn crossing_modifier_at(&self, pos: Position) -> Option<CrossingModifier> {
+        self.captures
+            .iter()
+            .find(|capture| capture.pos == pos && capture.capture_type == CaptureType::Default)
+            .and_then(|capture| capture.crossing_modifier)
+    }
+
+    fn set_crossing_modifier(&mut self, handle: CaptureHandle, modifier: Option<CrossingModifier>) {
+        if let Some(capture) = self
+            .captures
+            .iter_mut()
+            .find(|capture| capture.handle == handle)
+        {
+            capture.crossing_modifier = modifier;
+        }
+    }
+
+    fn crossing_modifier_held(
+        &self,
+        capture: &InputCapture,
+        modifier: CrossingModifier,
+        event: &CaptureEvent,
+    ) -> bool {
+        crossing_modifier_keys(modifier)
+            .iter()
+            .any(|key| capture.keys_pressed(&[*key]))
+            || event_has_crossing_modifier(event, modifier)
     }
 
     fn scoped_input(&self, event: Event) -> ProtoEvent {
@@ -813,8 +948,8 @@ impl CaptureTask {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
                         CaptureRequest::Reenable => break,
-                        CaptureRequest::Create(h, p, t, command_as_ctrl) => {
-                            self.add_capture(h, p, t, command_as_ctrl)
+                        CaptureRequest::Create(h, p, t, command_as_ctrl, crossing_modifier) => {
+                            self.add_capture(h, p, t, command_as_ctrl, crossing_modifier)
                         }
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::ReleaseForHandover(completion) => {
@@ -830,6 +965,9 @@ impl CaptureTask {
                         }
                         CaptureRequest::SetCommandAsCtrl(handle, enabled) => {
                             self.set_command_as_ctrl(handle, enabled);
+                        }
+                        CaptureRequest::SetCrossingModifier(handle, modifier) => {
+                            self.set_crossing_modifier(handle, modifier);
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -902,11 +1040,20 @@ impl CaptureTask {
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         let captures = self.captures.clone();
-        for registration in captures {
+        for registration in &captures {
             tokio::select! {
                 r = capture.create(registration.handle, registration.pos) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
             }
+        }
+        let positions = captures
+            .iter()
+            .map(|registration| registration.pos)
+            .collect::<HashSet<_>>();
+        for pos in positions {
+            capture
+                .set_crossing_modifier(pos, self.crossing_modifier_at(pos))
+                .await?;
         }
         Ok(())
     }
@@ -1243,9 +1390,12 @@ impl CaptureTask {
                         let _ = completion.send(result.is_ok());
                         result?;
                     },
-                    CaptureRequest::Create(h, p, t, command_as_ctrl) => {
-                        self.add_capture(h, p, t, command_as_ctrl);
+                    CaptureRequest::Create(h, p, t, command_as_ctrl, crossing_modifier) => {
+                        self.add_capture(h, p, t, command_as_ctrl, crossing_modifier);
                         capture.create(h, p).await?;
+                        capture
+                            .set_crossing_modifier(p, self.crossing_modifier_at(p))
+                            .await?;
                     }
                     CaptureRequest::Destroy(h) => {
                         let removed_type = self.get_type(h);
@@ -1267,6 +1417,9 @@ impl CaptureTask {
                         let pos = self.get_pos(h);
                         self.remove_capture(h);
                         capture.destroy(h).await?;
+                        capture
+                            .set_crossing_modifier(pos, self.crossing_modifier_at(pos))
+                            .await?;
                         if self.should_clear_peer_metadata_after_removal(pos, removed_type) {
                             // An EnterOnly registration can remain on the same
                             // edge after its outgoing Default peer is replaced;
@@ -1288,6 +1441,15 @@ impl CaptureTask {
                     CaptureRequest::SetCommandAsCtrl(handle, enabled) => {
                         self.set_command_as_ctrl(handle, enabled);
                     }
+                    CaptureRequest::SetCrossingModifier(handle, modifier) => {
+                        let pos = self.try_get_pos(handle);
+                        self.set_crossing_modifier(handle, modifier);
+                        if let Some(pos) = pos {
+                            capture
+                                .set_crossing_modifier(pos, self.crossing_modifier_at(pos))
+                                .await?;
+                        }
+                    }
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
@@ -1296,6 +1458,81 @@ impl CaptureTask {
     }
 
     async fn handle_capture_event(
+        &mut self,
+        capture: &mut InputCapture,
+        event: (CaptureHandle, CaptureEvent),
+    ) -> Result<(), CaptureError> {
+        let (handle, capture_event) = &event;
+
+        // Lifecycle events must never wait behind the crossing gate. In
+        // particular, a lock or backend release has to relinquish the local
+        // grab even if the compositor never delivered a modifier snapshot.
+        if matches!(
+            capture_event,
+            CaptureEvent::HostInputState(_) | CaptureEvent::AutoRelease
+        ) {
+            self.pending_cross = None;
+            return self.handle_accepted_capture_event(capture, event).await;
+        }
+
+        if let Some(pending) = self.pending_cross.take() {
+            // InputCapture broadcasts a same-edge event to both the outgoing
+            // Default registration and any incoming EnterOnly registration.
+            // Only the gated Default handle consumes its pending decision.
+            if pending.handle != *handle {
+                self.pending_cross = Some(pending);
+                return self.handle_accepted_capture_event(capture, event).await;
+            }
+
+            let required = self.crossing_modifier(pending.handle);
+            let modifier_held = required.is_some_and(|modifier| {
+                self.crossing_modifier_held(capture, modifier, capture_event)
+            });
+            match crossing_gate_decision(required, modifier_held, capture_event) {
+                CrossingGateDecision::Accept => {
+                    log::debug!("crossing modifier accepted for client {}", pending.handle);
+                    self.handle_accepted_capture_event(capture, (pending.handle, pending.begin))
+                        .await?;
+                    return self.handle_accepted_capture_event(capture, event).await;
+                }
+                CrossingGateDecision::Reject => {
+                    log::info!(
+                        "crossing blocked for client {}: {:?} is not held",
+                        pending.handle,
+                        required.expect("required modifier checked above")
+                    );
+                    capture.release().await?;
+                    return Ok(());
+                }
+                CrossingGateDecision::WaitForSnapshot => {}
+            }
+
+            // Held-key snapshots are a short sequence of Key events followed
+            // by one aggregate Modifiers event. Keep waiting so a non-required
+            // modifier sent first cannot incorrectly reject a later match.
+            self.pending_cross = Some(pending);
+            return Ok(());
+        }
+
+        if matches!(capture_event, CaptureEvent::Begin { .. }) {
+            if let Some(modifier) = self.crossing_modifier(*handle) {
+                if !self.crossing_modifier_held(capture, modifier, capture_event) {
+                    log::debug!(
+                        "deferring crossing into client {handle} until {modifier:?} state is known"
+                    );
+                    self.pending_cross = Some(PendingCross {
+                        handle: *handle,
+                        begin: capture_event.clone(),
+                    });
+                    return Ok(());
+                }
+            }
+        }
+
+        self.handle_accepted_capture_event(capture, event).await
+    }
+
+    async fn handle_accepted_capture_event(
         &mut self,
         capture: &mut InputCapture,
         event: (CaptureHandle, CaptureEvent),
@@ -1673,6 +1910,7 @@ impl CaptureTask {
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        self.pending_cross = None;
         self.notify_peer_of_leave().await;
         capture.release().await
     }
@@ -1695,6 +1933,7 @@ impl CaptureTask {
         self.modeling_disabled_for = None;
         self.pending_input.clear();
         self.pending_handover = None;
+        self.pending_cross = None;
         self.pending_leaves
             .retain(|_, pending| pending.handle != handle || pending.session != session);
         self.state = State::WaitingForAck;
@@ -1712,6 +1951,7 @@ impl CaptureTask {
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), CaptureError> {
+        self.pending_cross = None;
         self.notify_peer_of_leave().await;
         capture.release_no_host_warp().await
     }
@@ -1743,6 +1983,7 @@ impl CaptureTask {
         self.stop_user_activity();
         self.pending_input.clear();
         self.pending_handover = None;
+        self.pending_cross = None;
         self.state = State::WaitingForAck;
 
         // If we have an active client, notify them we're leaving
@@ -1914,7 +2155,8 @@ impl<T> Drop for DropGuard<T> {
 mod command_ctrl_tests {
     use super::*;
     use scancode::Linux::{
-        KeyA, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift, KeyRightCtrl, KeyRightmeta,
+        KeyA, KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift, KeyRightCtrl, KeyRightShift,
+        KeyRightalt, KeyRightmeta,
     };
 
     fn capture_task(active_client: Option<CaptureHandle>) -> CaptureTask {
@@ -1943,6 +2185,7 @@ mod command_ctrl_tests {
             command_ctrl_mapper: Default::default(),
             pending_input: Default::default(),
             pending_handover: None,
+            pending_cross: None,
             pending_leaves: Default::default(),
             active_handover_serial: None,
             modeling_disabled_for: None,
@@ -2102,8 +2345,8 @@ mod command_ctrl_tests {
     #[test]
     fn removing_one_same_edge_handle_keeps_position_registration() {
         let mut task = capture_task(Some(7));
-        task.add_capture(7, Position::Right, CaptureType::Default, false);
-        task.add_capture(8, Position::Right, CaptureType::EnterOnly, false);
+        task.add_capture(7, Position::Right, CaptureType::Default, false, None);
+        task.add_capture(8, Position::Right, CaptureType::EnterOnly, false, None);
 
         task.remove_capture(8);
 
@@ -2115,8 +2358,8 @@ mod command_ctrl_tests {
     #[test]
     fn removing_default_clears_metadata_even_when_enter_only_remains() {
         let mut task = capture_task(Some(7));
-        task.add_capture(7, Position::Right, CaptureType::Default, false);
-        task.add_capture(8, Position::Right, CaptureType::EnterOnly, false);
+        task.add_capture(7, Position::Right, CaptureType::Default, false, None);
+        task.add_capture(8, Position::Right, CaptureType::EnterOnly, false, None);
 
         let removed_type = task.get_type(7);
         task.active_client = None;
@@ -2129,8 +2372,8 @@ mod command_ctrl_tests {
     #[test]
     fn removing_inactive_same_edge_registration_preserves_active_default_metadata() {
         let mut task = capture_task(Some(7));
-        task.add_capture(7, Position::Right, CaptureType::Default, false);
-        task.add_capture(8, Position::Right, CaptureType::EnterOnly, false);
+        task.add_capture(7, Position::Right, CaptureType::Default, false, None);
+        task.add_capture(8, Position::Right, CaptureType::EnterOnly, false, None);
 
         let removed_type = task.get_type(8);
         task.remove_capture(8);
@@ -2141,11 +2384,78 @@ mod command_ctrl_tests {
     #[test]
     fn removed_handle_metadata_is_ignored_without_position_lookup_panic() {
         let mut task = capture_task(None);
-        task.add_capture(7, Position::Right, CaptureType::Default, false);
+        task.add_capture(7, Position::Right, CaptureType::Default, false, None);
         task.remove_capture(7);
 
         assert_eq!(task.try_get_pos(7), None);
         assert_ne!(task.active_client, Some(7));
+    }
+
+    #[test]
+    fn crossing_modifier_accepts_either_physical_side() {
+        assert_eq!(
+            crossing_modifier_keys(CrossingModifier::Control),
+            [KeyLeftCtrl, KeyRightCtrl]
+        );
+        assert_eq!(
+            crossing_modifier_keys(CrossingModifier::Alt),
+            [KeyLeftAlt, KeyRightalt]
+        );
+        assert_eq!(
+            crossing_modifier_keys(CrossingModifier::Shift),
+            [KeyLeftShift, KeyRightShift]
+        );
+        assert_eq!(
+            crossing_modifier_keys(CrossingModifier::Super),
+            [KeyLeftMeta, KeyRightmeta]
+        );
+    }
+
+    #[test]
+    fn aggregate_modifier_snapshot_can_accept_or_reject_crossing() {
+        let shift = CaptureEvent::Input(modifiers(SHIFT_MASK));
+        assert!(event_has_crossing_modifier(&shift, CrossingModifier::Shift));
+        assert!(!event_has_crossing_modifier(
+            &shift,
+            CrossingModifier::Control
+        ));
+        assert!(modifier_snapshot_complete(&shift));
+        assert_eq!(
+            crossing_gate_decision(Some(CrossingModifier::Shift), true, &shift),
+            CrossingGateDecision::Accept
+        );
+        assert_eq!(
+            crossing_gate_decision(Some(CrossingModifier::Control), false, &shift),
+            CrossingGateDecision::Reject
+        );
+
+        let key = CaptureEvent::Input(key(KeyLeftShift, 1));
+        assert!(!modifier_snapshot_complete(&key));
+        assert_eq!(
+            crossing_gate_decision(Some(CrossingModifier::Control), false, &key),
+            CrossingGateDecision::WaitForSnapshot
+        );
+        assert_eq!(
+            crossing_gate_decision(None, false, &key),
+            CrossingGateDecision::Accept
+        );
+    }
+
+    #[test]
+    fn crossing_modifier_registration_updates_without_recreating_capture() {
+        let mut task = capture_task(None);
+        task.add_capture(
+            7,
+            Position::Right,
+            CaptureType::Default,
+            false,
+            Some(CrossingModifier::Alt),
+        );
+        assert_eq!(task.crossing_modifier(7), Some(CrossingModifier::Alt));
+        task.set_crossing_modifier(7, Some(CrossingModifier::Super));
+        assert_eq!(task.crossing_modifier(7), Some(CrossingModifier::Super));
+        task.set_crossing_modifier(7, None);
+        assert_eq!(task.crossing_modifier(7), None);
     }
 
     fn modifiers(depressed: u32) -> Event {

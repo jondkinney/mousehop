@@ -22,7 +22,7 @@ use core_graphics::{
 };
 use futures_core::Stream;
 use input_event::{
-    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent,
+    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, CrossingModifier, Event, KeyboardEvent,
     MACOS_KEEP_AWAKE_EVENT_TAG, PointerEvent,
     display::{DisplayEdge, DisplayLayout},
     scancode,
@@ -31,7 +31,7 @@ use keycode::{KeyMap, KeyMapping};
 use libc::c_void;
 use once_cell::unsync::Lazy;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::{CString, c_char},
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -169,6 +169,9 @@ fn capture_anchor(
 struct InputCaptureState {
     /// active capture positions
     active_clients: Lazy<HashSet<Position>>,
+    /// Optional per-edge preflight. When absent, crossing retains the
+    /// historical immediate-capture path with no extra check.
+    crossing_modifiers: HashMap<Position, CrossingModifier>,
     /// the currently entered capture position, if any
     current_pos: Option<Position>,
     /// Whether this backend has successfully hidden the Quartz cursor. Keep
@@ -209,6 +212,7 @@ enum ProducerEvent {
     },
     Create(Position),
     Destroy(Position),
+    SetCrossingModifier(Position, Option<CrossingModifier>),
     Grab(Position),
     EventTapDisabled {
         recovery_generation: u64,
@@ -313,6 +317,7 @@ impl InputCaptureState {
     fn new() -> Result<Self, MacosCaptureCreationError> {
         let mut res = Self {
             active_clients: Lazy::new(HashSet::new),
+            crossing_modifiers: HashMap::new(),
             current_pos: None,
             cursor_hidden: false,
             tap_recovery_generation: 0,
@@ -499,9 +504,17 @@ impl InputCaptureState {
             }
             ProducerEvent::Destroy(p) => {
                 self.active_clients.remove(&p);
+                self.crossing_modifiers.remove(&p);
                 if self.current_pos == Some(p) {
                     self.current_pos = None;
                     self.show_cursor()?;
+                }
+            }
+            ProducerEvent::SetCrossingModifier(pos, modifier) => {
+                if let Some(modifier) = modifier {
+                    self.crossing_modifiers.insert(pos, modifier);
+                } else {
+                    self.crossing_modifiers.remove(&pos);
                 }
             }
             ProducerEvent::EventTapDisabled {
@@ -664,6 +677,20 @@ fn modifier_masks(flags: CGEventFlags) -> (XMods, XMods) {
     }
 
     (depressed, locked)
+}
+
+fn crossing_modifier_held(modifier: CrossingModifier, flags: CGEventFlags) -> bool {
+    let flag = match modifier {
+        CrossingModifier::Control => CGEventFlags::CGEventFlagControl,
+        CrossingModifier::Alt => CGEventFlags::CGEventFlagAlternate,
+        CrossingModifier::Shift => CGEventFlags::CGEventFlagShift,
+        CrossingModifier::Super => CGEventFlags::CGEventFlagCommand,
+    };
+    flags.contains(flag)
+}
+
+fn crossing_preflight_allows(required: Option<CrossingModifier>, flags: CGEventFlags) -> bool {
+    required.is_none_or(|modifier| crossing_modifier_held(modifier, flags))
 }
 
 /// Snapshot the post-remapping modifier state carried by the mouse event that
@@ -1130,7 +1157,13 @@ fn create_event_tap<'a>(
                 // the per-event cost zero — `is_screen_locked()` is
                 // an XPC to WindowServer (~10–50µs); a typical user
                 // crosses a wall a few times per minute.
-                if is_screen_locked() {
+                let required_modifier = state.crossing_modifiers.get(&new_pos).copied();
+                if !crossing_preflight_allows(required_modifier, cg_ev.get_flags()) {
+                    log::debug!(
+                        "crossing preflight blocked {new_pos:?}: {:?} is not held",
+                        required_modifier.expect("checked above")
+                    );
+                } else if is_screen_locked() {
                     log::info!("host screen locked; suppressing cross to {new_pos:?}");
                 } else {
                     capture_position = Some(new_pos);
@@ -1916,6 +1949,19 @@ mod modifier_tests {
     }
 
     #[test]
+    fn crossing_preflight_is_bypassed_when_the_gate_is_disabled() {
+        assert!(crossing_preflight_allows(None, CGEventFlags::empty()));
+        assert!(!crossing_preflight_allows(
+            Some(CrossingModifier::Control),
+            CGEventFlags::empty()
+        ));
+        assert!(crossing_preflight_allows(
+            Some(CrossingModifier::Control),
+            CGEventFlags::CGEventFlagControl
+        ));
+    }
+
+    #[test]
     fn device_flags_report_each_physical_modifier_key_independently() {
         let cases = [
             (KeyLeftCtrl, NX_DEVICE_LCTRL_KEY_MASK),
@@ -2158,6 +2204,7 @@ mod modifier_tests {
         let old_layout = DisplayLayout::new([(0, 0, 1920, 1080)]);
         let mut state = InputCaptureState {
             active_clients: Lazy::new(HashSet::new),
+            crossing_modifiers: HashMap::new(),
             current_pos: Some(Position::Right),
             cursor_hidden: true,
             tap_recovery_generation: 0,
@@ -2239,6 +2286,17 @@ impl Capture for MacOSInputCapture {
             .await
             .map_err(|_| CaptureError::CaptureUpdatesClosed)?;
         Ok(())
+    }
+
+    async fn set_crossing_modifier(
+        &mut self,
+        pos: Position,
+        modifier: Option<CrossingModifier>,
+    ) -> Result<(), CaptureError> {
+        self.notify_tx
+            .send(ProducerEvent::SetCrossingModifier(pos, modifier))
+            .await
+            .map_err(|_| CaptureError::CaptureUpdatesClosed)
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {

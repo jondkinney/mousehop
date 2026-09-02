@@ -7,6 +7,8 @@ use std::pin::Pin;
 use std::task::ready;
 use tokio::sync::mpsc::{Receiver, channel};
 
+use input_event::CrossingModifier;
+
 use super::{Capture, CaptureError, CaptureEvent, Position};
 
 mod display_util;
@@ -31,6 +33,15 @@ impl Capture for WindowsInputCapture {
 
     async fn release(&mut self, _warp_target: Option<(i32, i32)>) -> Result<(), CaptureError> {
         self.event_thread.release_capture();
+        Ok(())
+    }
+
+    async fn set_crossing_modifier(
+        &mut self,
+        pos: Position,
+        modifier: Option<CrossingModifier>,
+    ) -> Result<(), CaptureError> {
+        self.event_thread.set_crossing_modifier(pos, modifier);
         Ok(())
     }
 

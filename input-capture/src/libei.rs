@@ -40,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 use futures_core::Stream;
 
 use input_event::{
-    Event,
+    CrossingModifier, Event,
     display::{DisplayEdge, DisplayLayout, EdgeSegment},
 };
 
@@ -1006,6 +1006,14 @@ impl MousehopInputCapture for LibeiInputCapture {
         completed
             .await
             .map_err(|_| CaptureError::CaptureUpdatesClosed)
+    }
+
+    async fn set_crossing_modifier(
+        &mut self,
+        _pos: Position,
+        _modifier: Option<CrossingModifier>,
+    ) -> Result<(), CaptureError> {
+        Ok(())
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {

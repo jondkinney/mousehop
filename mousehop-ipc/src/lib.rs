@@ -16,7 +16,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub use input_event::scancode;
+pub use input_event::{CrossingModifier, scancode};
 
 mod connect;
 mod connect_async;
@@ -385,6 +385,16 @@ pub struct ClientConfig {
     /// `false` so existing peers keep their current modifier mapping.
     #[serde(default)]
     pub command_as_ctrl: bool,
+    /// When true, the pointer may enter this outgoing client only while
+    /// [`Self::crossing_modifier`] is physically held. Default-off preserves
+    /// the historical automatic edge crossing for existing configurations.
+    #[serde(default)]
+    pub require_crossing_modifier: bool,
+    /// Modifier family used by [`Self::require_crossing_modifier`]. Stored
+    /// separately so turning the requirement off and back on remembers the
+    /// user's selection.
+    #[serde(default)]
+    pub crossing_modifier: CrossingModifier,
 }
 
 impl Default for ClientConfig {
@@ -399,6 +409,8 @@ impl Default for ClientConfig {
             network_locks: HashMap::new(),
             clipboard_send: false,
             command_as_ctrl: false,
+            require_crossing_modifier: false,
+            crossing_modifier: CrossingModifier::default(),
         }
     }
 }
@@ -733,6 +745,12 @@ pub enum FrontendRequest {
     /// On a macOS sender, toggle the one-way Command-to-Control alias
     /// for the given outgoing client.
     SetClientCommandAsCtrl(ClientHandle, bool),
+    /// Toggle whether crossing into an outgoing client requires its selected
+    /// modifier to be held.
+    SetClientRequireCrossingModifier(ClientHandle, bool),
+    /// Select the modifier family that gates crossing into an outgoing
+    /// client.
+    SetClientCrossingModifier(ClientHandle, CrossingModifier),
     /// Set the base connection policy ([`ConnectionMode`]) for a
     /// client, and clear any explicit lock on the *current* network
     /// (so picking "Auto"/"Fastest" in the GUI releases a pin set
@@ -961,6 +979,8 @@ mod tests {
         let cfg: ClientConfig = serde_json::from_str(json).unwrap();
         assert!(!cfg.clipboard_send);
         assert!(!cfg.command_as_ctrl);
+        assert!(!cfg.require_crossing_modifier);
+        assert_eq!(cfg.crossing_modifier, CrossingModifier::Control);
     }
 
     #[test]
@@ -972,5 +992,18 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let decoded: ClientConfig = serde_json::from_str(&json).unwrap();
         assert!(decoded.command_as_ctrl);
+    }
+
+    #[test]
+    fn client_config_crossing_modifier_round_trips() {
+        let cfg = ClientConfig {
+            require_crossing_modifier: true,
+            crossing_modifier: CrossingModifier::Super,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let decoded: ClientConfig = serde_json::from_str(&json).unwrap();
+        assert!(decoded.require_crossing_modifier);
+        assert_eq!(decoded.crossing_modifier, CrossingModifier::Super);
     }
 }

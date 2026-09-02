@@ -7,7 +7,9 @@ use std::{
 
 use slab::Slab;
 
-use mousehop_ipc::{ClientConfig, ClientHandle, ClientState, ConnectionMode, IfaceKind, Position};
+use mousehop_ipc::{
+    ClientConfig, ClientHandle, ClientState, ConnectionMode, CrossingModifier, IfaceKind, Position,
+};
 
 use crate::config::ConfigClient;
 
@@ -37,6 +39,8 @@ impl ClientManager {
             network_locks: config_client.network_locks,
             clipboard_send: config_client.clipboard_send,
             command_as_ctrl: config_client.command_as_ctrl,
+            require_crossing_modifier: config_client.require_crossing_modifier,
+            crossing_modifier: config_client.crossing_modifier,
         };
         let state = ClientState {
             active: config_client.active,
@@ -375,6 +379,48 @@ impl ClientManager {
             .unwrap_or(false)
     }
 
+    pub(crate) fn set_require_crossing_modifier(
+        &self,
+        handle: ClientHandle,
+        required: bool,
+    ) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((config, _)) if config.require_crossing_modifier != required => {
+                config.require_crossing_modifier = required;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn set_crossing_modifier(
+        &self,
+        handle: ClientHandle,
+        modifier: CrossingModifier,
+    ) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((config, _)) if config.crossing_modifier != modifier => {
+                config.crossing_modifier = modifier;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn required_crossing_modifier(
+        &self,
+        handle: ClientHandle,
+    ) -> Option<CrossingModifier> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .and_then(|(config, _)| {
+                config
+                    .require_crossing_modifier
+                    .then_some(config.crossing_modifier)
+            })
+    }
+
     pub(crate) fn get_mode(&self, handle: ClientHandle) -> ConnectionMode {
         self.clients
             .borrow()
@@ -616,6 +662,8 @@ mod tests {
             network_locks: HashMap::new(),
             clipboard_send: false,
             command_as_ctrl: false,
+            require_crossing_modifier: false,
+            crossing_modifier: CrossingModifier::default(),
         });
         (cm, handle)
     }
@@ -726,5 +774,22 @@ mod tests {
         assert!(!cm.set_command_as_ctrl(h, true));
         assert!(cm.set_command_as_ctrl(h, false));
         assert!(!cm.command_as_ctrl(h));
+    }
+
+    #[test]
+    fn crossing_modifier_gate_is_per_client_and_default_off() {
+        let (cm, h) = manager_with_ips(&[]);
+        assert_eq!(cm.required_crossing_modifier(h), None);
+
+        assert!(cm.set_crossing_modifier(h, CrossingModifier::Alt));
+        assert_eq!(cm.required_crossing_modifier(h), None);
+        assert!(cm.set_require_crossing_modifier(h, true));
+        assert_eq!(
+            cm.required_crossing_modifier(h),
+            Some(CrossingModifier::Alt)
+        );
+        assert!(!cm.set_require_crossing_modifier(h, true));
+        assert!(cm.set_require_crossing_modifier(h, false));
+        assert_eq!(cm.required_crossing_modifier(h), None);
     }
 }
