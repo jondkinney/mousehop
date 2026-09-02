@@ -34,6 +34,21 @@ use std::{
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
 
+async fn shutdown_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        signal::ctrl_c().await
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ServiceError {
     #[error(transparent)]
@@ -351,7 +366,7 @@ impl Service {
                 event = recv_clipboard(&mut self.clipboard_monitor) => {
                     self.handle_local_clipboard_event(event).await;
                 }
-                r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
+                result = shutdown_signal() => break result?,
             }
         }
 
