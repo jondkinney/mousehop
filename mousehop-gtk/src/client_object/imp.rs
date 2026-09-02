@@ -22,6 +22,21 @@ pub struct ClientObject {
     #[property(name = "peer-commit", get, set, type = Option<String>, member = peer_commit)]
     #[property(name = "clipboard-send", get, set, type = bool, member = clipboard_send)]
     #[property(name = "command-as-ctrl", get, set, type = bool, member = command_as_ctrl)]
+    #[property(
+        name = "require-crossing-modifier",
+        get,
+        set,
+        type = bool,
+        member = require_crossing_modifier
+    )]
+    #[property(
+        name = "crossing-modifier",
+        get,
+        set,
+        type = u32,
+        member = crossing_modifier,
+        maximum = 3
+    )]
     pub data: RefCell<ClientData>,
 }
 

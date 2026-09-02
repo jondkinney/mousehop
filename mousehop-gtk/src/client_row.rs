@@ -4,7 +4,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::glib::{self, Object};
 
-use mousehop_ipc::{DEFAULT_PORT, Position};
+use mousehop_ipc::{CrossingModifier, DEFAULT_PORT, Position};
 
 use super::ClientObject;
 
@@ -171,6 +171,39 @@ impl ClientRow {
             .sync_create()
             .build();
 
+        let require_crossing_modifier_state_binding = client_object
+            .bind_property(
+                "require-crossing-modifier",
+                &self.imp().require_crossing_modifier_switch.get(),
+                "state",
+            )
+            .sync_create()
+            .build();
+        let require_crossing_modifier_active_binding = client_object
+            .bind_property(
+                "require-crossing-modifier",
+                &self.imp().require_crossing_modifier_switch.get(),
+                "active",
+            )
+            .sync_create()
+            .build();
+        let crossing_modifier_sensitive_binding = client_object
+            .bind_property(
+                "require-crossing-modifier",
+                &self.imp().crossing_modifier_combo.get(),
+                "sensitive",
+            )
+            .sync_create()
+            .build();
+        let crossing_modifier_binding = client_object
+            .bind_property(
+                "crossing-modifier",
+                &self.imp().crossing_modifier_combo.get(),
+                "selected",
+            )
+            .sync_create()
+            .build();
+
         bindings.push(active_binding);
         bindings.push(switch_position_binding);
         bindings.push(hostname_binding);
@@ -182,6 +215,10 @@ impl ClientRow {
         bindings.push(clipboard_send_active_binding);
         bindings.push(command_as_ctrl_state_binding);
         bindings.push(command_as_ctrl_active_binding);
+        bindings.push(require_crossing_modifier_state_binding);
+        bindings.push(require_crossing_modifier_active_binding);
+        bindings.push(crossing_modifier_sensitive_binding);
+        bindings.push(crossing_modifier_binding);
 
         // Render the initial collapsed subtitle from whatever
         // peer_commit the ClientObject was created with. Subsequent
@@ -232,6 +269,13 @@ impl ClientRow {
 
     pub fn set_command_as_ctrl(&self, value: bool) {
         self.imp().set_command_as_ctrl(value);
+    }
+
+    pub fn set_crossing_modifier(&self, required: bool, modifier: CrossingModifier) {
+        self.imp().set_crossing_modifier(
+            required,
+            crate::client_object::crossing_modifier_index(modifier),
+        );
     }
 
     /// Rebuild the address-selector dropdown from the object's cached

@@ -379,6 +379,11 @@ cp service/mousehop.service ~/.config/systemd/user
 systemctl --user daemon-reload
 systemctl --user enable --now mousehop.service
 ```
+
+Choosing **Quit Mousehop** from the Linux tray stops the running user service
+without disabling it. An enabled service therefore starts automatically again
+with the next graphical session.
+
 > [!Important]
 > Make sure to point `ExecStart=/usr/bin/mousehop daemon` to the actual `mousehop` binary (in case it is not under `/usr/bin`, e.g. when installed manually.
 
@@ -434,6 +439,9 @@ port = 4252
 mode = "fastest"
 # macOS sender only: make Command act as Control for this peer
 command_as_ctrl = true
+# optional: cross this edge only while either Control key is held
+require_crossing_modifier = true
+crossing_modifier = "control"
 ```
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
@@ -449,6 +457,22 @@ as Control, while Command no longer acts as the peer's Super/Windows
 key for that client. The setting can also be enabled with
 `command_as_ctrl = true` on the corresponding `[[clients]]` entry and
 is ignored when mousehop is running on a non-macOS sender.
+
+### Require a modifier to cross
+
+Each outgoing client has an optional **Require Modifier to Cross** switch. When
+enabled, moving into that client's configured edge does nothing unless the
+selected modifier is currently held; with the modifier held, crossing behaves
+exactly like automatic crossing. Either the left or right key works. On
+backends that expose held-modifier state at the boundary, Mousehop checks it
+before locking or hiding the pointer, so a blocked crossing rests at the local
+OS edge without a grab/release delay. This preflight is skipped entirely while
+the switch is off.
+
+Choose Control, Alt/Option, Shift, or Super/Command/Windows in the GUI. The
+equivalent `[[clients]]` settings are `require_crossing_modifier = true` and
+`crossing_modifier = "control"`, `"alt"`, `"shift"`, or `"super"`. The
+default is off, so existing clients retain automatic edge crossing.
 
 ### Multi-homed peers (interfaces, latency, locking)
 

@@ -481,6 +481,25 @@ impl Service {
                     self.save_config().await;
                 }
             }
+            FrontendRequest::SetClientRequireCrossingModifier(handle, required) => {
+                if self
+                    .client_manager
+                    .set_require_crossing_modifier(handle, required)
+                {
+                    let modifier = self.client_manager.required_crossing_modifier(handle);
+                    self.capture.set_crossing_modifier(handle, modifier);
+                    self.broadcast_client(handle);
+                    self.save_config().await;
+                }
+            }
+            FrontendRequest::SetClientCrossingModifier(handle, modifier) => {
+                if self.client_manager.set_crossing_modifier(handle, modifier) {
+                    let modifier = self.client_manager.required_crossing_modifier(handle);
+                    self.capture.set_crossing_modifier(handle, modifier);
+                    self.broadcast_client(handle);
+                    self.save_config().await;
+                }
+            }
             FrontendRequest::SetConnectionMode(handle, mode) => {
                 // Resolve the live network first: the user is acting on a
                 // connected machine, so a stale cached `None` (from a
@@ -685,6 +704,8 @@ impl Service {
                 network_locks: c.network_locks,
                 clipboard_send: c.clipboard_send,
                 command_as_ctrl: c.command_as_ctrl,
+                require_crossing_modifier: c.require_crossing_modifier,
+                crossing_modifier: c.crossing_modifier,
             })
             .collect();
         self.config.set_clients(clients);
@@ -1185,7 +1206,7 @@ impl Service {
         let handle = Self::ENTER_HANDLE_BEGIN + self.next_trigger_handle;
         self.next_trigger_handle += 1;
         self.capture
-            .create(handle, pos, CaptureType::EnterOnly, false);
+            .create(handle, pos, CaptureType::EnterOnly, false, None);
         self.incoming_conns.insert(addr);
         self.incoming_conn_info.insert(
             handle,
@@ -1340,8 +1361,14 @@ impl Service {
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
             let command_as_ctrl = self.client_manager.command_as_ctrl(handle);
-            self.capture
-                .create(handle, pos, CaptureType::Default, command_as_ctrl);
+            let crossing_modifier = self.client_manager.required_crossing_modifier(handle);
+            self.capture.create(
+                handle,
+                pos,
+                CaptureType::Default,
+                command_as_ctrl,
+                crossing_modifier,
+            );
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
         }

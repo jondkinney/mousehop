@@ -325,6 +325,44 @@ impl Window {
                         ),
                     );
                     row.connect_closure(
+                        "request-require-crossing-modifier-change",
+                        false,
+                        closure_local!(
+                            #[strong]
+                            window,
+                            move |row: ClientRow, required: bool| {
+                                if let Some(client) = window.client_by_idx(row.index() as u32) {
+                                    window.request(
+                                        FrontendRequest::SetClientRequireCrossingModifier(
+                                            client.handle(),
+                                            required,
+                                        ),
+                                    );
+                                }
+                            }
+                        ),
+                    );
+                    row.connect_closure(
+                        "request-crossing-modifier-change",
+                        false,
+                        closure_local!(
+                            #[strong]
+                            window,
+                            move |row: ClientRow, modifier_index: u32| {
+                                let Some(client) = window.client_by_idx(row.index() as u32) else {
+                                    return;
+                                };
+                                let modifier = crate::client_object::crossing_modifier_from_index(
+                                    modifier_index,
+                                );
+                                window.request(FrontendRequest::SetClientCrossingModifier(
+                                    client.handle(),
+                                    modifier,
+                                ));
+                            }
+                        ),
+                    );
+                    row.connect_closure(
                         "request-connection-choice",
                         false,
                         closure_local!(
@@ -463,6 +501,7 @@ impl Window {
         row.set_position(client.pos);
         row.set_clipboard_send(client.clipboard_send);
         row.set_command_as_ctrl(client.command_as_ctrl);
+        row.set_crossing_modifier(client.require_crossing_modifier, client.crossing_modifier);
         if let Some(client_object) = self.client_object_for_handle(handle) {
             client_object.set_mode(client.mode);
             row.refresh_addresses(&client_object);

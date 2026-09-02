@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ptr::addr_of_mut;
 
 use std::default::Default;
@@ -32,7 +32,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use input_event::{
-    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
+    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, CrossingModifier, Event, KeyboardEvent,
+    PointerEvent,
     scancode::{self, Linux},
 };
 
@@ -65,6 +66,10 @@ impl EventThread {
 
     pub(crate) fn destroy(&self, pos: Position) {
         self.client_update(ClientUpdate::Destroy(pos));
+    }
+
+    pub(crate) fn set_crossing_modifier(&self, pos: Position, modifier: Option<CrossingModifier>) {
+        self.client_update(ClientUpdate::SetCrossingModifier(pos, modifier));
     }
 
     fn exit(&self) {
@@ -101,6 +106,7 @@ enum RequestType {
 enum ClientUpdate {
     Create(Position),
     Destroy(Position),
+    SetCrossingModifier(Position, Option<CrossingModifier>),
 }
 
 /// `SetTimer` id for the low-level-hook watchdog.
@@ -136,6 +142,12 @@ thread_local! {
     /// would happily forward motion to the peer while the lock screen
     /// consumes keyboard events, leaving a half-broken state.
     static HOST_LOCKED: Cell<bool> = const { Cell::new(false) };
+    /// Momentary modifiers observed by the global low-level keyboard hook,
+    /// including presses that happened before an edge activated capture.
+    static HOST_MODIFIERS: RefCell<HashSet<Linux>> = RefCell::new(HashSet::new());
+    /// Optional per-edge preflight. An absent entry preserves immediate edge
+    /// capture without adding any modifier check.
+    static CROSSING_MODIFIERS: RefCell<HashMap<Position, CrossingModifier>> = RefCell::new(HashMap::new());
     /// Handles to the installed low-level hooks. Kept so the
     /// watchdog can unhook the stale handle before re-installing.
     static MOUSE_HOOK: Cell<Option<HHOOK>> = const { Cell::new(None) };
@@ -413,6 +425,14 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         return ret;
     }
 
+    if CROSSING_MODIFIERS.with_borrow(|modifiers| {
+        modifiers
+            .get(&pos)
+            .is_some_and(|modifier| !host_modifier_held(*modifier))
+    }) {
+        return ret;
+    }
+
     /* update active client and entry point */
     ACTIVE_CLIENT.replace(Some(pos));
     let entry_point = DISPLAYS.with_borrow(|(displays, _)| {
@@ -437,6 +457,11 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         },
     ) {
         log::error!("forwarding channel full — dropped capture-begin event: {e}");
+    }
+    for event in host_modifier_snapshot() {
+        if let Err(e) = try_send_event(active, event) {
+            log::error!("forwarding channel full — dropped modifier snapshot: {e}");
+        }
     }
 
     ret
@@ -472,14 +497,15 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     HOOK_FIRED.store(true, Ordering::Relaxed);
+    /* convert to key event */
+    let Some(key_event) = to_key_event(wparam, lparam) else {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    };
+    update_host_modifier_state(&key_event);
+
     /* get active client if any */
     let Some(client) = ACTIVE_CLIENT.get() else {
         return CallNextHookEx(None, ncode, wparam, lparam);
-    };
-
-    /* convert to key event */
-    let Some(key_event) = to_key_event(wparam, lparam) else {
-        return LRESULT(1);
     };
 
     if let Err(e) = try_send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
@@ -507,6 +533,7 @@ unsafe extern "system" fn window_proc(
         match wparam.0 as u32 {
             WTS_SESSION_LOCK => {
                 HOST_LOCKED.set(true);
+                HOST_MODIFIERS.with_borrow_mut(HashSet::clear);
                 if let Some(pos) = ACTIVE_CLIENT.take() {
                     log::info!("host session locked mid-capture; releasing");
                     let _ = try_send_event(pos, CaptureEvent::AutoRelease);
@@ -522,6 +549,102 @@ unsafe extern "system" fn window_proc(
         }
     }
     LRESULT(1)
+}
+
+fn update_host_modifier_state(event: &KeyboardEvent) {
+    let KeyboardEvent::Key { key, state, .. } = event else {
+        return;
+    };
+    let Ok(key) = Linux::try_from(*key) else {
+        return;
+    };
+    if !matches!(
+        key,
+        Linux::KeyLeftShift
+            | Linux::KeyRightShift
+            | Linux::KeyLeftCtrl
+            | Linux::KeyRightCtrl
+            | Linux::KeyLeftAlt
+            | Linux::KeyRightalt
+            | Linux::KeyLeftMeta
+            | Linux::KeyRightmeta
+    ) {
+        return;
+    }
+    HOST_MODIFIERS.with_borrow_mut(|pressed| {
+        if *state == 0 {
+            pressed.remove(&key);
+        } else {
+            pressed.insert(key);
+        }
+    });
+}
+
+fn host_modifier_snapshot() -> Vec<CaptureEvent> {
+    const SHIFT_MASK: u32 = 1 << 0;
+    const CONTROL_MASK: u32 = 1 << 2;
+    const ALT_MASK: u32 = 1 << 3;
+    const SUPER_MASK: u32 = 1 << 6;
+    const ORDERED_MODIFIERS: [Linux; 8] = [
+        Linux::KeyLeftShift,
+        Linux::KeyRightShift,
+        Linux::KeyLeftCtrl,
+        Linux::KeyRightCtrl,
+        Linux::KeyLeftAlt,
+        Linux::KeyRightalt,
+        Linux::KeyLeftMeta,
+        Linux::KeyRightmeta,
+    ];
+
+    HOST_MODIFIERS.with_borrow(|pressed| {
+        let mut events = ORDERED_MODIFIERS
+            .into_iter()
+            .filter(|key| pressed.contains(key))
+            .map(|key| {
+                CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                    time: 0,
+                    key: key as u32,
+                    state: 1,
+                }))
+            })
+            .collect::<Vec<_>>();
+        let mut depressed = 0;
+        for key in pressed {
+            depressed |= match key {
+                Linux::KeyLeftShift | Linux::KeyRightShift => SHIFT_MASK,
+                Linux::KeyLeftCtrl | Linux::KeyRightCtrl => CONTROL_MASK,
+                Linux::KeyLeftAlt | Linux::KeyRightalt => ALT_MASK,
+                Linux::KeyLeftMeta | Linux::KeyRightmeta => SUPER_MASK,
+                _ => 0,
+            };
+        }
+        events.push(CaptureEvent::Input(Event::Keyboard(
+            KeyboardEvent::Modifiers {
+                depressed,
+                latched: 0,
+                locked: 0,
+                group: 0,
+            },
+        )));
+        events
+    })
+}
+
+fn host_modifier_held(modifier: CrossingModifier) -> bool {
+    HOST_MODIFIERS.with_borrow(|pressed| match modifier {
+        CrossingModifier::Control => {
+            pressed.contains(&Linux::KeyLeftCtrl) || pressed.contains(&Linux::KeyRightCtrl)
+        }
+        CrossingModifier::Alt => {
+            pressed.contains(&Linux::KeyLeftAlt) || pressed.contains(&Linux::KeyRightalt)
+        }
+        CrossingModifier::Shift => {
+            pressed.contains(&Linux::KeyLeftShift) || pressed.contains(&Linux::KeyRightShift)
+        }
+        CrossingModifier::Super => {
+            pressed.contains(&Linux::KeyLeftMeta) || pressed.contains(&Linux::KeyRightmeta)
+        }
+    })
 }
 
 static DISPLAY_RESOLUTION_GENERATION: AtomicI32 = AtomicI32::new(1);
@@ -591,6 +714,16 @@ fn update_clients(request: ClientUpdate) {
                 }
             }
             CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));
+            CROSSING_MODIFIERS.with_borrow_mut(|modifiers| modifiers.remove(&pos));
+        }
+        ClientUpdate::SetCrossingModifier(pos, modifier) => {
+            CROSSING_MODIFIERS.with_borrow_mut(|modifiers| {
+                if let Some(modifier) = modifier {
+                    modifiers.insert(pos, modifier);
+                } else {
+                    modifiers.remove(&pos);
+                }
+            });
         }
     }
 }

@@ -2,6 +2,7 @@ use std::task::Poll;
 
 use async_trait::async_trait;
 use futures_core::Stream;
+use input_event::CrossingModifier;
 
 use super::{Capture, CaptureError, CaptureEvent, Position, error::X11InputCaptureCreationError};
 
@@ -24,6 +25,14 @@ impl Capture for X11InputCapture {
     }
 
     async fn release(&mut self, _warp_target: Option<(i32, i32)>) -> Result<(), CaptureError> {
+        Ok(())
+    }
+
+    async fn set_crossing_modifier(
+        &mut self,
+        _pos: Position,
+        _modifier: Option<CrossingModifier>,
+    ) -> Result<(), CaptureError> {
         Ok(())
     }
 

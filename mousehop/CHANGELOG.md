@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/jondkinney/mousehop/compare/v0.16.0...v0.17.0) - 2026-09-01
+
+### Added
+
+- *(crossing)* optionally require a per-client Control, Alt/Option, Shift, or Super/Command/Windows modifier to cross an edge
+
+### Fixed
+
+- *(crossing)* preflight an enabled crossing modifier before taking pointer ownership, avoiding repeated grab/release resistance at a blocked edge
+- *(linux/tray)* stop the systemd user daemon on Quit without disabling automatic startup
+
 ## [0.16.0](https://github.com/jondkinney/mousehop/compare/v0.15.6...v0.16.0) - 2026-09-01
 
 ### Added

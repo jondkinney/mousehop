@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use futures_core::Stream;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     fmt::{self, Display},
     io::{self, ErrorKind},
@@ -62,7 +62,7 @@ use wayland_client::{
 };
 
 use input_event::{
-    Event, KeyboardEvent, PointerEvent,
+    CrossingModifier, Event, KeyboardEvent, PointerEvent,
     display::{DisplayEdge, DisplayLayout, EdgeSegment},
     scancode,
 };
@@ -119,6 +119,9 @@ struct OutputInfo {
 
 struct State {
     active_positions: HashSet<Position>,
+    /// Optional per-edge modifier preflight. An absent entry preserves the
+    /// historical immediate-grab path without adding an edge check.
+    crossing_modifiers: HashMap<Position, CrossingModifier>,
     pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
     pointer_lock: Option<ZwpLockedPointerV1>,
@@ -126,6 +129,10 @@ struct State {
     shortcut_inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
     active_windows: Vec<Arc<Window>>,
     focused: Option<Arc<Window>>,
+    /// Pointer focus reached a gated edge, but ownership has not been taken.
+    /// We briefly request keyboard focus only to receive Wayland's atomic
+    /// held-key snapshot, then either begin capture or leave the edge inert.
+    crossing_preflight: Option<CrossingPreflight>,
     global_list: GlobalList,
     globals: Globals,
     wayland_fd: RawFd,
@@ -158,6 +165,14 @@ struct Window {
     /// coordinates. Combined with `wl_pointer::Enter`'s surface-local point
     /// to recover the exact screen-space crossing coordinate.
     surface_origin: (i32, i32),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CrossingPreflight {
+    pos: Position,
+    pointer_serial: u32,
+    cursor: (i32, i32),
+    normalized_cursor: Option<(f32, f32)>,
 }
 
 impl Window {
@@ -385,6 +400,7 @@ impl LayerShellInputCapture {
 
         let mut state = State {
             active_positions: Default::default(),
+            crossing_modifiers: Default::default(),
             pointer: None,
             keyboard: None,
             global_list,
@@ -403,6 +419,7 @@ impl LayerShellInputCapture {
             shortcut_inhibitor: None,
             active_windows: Vec::new(),
             focused: None,
+            crossing_preflight: None,
             qh,
             wayland_fd: queue.as_fd().as_raw_fd(),
             read_guard: None,
@@ -441,6 +458,7 @@ impl LayerShellInputCapture {
     fn delete_client(&mut self, pos: Position) {
         let inner = self.0.get_mut();
         inner.state.active_positions.remove(&pos);
+        inner.state.crossing_modifiers.remove(&pos);
 
         // A single edge can be removed while another edge owns the live
         // pointer/keyboard grab. Preserve that unrelated focus. If this edge
@@ -574,6 +592,35 @@ impl State {
         }
     }
 
+    fn start_crossing_preflight(
+        &mut self,
+        pointer_serial: u32,
+        cursor: (i32, i32),
+        normalized_cursor: Option<(f32, f32)>,
+    ) {
+        let window = self.focused.as_ref().expect("focused edge");
+        window
+            .layer_surface
+            .set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        window.surface.commit();
+        self.crossing_preflight = Some(CrossingPreflight {
+            pos: window.pos,
+            pointer_serial,
+            cursor,
+            normalized_cursor,
+        });
+    }
+
+    fn reject_crossing_preflight(&mut self) {
+        if let Some(window) = self.focused.as_ref() {
+            window
+                .layer_surface
+                .set_keyboard_interactivity(KeyboardInteractivity::None);
+            window.surface.commit();
+        }
+        self.crossing_preflight = None;
+    }
+
     fn ungrab(&mut self, warp_target: Option<(i32, i32)>) {
         // Only the keyboard-interactivity reset and the release warp
         // need a focused window; the teardown below must run
@@ -625,6 +672,7 @@ impl State {
             shortcut_inhibitor.destroy();
             self.shortcut_inhibitor = None;
         }
+        self.crossing_preflight = None;
     }
 
     /// Tear down a compositor-side grab whose surface disappeared or lost
@@ -783,6 +831,20 @@ impl Capture for LayerShellInputCapture {
         Ok(inner.flush_events()?)
     }
 
+    async fn set_crossing_modifier(
+        &mut self,
+        pos: Position,
+        modifier: Option<CrossingModifier>,
+    ) -> Result<(), CaptureError> {
+        let inner = self.0.get_mut();
+        if let Some(modifier) = modifier {
+            inner.state.crossing_modifiers.insert(pos, modifier);
+        } else {
+            inner.state.crossing_modifiers.remove(&pos);
+        }
+        Ok(inner.flush_events()?)
+    }
+
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         Ok(())
     }
@@ -925,17 +987,21 @@ impl Dispatch<WlPointer, ()> for State {
                     return;
                 };
                 app.focused = Some(window.clone());
-                app.grab(&surface, pointer, serial, qh);
                 let cursor = surface_to_screen(&window, surface_x, surface_y);
                 let layout = output_layout(&app.outputs);
                 let normalized_cursor = normalize_cursor_in_layout(&layout, cursor);
-                app.pending_events.push_back((
-                    window.pos,
-                    CaptureEvent::Begin {
-                        cursor: Some(cursor),
-                        normalized_cursor,
-                    },
-                ));
+                if app.crossing_modifiers.contains_key(&window.pos) {
+                    app.start_crossing_preflight(serial, cursor, normalized_cursor);
+                } else {
+                    app.grab(&surface, pointer, serial, qh);
+                    app.pending_events.push_back((
+                        window.pos,
+                        CaptureEvent::Begin {
+                            cursor: Some(cursor),
+                            normalized_cursor,
+                        },
+                    ));
+                }
             }
             wl_pointer::Event::Leave { surface, .. } => {
                 /* There are rare cases, where when a window is opened in
@@ -963,6 +1029,9 @@ impl Dispatch<WlPointer, ()> for State {
                 button,
                 state,
             } => {
+                if app.pointer_lock.is_none() {
+                    return;
+                }
                 let Some(window) = app.focused.as_ref() else {
                     log::debug!("dropping pointer button queued after capture lost focus");
                     return;
@@ -977,6 +1046,10 @@ impl Dispatch<WlPointer, ()> for State {
                 ));
             }
             wl_pointer::Event::Axis { time, axis, value } => {
+                if app.pointer_lock.is_none() {
+                    app.scroll_discrete_pending = false;
+                    return;
+                }
                 let Some(window) = app.focused.as_ref() else {
                     app.scroll_discrete_pending = false;
                     log::debug!("dropping pointer axis queued after capture lost focus");
@@ -1000,6 +1073,10 @@ impl Dispatch<WlPointer, ()> for State {
                 }
             }
             wl_pointer::Event::AxisValue120 { axis, value120 } => {
+                if app.pointer_lock.is_none() {
+                    app.scroll_discrete_pending = false;
+                    return;
+                }
                 let Some(window) = app.focused.as_ref() else {
                     log::debug!("dropping discrete pointer axis queued after capture lost focus");
                     return;
@@ -1030,7 +1107,7 @@ impl Dispatch<WlKeyboard, ()> for State {
         event: wl_keyboard::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
         match event {
             wl_keyboard::Event::Key {
@@ -1039,15 +1116,17 @@ impl Dispatch<WlKeyboard, ()> for State {
                 key,
                 state,
             } => {
-                if let Some(window) = &app.focused {
-                    app.pending_events.push_back((
-                        window.pos,
-                        CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
-                            time,
-                            key,
-                            state: u32::from(state) as u8,
-                        })),
-                    ));
+                if app.pointer_lock.is_some() {
+                    if let Some(window) = &app.focused {
+                        app.pending_events.push_back((
+                            window.pos,
+                            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                                time,
+                                key,
+                                state: u32::from(state) as u8,
+                            })),
+                        ));
+                    }
                 }
             }
             wl_keyboard::Event::Modifiers {
@@ -1057,37 +1136,67 @@ impl Dispatch<WlKeyboard, ()> for State {
                 mods_locked,
                 group,
             } => {
-                if let Some(window) = &app.focused {
-                    app.pending_events.push_back((
-                        window.pos,
-                        CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
-                            depressed: mods_depressed,
-                            latched: mods_latched,
-                            locked: mods_locked,
-                            group,
-                        })),
-                    ));
-                }
-            }
-            wl_keyboard::Event::Enter { keys, .. } => {
-                if let Some(window) = &app.focused {
-                    // `keys` is a native-endian wl_array of evdev u32s held
-                    // before this layer surface gained keyboard focus. Replay
-                    // only momentary modifiers: they must work immediately on
-                    // the peer and participate in release-bind/pressed-key
-                    // cleanup. Replaying characters or toggle locks here would
-                    // type phantom text or invert Caps/Num/Scroll on every
-                    // boundary crossing.
-                    for key in held_modifiers_on_enter(&keys) {
+                if app.pointer_lock.is_some() {
+                    if let Some(window) = &app.focused {
                         app.pending_events.push_back((
                             window.pos,
-                            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
-                                time: 0,
-                                key,
-                                state: 1,
+                            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
+                                depressed: mods_depressed,
+                                latched: mods_latched,
+                                locked: mods_locked,
+                                group,
                             })),
                         ));
                     }
+                }
+            }
+            wl_keyboard::Event::Enter { keys, .. } => {
+                let Some(window) = app.focused.clone() else {
+                    return;
+                };
+                // `keys` is a native-endian wl_array of evdev u32s held
+                // before this layer surface gained keyboard focus. Replay
+                // only momentary modifiers: they must work immediately on
+                // the peer and participate in release-bind/pressed-key
+                // cleanup. Replaying characters or toggle locks here would
+                // type phantom text or invert Caps/Num/Scroll on every
+                // boundary crossing.
+                let held_modifiers = held_modifiers_on_enter(&keys);
+
+                if let Some(preflight) = app.crossing_preflight.take() {
+                    if preflight.pos != window.pos {
+                        log::debug!(
+                            "discarding stale crossing preflight for {:?}",
+                            preflight.pos
+                        );
+                        app.reject_crossing_preflight();
+                        return;
+                    }
+                    let required = app.crossing_modifiers.get(&window.pos).copied();
+                    if crossing_preflight_allows(required, &held_modifiers) {
+                        let Some(pointer) = app.pointer.clone() else {
+                            app.reject_crossing_preflight();
+                            return;
+                        };
+                        app.grab(&window.surface, &pointer, preflight.pointer_serial, qh);
+                        app.pending_events.push_back((
+                            window.pos,
+                            CaptureEvent::Begin {
+                                cursor: Some(preflight.cursor),
+                                normalized_cursor: preflight.normalized_cursor,
+                            },
+                        ));
+                        queue_modifier_snapshot(app, window.pos, &held_modifiers);
+                    } else {
+                        log::debug!(
+                            "crossing preflight blocked {}: {:?} is not held",
+                            window.pos,
+                            required.expect("checked above")
+                        );
+                        app.reject_crossing_preflight();
+                    }
+                } else if app.pointer_lock.is_some() {
+                    queue_modifier_snapshot(app, window.pos, &held_modifiers);
                 }
             }
             wl_keyboard::Event::Leave { surface, .. } => {
@@ -1098,8 +1207,14 @@ impl Dispatch<WlKeyboard, ()> for State {
                 if matches_focus {
                     if app.pointer_lock.is_some() {
                         log::warn!("compositor released keyboard focus during capture");
+                        app.lose_focus();
+                    } else {
+                        // A rejected preflight deliberately gives keyboard
+                        // focus back while pointer focus stays on the inert
+                        // 1 px edge. Keep that pointer focus until wl_pointer
+                        // Leave so resting at the edge cannot retrigger checks.
+                        app.crossing_preflight = None;
                     }
-                    app.lose_focus();
                 } else {
                     // Output reconfiguration or a rapid re-entry can leave a
                     // Leave for an old surface queued behind focus on another
@@ -1134,6 +1249,75 @@ fn held_modifiers_on_enter(keys: &[u8]) -> Vec<u32> {
                 .map(|key| key as u32)
         })
         .collect()
+}
+
+fn held_modifiers_contain(keys: &[u32], modifier: CrossingModifier) -> bool {
+    let matches = |key| match modifier {
+        CrossingModifier::Control => matches!(
+            key,
+            scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl
+        ),
+        CrossingModifier::Alt => matches!(
+            key,
+            scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt
+        ),
+        CrossingModifier::Shift => matches!(
+            key,
+            scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift
+        ),
+        CrossingModifier::Super => matches!(
+            key,
+            scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta
+        ),
+    };
+    keys.iter()
+        .any(|key| scancode::Linux::try_from(*key).ok().is_some_and(matches))
+}
+
+fn crossing_preflight_allows(required: Option<CrossingModifier>, held_modifiers: &[u32]) -> bool {
+    required.is_none_or(|modifier| held_modifiers_contain(held_modifiers, modifier))
+}
+
+fn queue_modifier_snapshot(app: &mut State, pos: Position, held_modifiers: &[u32]) {
+    for &key in held_modifiers {
+        app.pending_events.push_back((
+            pos,
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key,
+                state: 1,
+            })),
+        ));
+    }
+    // Always terminate the held-key snapshot with an aggregate state,
+    // including zero, so the higher-level safety gate has a conclusive
+    // decision on every backend-generated Begin.
+    app.pending_events.push_back((
+        pos,
+        CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
+            depressed: modifier_mask_for_keys(held_modifiers),
+            latched: 0,
+            locked: 0,
+            group: 0,
+        })),
+    ));
+}
+
+fn modifier_mask_for_keys(keys: &[u32]) -> u32 {
+    const SHIFT_MASK: u32 = 1 << 0;
+    const CONTROL_MASK: u32 = 1 << 2;
+    const ALT_MASK: u32 = 1 << 3;
+    const SUPER_MASK: u32 = 1 << 6;
+
+    keys.iter().fold(0, |mask, key| {
+        mask | match scancode::Linux::try_from(*key) {
+            Ok(scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift) => SHIFT_MASK,
+            Ok(scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl) => CONTROL_MASK,
+            Ok(scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt) => ALT_MASK,
+            Ok(scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta) => SUPER_MASK,
+            _ => 0,
+        }
+    })
 }
 
 impl Dispatch<ZwpRelativePointerV1, ()> for State {
@@ -1297,12 +1481,15 @@ delegate_noop!(State: ignore ZwpLockedPointerV1);
 #[cfg(test)]
 mod tests {
     use super::{
-        deleting_position_interrupts_focus, held_modifiers_on_enter, lost_active_seat_device,
-        screen_to_surface, surface_leave_matches_focus,
+        crossing_preflight_allows, deleting_position_interrupts_focus, held_modifiers_on_enter,
+        lost_active_seat_device, modifier_mask_for_keys, screen_to_surface,
+        surface_leave_matches_focus,
     };
     use crate::Position;
+    use input_event::CrossingModifier;
     use input_event::scancode::Linux::{
-        KeyA, KeyCapsLock, KeyLeftShift, KeyNumlock, KeyRightCtrl, KeyScrollLock,
+        KeyA, KeyCapsLock, KeyLeftAlt, KeyLeftMeta, KeyLeftShift, KeyNumlock, KeyRightCtrl,
+        KeyRightShift, KeyScrollLock,
     };
 
     fn native_keys(keys: &[input_event::scancode::Linux]) -> Vec<u8> {
@@ -1379,5 +1566,47 @@ mod tests {
         keys.extend_from_slice(&[0xaa, 0xbb]);
 
         assert_eq!(held_modifiers_on_enter(&keys), vec![KeyLeftShift as u32]);
+    }
+
+    #[test]
+    fn keyboard_enter_snapshot_includes_aggregate_modifier_mask() {
+        assert_eq!(
+            modifier_mask_for_keys(&[KeyLeftShift as u32, KeyRightCtrl as u32]),
+            (1 << 0) | (1 << 2)
+        );
+        assert_eq!(modifier_mask_for_keys(&[]), 0);
+    }
+
+    #[test]
+    fn crossing_preflight_only_checks_when_the_gate_is_enabled() {
+        assert!(crossing_preflight_allows(None, &[]));
+        assert!(!crossing_preflight_allows(
+            Some(CrossingModifier::Control),
+            &[]
+        ));
+        assert!(crossing_preflight_allows(
+            Some(CrossingModifier::Control),
+            &[KeyRightCtrl as u32]
+        ));
+    }
+
+    #[test]
+    fn crossing_preflight_accepts_either_side_of_each_modifier_family() {
+        assert!(crossing_preflight_allows(
+            Some(CrossingModifier::Alt),
+            &[KeyLeftAlt as u32]
+        ));
+        assert!(crossing_preflight_allows(
+            Some(CrossingModifier::Shift),
+            &[KeyRightShift as u32]
+        ));
+        assert!(crossing_preflight_allows(
+            Some(CrossingModifier::Super),
+            &[KeyLeftMeta as u32]
+        ));
+        assert!(!crossing_preflight_allows(
+            Some(CrossingModifier::Alt),
+            &[KeyLeftShift as u32]
+        ));
     }
 }

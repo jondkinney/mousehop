@@ -3,7 +3,27 @@ mod imp;
 use adw::subclass::prelude::*;
 use gtk::glib::{self, Object};
 
-use mousehop_ipc::{ClientConfig, ClientHandle, ClientState, ConnectionMode, IfaceKind};
+use mousehop_ipc::{
+    ClientConfig, ClientHandle, ClientState, ConnectionMode, CrossingModifier, IfaceKind,
+};
+
+pub(crate) fn crossing_modifier_index(modifier: CrossingModifier) -> u32 {
+    match modifier {
+        CrossingModifier::Control => 0,
+        CrossingModifier::Alt => 1,
+        CrossingModifier::Shift => 2,
+        CrossingModifier::Super => 3,
+    }
+}
+
+pub(crate) fn crossing_modifier_from_index(index: u32) -> CrossingModifier {
+    match index {
+        1 => CrossingModifier::Alt,
+        2 => CrossingModifier::Shift,
+        3 => CrossingModifier::Super,
+        _ => CrossingModifier::Control,
+    }
+}
 
 glib::wrapper! {
     pub struct ClientObject(ObjectSubclass<imp::ClientObject>);
@@ -29,6 +49,14 @@ impl ClientObject {
             .property("peer-commit", peer_commit_to_string(state.peer_commit))
             .property("clipboard-send", client.clipboard_send)
             .property("command-as-ctrl", client.command_as_ctrl)
+            .property(
+                "require-crossing-modifier",
+                client.require_crossing_modifier,
+            )
+            .property(
+                "crossing-modifier",
+                crossing_modifier_index(client.crossing_modifier),
+            )
             .build();
         // The candidate list, mode and active lock aren't GObject
         // properties (the row renders them imperatively into a
@@ -213,6 +241,25 @@ mod tests {
         assert_eq!(iface_label(Some(IfaceKind::WiFi)), Some("Wi-Fi"));
         assert_eq!(iface_label(None), None);
     }
+
+    #[test]
+    fn crossing_modifier_indices_round_trip() {
+        for modifier in [
+            CrossingModifier::Control,
+            CrossingModifier::Alt,
+            CrossingModifier::Shift,
+            CrossingModifier::Super,
+        ] {
+            assert_eq!(
+                crossing_modifier_from_index(crossing_modifier_index(modifier)),
+                modifier
+            );
+        }
+        assert_eq!(
+            crossing_modifier_from_index(u32::MAX),
+            CrossingModifier::Control
+        );
+    }
 }
 
 /// Render the 8-byte ASCII commit hash carried in
@@ -235,6 +282,8 @@ pub struct ClientData {
     pub peer_commit: Option<String>,
     pub clipboard_send: bool,
     pub command_as_ctrl: bool,
+    pub require_crossing_modifier: bool,
+    pub crossing_modifier: u32,
     /// Candidate addresses with per-address latency, rendered into the
     /// address-selector dropdown. Not a GObject property — updated via
     /// [`ClientObject::set_addresses`].

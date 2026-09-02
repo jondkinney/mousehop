@@ -17,7 +17,8 @@ use toml_edit::{self, DocumentMut};
 
 use mousehop_cli::CliArgs;
 use mousehop_ipc::{
-    ClipboardSuppression, ConnectionMode, DEFAULT_PORT, IncomingPeerConfig, Position,
+    ClipboardSuppression, ConnectionMode, CrossingModifier, DEFAULT_PORT, IncomingPeerConfig,
+    Position,
 };
 
 use input_event::scancode::{
@@ -116,6 +117,14 @@ struct TomlClient {
     /// Absent in legacy configs and default-off.
     #[serde(default)]
     command_as_ctrl: Option<bool>,
+    /// Per-outgoing-client edge-crossing gate. Absent in legacy configs and
+    /// default-off, preserving automatic crossing.
+    #[serde(default)]
+    require_crossing_modifier: Option<bool>,
+    /// Modifier family retained independently of the toggle so disabling and
+    /// re-enabling the gate does not lose the user's selection.
+    #[serde(default)]
+    crossing_modifier: Option<CrossingModifier>,
 }
 
 impl ConfigToml {
@@ -338,6 +347,8 @@ pub struct ConfigClient {
     pub network_locks: HashMap<String, IpAddr>,
     pub clipboard_send: bool,
     pub command_as_ctrl: bool,
+    pub require_crossing_modifier: bool,
+    pub crossing_modifier: CrossingModifier,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -352,6 +363,8 @@ impl From<TomlClient> for ConfigClient {
         let network_locks = toml.network_locks.unwrap_or_default();
         let clipboard_send = toml.clipboard_send.unwrap_or(false);
         let command_as_ctrl = toml.command_as_ctrl.unwrap_or(false);
+        let require_crossing_modifier = toml.require_crossing_modifier.unwrap_or(false);
+        let crossing_modifier = toml.crossing_modifier.unwrap_or_default();
         Self {
             ips,
             hostname,
@@ -363,6 +376,8 @@ impl From<TomlClient> for ConfigClient {
             network_locks,
             clipboard_send,
             command_as_ctrl,
+            require_crossing_modifier,
+            crossing_modifier,
         }
     }
 }
@@ -397,6 +412,14 @@ impl From<ConfigClient> for TomlClient {
         } else {
             None
         };
+        let require_crossing_modifier = if client.require_crossing_modifier {
+            Some(true)
+        } else {
+            None
+        };
+        // Remember a non-default selection even while the requirement is off.
+        let crossing_modifier = (client.crossing_modifier != CrossingModifier::default())
+            .then_some(client.crossing_modifier);
         // Persist the mode only when it diverges from the default, and
         // the lock map only when non-empty, so untouched configs don't
         // sprout new keys on every save.
@@ -414,6 +437,8 @@ impl From<ConfigClient> for TomlClient {
             network_locks,
             clipboard_send,
             command_as_ctrl,
+            require_crossing_modifier,
+            crossing_modifier,
         }
     }
 }
@@ -771,6 +796,8 @@ mod connection_mode_tests {
             network_locks: locks,
             clipboard_send: false,
             command_as_ctrl: false,
+            require_crossing_modifier: false,
+            crossing_modifier: CrossingModifier::default(),
         }
     }
 
@@ -838,6 +865,8 @@ mod connection_mode_tests {
         assert_eq!(toml.mode, None);
         assert_eq!(toml.network_locks, None);
         assert_eq!(toml.command_as_ctrl, None);
+        assert_eq!(toml.require_crossing_modifier, None);
+        assert_eq!(toml.crossing_modifier, None);
         // A non-default mode IS persisted.
         let toml: TomlClient = client_with(ConnectionMode::Auto, HashMap::new()).into();
         assert_eq!(toml.mode, Some(ConnectionMode::Auto));
@@ -857,6 +886,8 @@ mod connection_mode_tests {
         assert_eq!(cc.mode, ConnectionMode::default());
         assert!(cc.network_locks.is_empty());
         assert!(!cc.command_as_ctrl);
+        assert!(!cc.require_crossing_modifier);
+        assert_eq!(cc.crossing_modifier, CrossingModifier::Control);
     }
 
     #[test]
@@ -868,5 +899,24 @@ mod connection_mode_tests {
 
         let back: ConfigClient = toml.into();
         assert!(back.command_as_ctrl);
+    }
+
+    #[test]
+    fn crossing_modifier_roundtrips_and_remembers_selection_while_disabled() {
+        let mut client = client_with(ConnectionMode::default(), HashMap::new());
+        client.require_crossing_modifier = true;
+        client.crossing_modifier = CrossingModifier::Alt;
+        let toml: TomlClient = client.into();
+        assert_eq!(toml.require_crossing_modifier, Some(true));
+        assert_eq!(toml.crossing_modifier, Some(CrossingModifier::Alt));
+
+        let mut back: ConfigClient = toml.into();
+        assert!(back.require_crossing_modifier);
+        assert_eq!(back.crossing_modifier, CrossingModifier::Alt);
+
+        back.require_crossing_modifier = false;
+        let disabled: TomlClient = back.into();
+        assert_eq!(disabled.require_crossing_modifier, None);
+        assert_eq!(disabled.crossing_modifier, Some(CrossingModifier::Alt));
     }
 }

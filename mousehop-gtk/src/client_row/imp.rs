@@ -23,6 +23,10 @@ pub struct ClientRow {
     #[template_child]
     pub command_as_ctrl_switch: TemplateChild<gtk::Switch>,
     #[template_child]
+    pub require_crossing_modifier_switch: TemplateChild<gtk::Switch>,
+    #[template_child]
+    pub crossing_modifier_combo: TemplateChild<ComboRow>,
+    #[template_child]
     pub dns_button: TemplateChild<gtk::Button>,
     #[template_child]
     pub hostname: TemplateChild<gtk::Entry>,
@@ -46,6 +50,8 @@ pub struct ClientRow {
     set_state_handler: RefCell<Option<SignalHandlerId>>,
     pub clipboard_send_handler: RefCell<Option<SignalHandlerId>>,
     pub command_as_ctrl_handler: RefCell<Option<SignalHandlerId>>,
+    pub require_crossing_modifier_handler: RefCell<Option<SignalHandlerId>>,
+    pub crossing_modifier_handler: RefCell<Option<SignalHandlerId>>,
     address_select_handler: RefCell<Option<SignalHandlerId>>,
     /// Maps a non-"Auto" dropdown index (i.e. `selected - 1`) to the
     /// candidate IP string it represents.
@@ -152,6 +158,31 @@ impl ObjectImpl for ClientRow {
             }
         ));
         self.command_as_ctrl_handler.replace(Some(handler));
+        let handler = self
+            .require_crossing_modifier_switch
+            .connect_state_set(clone!(
+                #[weak(rename_to = row)]
+                self,
+                #[upgrade_or]
+                glib::Propagation::Proceed,
+                move |_, state| {
+                    row.crossing_modifier_combo.set_sensitive(state);
+                    row.obj()
+                        .emit_by_name::<()>("request-require-crossing-modifier-change", &[&state]);
+                    glib::Propagation::Proceed
+                }
+            ));
+        self.require_crossing_modifier_handler
+            .replace(Some(handler));
+        let handler = self.crossing_modifier_combo.connect_selected_notify(clone!(
+            #[weak(rename_to = row)]
+            self,
+            move |combo| {
+                row.obj()
+                    .emit_by_name::<()>("request-crossing-modifier-change", &[&combo.selected()]);
+            }
+        ));
+        self.crossing_modifier_handler.replace(Some(handler));
         let handler = self.address_select.connect_selected_notify(clone!(
             #[weak(rename_to = row)]
             self,
@@ -208,6 +239,12 @@ impl ObjectImpl for ClientRow {
                     .build(),
                 Signal::builder("request-command-as-ctrl-change")
                     .param_types([bool::static_type()])
+                    .build(),
+                Signal::builder("request-require-crossing-modifier-change")
+                    .param_types([bool::static_type()])
+                    .build(),
+                Signal::builder("request-crossing-modifier-change")
+                    .param_types([u32::static_type()])
                     .build(),
                 // Carries the connection choice: "auto", "fastest", or
                 // a specific candidate IP (= lock on the current net).
@@ -342,6 +379,27 @@ impl ClientRow {
             .expect("client object")
             .set_command_as_ctrl(value);
         self.command_as_ctrl_switch.unblock_signal(handler);
+    }
+
+    /// Push the daemon's crossing-gate settings into both controls without
+    /// echoing frontend requests back through the IPC channel.
+    pub(super) fn set_crossing_modifier(&self, required: bool, modifier: u32) {
+        let require_handler = self.require_crossing_modifier_handler.borrow();
+        let require_handler = require_handler.as_ref().expect("signal handler");
+        let modifier_handler = self.crossing_modifier_handler.borrow();
+        let modifier_handler = modifier_handler.as_ref().expect("signal handler");
+        self.require_crossing_modifier_switch
+            .block_signal(require_handler);
+        self.crossing_modifier_combo.block_signal(modifier_handler);
+        let mut client_object = self.client_object.borrow_mut();
+        let client = client_object.as_mut().expect("client object");
+        client.set_require_crossing_modifier(required);
+        client.set_crossing_modifier(modifier);
+        self.crossing_modifier_combo.set_sensitive(required);
+        self.crossing_modifier_combo
+            .unblock_signal(modifier_handler);
+        self.require_crossing_modifier_switch
+            .unblock_signal(require_handler);
     }
 
     /// Rebuild the connection-address dropdown from the candidate list,
