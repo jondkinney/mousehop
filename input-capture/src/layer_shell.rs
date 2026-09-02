@@ -1115,18 +1115,16 @@ impl Dispatch<WlKeyboard, ()> for State {
                 time,
                 key,
                 state,
-            } => {
-                if app.pointer_lock.is_some() {
-                    if let Some(window) = &app.focused {
-                        app.pending_events.push_back((
-                            window.pos,
-                            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
-                                time,
-                                key,
-                                state: u32::from(state) as u8,
-                            })),
-                        ));
-                    }
+            } if app.pointer_lock.is_some() => {
+                if let Some(window) = &app.focused {
+                    app.pending_events.push_back((
+                        window.pos,
+                        CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                            time,
+                            key,
+                            state: u32::from(state) as u8,
+                        })),
+                    ));
                 }
             }
             wl_keyboard::Event::Modifiers {
@@ -1135,19 +1133,17 @@ impl Dispatch<WlKeyboard, ()> for State {
                 mods_latched,
                 mods_locked,
                 group,
-            } => {
-                if app.pointer_lock.is_some() {
-                    if let Some(window) = &app.focused {
-                        app.pending_events.push_back((
-                            window.pos,
-                            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
-                                depressed: mods_depressed,
-                                latched: mods_latched,
-                                locked: mods_locked,
-                                group,
-                            })),
-                        ));
-                    }
+            } if app.pointer_lock.is_some() => {
+                if let Some(window) = &app.focused {
+                    app.pending_events.push_back((
+                        window.pos,
+                        CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
+                            depressed: mods_depressed,
+                            latched: mods_latched,
+                            locked: mods_locked,
+                            group,
+                        })),
+                    ));
                 }
             }
             wl_keyboard::Event::Enter { keys, .. } => {
