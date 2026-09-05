@@ -39,9 +39,15 @@ use wayland_protocols::{
     },
 };
 
-use wayland_protocols_wlr::layer_shell::v1::client::{
-    zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1},
-    zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1},
+use wayland_protocols_wlr::{
+    layer_shell::v1::client::{
+        zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1},
+        zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1},
+    },
+    virtual_pointer::v1::client::{
+        zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
+        zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
+    },
 };
 
 use wayland_client::{
@@ -83,6 +89,7 @@ struct Globals {
     shm: wl_shm::WlShm,
     layer_shell: ZwlrLayerShellV1,
     xdg_output_manager: ZxdgOutputManagerV1,
+    virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +132,9 @@ struct State {
     pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
     pointer_lock: Option<ZwpLockedPointerV1>,
+    /// Created on the first local return. Shares the capture connection so
+    /// its absolute motion cannot overtake the pointer-lock destruction.
+    release_pointer: Option<ZwlrVirtualPointerV1>,
     rel_pointer: Option<ZwpRelativePointerV1>,
     shortcut_inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
     active_windows: Vec<Arc<Window>>,
@@ -292,6 +302,29 @@ fn screen_to_surface(surface_origin: (i32, i32), screen: (i32, i32)) -> (f64, f6
     )
 }
 
+#[derive(Debug, PartialEq)]
+struct AbsoluteWarp {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+fn absolute_warp_target(layout: &DisplayLayout, screen: (i32, i32)) -> Option<AbsoluteWarp> {
+    let bounds = layout.bounds()?;
+    let (x, y) = layout.clamp_to_nearest_display((f64::from(screen.0), f64::from(screen.1)))?;
+    let (origin_x, origin_y) = bounds.origin();
+    let (width, height) = bounds.size();
+    // Virtual-pointer absolute motion is relative to the whole layout, not
+    // the primary monitor or the one-pixel capture surface.
+    Some(AbsoluteWarp {
+        x: (x - f64::from(origin_x)) as u32,
+        y: (y - f64::from(origin_y)) as u32,
+        width,
+        height,
+    })
+}
+
 fn display_edge(pos: Position) -> DisplayEdge {
     match pos {
         Position::Left => DisplayEdge::Left,
@@ -397,6 +430,7 @@ impl LayerShellInputCapture {
                 to the client");
         }
         let shortcut_inhibit_manager = shortcut_inhibit_manager.ok();
+        let virtual_pointer_manager = global_list.bind(&qh, 1..=1, ()).ok();
 
         let mut state = State {
             active_positions: Default::default(),
@@ -413,8 +447,10 @@ impl LayerShellInputCapture {
                 relative_pointer_manager,
                 shortcut_inhibit_manager,
                 xdg_output_manager,
+                virtual_pointer_manager,
             },
             pointer_lock: None,
+            release_pointer: None,
             rel_pointer: None,
             shortcut_inhibitor: None,
             active_windows: Vec::new(),
@@ -622,6 +658,11 @@ impl State {
     }
 
     fn ungrab(&mut self, warp_target: Option<(i32, i32)>) {
+        let absolute_warp = self
+            .pointer_lock
+            .as_ref()
+            .and(warp_target)
+            .and_then(|target| absolute_warp_target(&output_layout(&self.outputs), target));
         // Only the keyboard-interactivity reset and the release warp
         // need a focused window; the teardown below must run
         // regardless. `focused` is cleared by a pointer `Leave` and by
@@ -635,8 +676,8 @@ impl State {
             // Restore normal keyboard focus. If the caller modeled a host
             // landing point, attach it to the still-live pointer lock before
             // committing and destroying the lock. Cursor position hints are
-            // double-buffered Wayland surface state; without this commit,
-            // Hyprland unlocks at the stale pre-capture cursor position.
+            // double-buffered Wayland surface state; commit them before
+            // destroying the lock for compositors that honor the hint.
             window
                 .layer_surface
                 .set_keyboard_interactivity(KeyboardInteractivity::None);
@@ -673,6 +714,30 @@ impl State {
             self.shortcut_inhibitor = None;
         }
         self.crossing_preflight = None;
+
+        // A position hint is advisory, and some compositors ignore it for
+        // layer surfaces. Explicitly seat a local return after unlocking.
+        // Handover releases pass None: the peer owns their subsequent warp.
+        if let (Some(warp), Some(manager)) =
+            (absolute_warp, self.globals.virtual_pointer_manager.as_ref())
+        {
+            let pointer = self.release_pointer.get_or_insert_with(|| {
+                manager.create_virtual_pointer(Some(&self.globals.seat), &self.qh, ())
+            });
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u32;
+            log::info!(
+                "[release-warp] layer-shell absolute return ({}, {}) in {}x{} layout",
+                warp.x,
+                warp.y,
+                warp.width,
+                warp.height,
+            );
+            pointer.motion_absolute(now, warp.x, warp.y, warp.width, warp.height);
+            pointer.frame();
+        }
     }
 
     /// Tear down a compositor-side grab whose surface disappeared or lost
@@ -846,7 +911,12 @@ impl Capture for LayerShellInputCapture {
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
-        Ok(())
+        let inner = self.0.get_mut();
+        inner.state.ungrab(None);
+        if let Some(pointer) = inner.state.release_pointer.take() {
+            pointer.destroy();
+        }
+        Ok(inner.flush_events()?)
     }
 
     fn display_bounds(&self) -> Option<(u32, u32)> {
@@ -1465,6 +1535,8 @@ delegate_noop!(State: ZwlrLayerShellV1);
 delegate_noop!(State: ZwpRelativePointerManagerV1);
 delegate_noop!(State: ZwpKeyboardShortcutsInhibitManagerV1);
 delegate_noop!(State: ZwpPointerConstraintsV1);
+delegate_noop!(State: ZwlrVirtualPointerManagerV1);
+delegate_noop!(State: ZwlrVirtualPointerV1);
 
 // ignore events
 delegate_noop!(State: ignore ZxdgOutputManagerV1);
@@ -1477,16 +1549,16 @@ delegate_noop!(State: ignore ZwpLockedPointerV1);
 #[cfg(test)]
 mod tests {
     use super::{
-        crossing_preflight_allows, deleting_position_interrupts_focus, held_modifiers_on_enter,
-        lost_active_seat_device, modifier_mask_for_keys, screen_to_surface,
-        surface_leave_matches_focus,
+        AbsoluteWarp, absolute_warp_target, crossing_preflight_allows,
+        deleting_position_interrupts_focus, held_modifiers_on_enter, lost_active_seat_device,
+        modifier_mask_for_keys, screen_to_surface, surface_leave_matches_focus,
     };
     use crate::Position;
-    use input_event::CrossingModifier;
     use input_event::scancode::Linux::{
         KeyA, KeyCapsLock, KeyLeftAlt, KeyLeftMeta, KeyLeftShift, KeyNumlock, KeyRightCtrl,
         KeyRightShift, KeyScrollLock,
     };
+    use input_event::{CrossingModifier, display::DisplayLayout};
 
     fn native_keys(keys: &[input_event::scancode::Linux]) -> Vec<u8> {
         keys.iter()
@@ -1500,6 +1572,60 @@ mod tests {
         assert_eq!(screen_to_surface((2559, -240), (2559, 719)), (0.0, 959.0));
         assert_eq!(screen_to_surface((1920, -240), (2559, -240)), (639.0, 0.0));
         assert_eq!(screen_to_surface((1920, 719), (2559, 719)), (639.0, 0.0));
+    }
+
+    #[test]
+    fn absolute_return_preserves_the_6k_edge_with_a_monitor_left_of_primary() {
+        let layout = DisplayLayout::new([
+            (0, 0, 3072, 1728),
+            (-1024, 0, 1024, 600),
+            (836, 1728, 1280, 360),
+        ]);
+        let warp = absolute_warp_target(&layout, (3071, 493)).unwrap();
+        assert_eq!(
+            warp,
+            AbsoluteWarp {
+                x: 4095,
+                y: 493,
+                width: 4096,
+                height: 2088
+            }
+        );
+        // Using global x=3071 as the union-relative numerator would instead
+        // land at 2047, skipping exactly a third of the main logical display.
+        assert_eq!(-1024 + warp.x as i32, 3071);
+    }
+
+    #[test]
+    fn absolute_return_uses_the_new_layout_after_hotplug_and_scale_changes() {
+        let layout = DisplayLayout::new([(0, 0, 2048, 1152)]);
+        assert_eq!(
+            absolute_warp_target(&layout, (3071, 493)),
+            Some(AbsoluteWarp {
+                x: 2047,
+                y: 493,
+                width: 2048,
+                height: 1152
+            })
+        );
+        assert_eq!(
+            absolute_warp_target(&DisplayLayout::default(), (3071, 493)),
+            None
+        );
+    }
+
+    #[test]
+    fn absolute_return_preserves_negative_vertical_origins() {
+        let layout = DisplayLayout::new([(-1024, -600, 1024, 600), (0, 0, 3072, 1728)]);
+        assert_eq!(
+            absolute_warp_target(&layout, (-1024, -100)),
+            Some(AbsoluteWarp {
+                x: 0,
+                y: 500,
+                width: 4096,
+                height: 2328
+            })
+        );
     }
 
     #[test]
