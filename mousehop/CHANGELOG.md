@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1](https://github.com/jondkinney/mousehop/compare/v0.17.0...v0.17.1) - 2026-09-05
+
+### Fixed
+
+- *(layer-shell)* place fallback returns at the current display edge
+
 ## [0.17.0](https://github.com/jondkinney/mousehop/compare/v0.16.0...v0.17.0) - 2026-09-02
 
 ### Added
