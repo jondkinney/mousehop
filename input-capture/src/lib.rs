@@ -15,7 +15,7 @@ use tokio::time::Sleep;
 
 use input_event::{
     CrossingModifier, Event, KeyboardEvent, PointerEvent,
-    display::{DisplayEdge, DisplayLayout},
+    display::{DisplayEdge, DisplayLayout, EDGE_LANDING_INSET},
     scancode,
 };
 
@@ -897,7 +897,9 @@ impl InputCapture {
                 origin_y + host_h_i.saturating_sub(1),
             ),
         };
-        layout.project_point(display_edge(pos), rectangular_target)
+        let edge = display_edge(pos);
+        let on_edge = layout.project_point(edge, rectangular_target)?;
+        Some(layout.inset_from_edge(edge, on_edge, EDGE_LANDING_INSET))
     }
 
     /// Update the wall-press accumulator from one event coming up

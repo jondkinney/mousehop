@@ -4,12 +4,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
     fmt::{self, Display},
+    future::Future,
     io::{self, ErrorKind},
     os::fd::{AsFd, RawFd},
     pin::Pin,
     task::{Context, Poll, ready},
+    time::{Duration, Instant},
 };
-use tokio::io::unix::AsyncFd;
+use tokio::{io::unix::AsyncFd, time::Sleep};
 
 use std::{
     fs::File,
@@ -151,11 +153,97 @@ struct State {
     pending_events: VecDeque<(Position, CaptureEvent)>,
     outputs: Vec<Output>,
     scroll_discrete_pending: bool,
+    /// Throttles re-grabs when the compositor keeps revoking them.
+    regrab_backoff: RegrabBackoff,
+    /// A pointer `Enter` whose grab waits out the backoff.
+    deferred_enter: Option<DeferredEnter>,
+}
+
+/// A pointer `Enter` that [`RegrabBackoff`] postponed until `due`. The
+/// compositor sends no further `Enter` while the pointer rests on the strip,
+/// so the grab has to be retried from here.
+struct DeferredEnter {
+    window: Arc<Window>,
+    serial: u32,
+    surface_x: f64,
+    surface_y: f64,
+    due: Instant,
+}
+
+/// First wait after a grab the compositor revoked.
+const REGRAB_BACKOFF_BASE: Duration = Duration::from_millis(100);
+/// Upper bound for the doubling wait between re-grab attempts.
+const REGRAB_BACKOFF_MAX: Duration = Duration::from_secs(2);
+/// A grab that survives this long counts as healthy and clears the backoff.
+const REGRAB_STABLE_AFTER: Duration = Duration::from_secs(1);
+/// Revokes this far apart are unrelated. Must exceed [`REGRAB_BACKOFF_MAX`],
+/// or a loop retrying at the cap would keep resetting itself.
+const REGRAB_FORGET_AFTER: Duration = Duration::from_secs(5);
+
+/// Breaks the grab → compositor revokes → re-grab loop.
+///
+/// Some compositors drop the layer-shell grab (keyboard or pointer `Leave`)
+/// right after it is taken. The cursor is still on the 1 px edge surface, so
+/// the revoke makes the compositor deliver a fresh pointer `Enter`, which
+/// grabs again — hundreds of times a second, each round creating and
+/// destroying a pointer lock, relative pointer, shortcut inhibitor and a
+/// peer handover. That floods the compositor (stutter, dropped events) and
+/// can exhaust its file descriptors.
+///
+/// After a revoked grab, the next grab waits for a delay that doubles with
+/// each consecutive revoke. A pointer `Enter` inside the delay is deferred,
+/// not dropped, so a crossing still lands once the delay is over. A grab that
+/// holds for [`REGRAB_STABLE_AFTER`], or a quiet spell of
+/// [`REGRAB_FORGET_AFTER`], resets the count. The wrapper calls `release`
+/// after every `AutoRelease`, so a release is not evidence the grab was
+/// healthy and must not reset it.
+#[derive(Debug, Default)]
+struct RegrabBackoff {
+    grabbed_at: Option<Instant>,
+    revoked_at: Option<Instant>,
+    consecutive_revokes: u32,
+}
+
+impl RegrabBackoff {
+    /// When a grab wanted at `now` may start, or `None` if it may start now.
+    fn retry_at(&self, now: Instant) -> Option<Instant> {
+        let due = self.revoked_at? + self.wait();
+        (due > now).then_some(due)
+    }
+
+    fn wait(&self) -> Duration {
+        let doublings = self.consecutive_revokes.saturating_sub(1).min(16);
+        REGRAB_BACKOFF_BASE
+            .saturating_mul(1 << doublings)
+            .min(REGRAB_BACKOFF_MAX)
+    }
+
+    fn grabbed(&mut self, now: Instant) {
+        self.grabbed_at = Some(now);
+    }
+
+    /// The compositor took the grab away at `now`.
+    fn revoked(&mut self, now: Instant) {
+        let held = self
+            .grabbed_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= REGRAB_STABLE_AFTER);
+        let quiet = self
+            .revoked_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= REGRAB_FORGET_AFTER);
+        if held || quiet {
+            self.consecutive_revokes = 0;
+        }
+        self.grabbed_at = None;
+        self.consecutive_revokes = self.consecutive_revokes.saturating_add(1);
+        self.revoked_at = Some(now);
+    }
 }
 
 struct Inner {
     state: State,
     queue: EventQueue<State>,
+    /// Wakes the stream when a deferred grab comes due.
+    retry_timer: Pin<Box<Sleep>>,
 }
 
 impl AsRawFd for Inner {
@@ -462,6 +550,8 @@ impl LayerShellInputCapture {
             pending_events: VecDeque::new(),
             outputs: vec![],
             scroll_discrete_pending: false,
+            regrab_backoff: RegrabBackoff::default(),
+            deferred_enter: None,
         };
 
         for global in state.global_list.contents().clone_list() {
@@ -482,7 +572,11 @@ impl LayerShellInputCapture {
         };
         state.read_guard = Some(read_guard);
 
-        let inner = AsyncFd::new(Inner { queue, state })?;
+        let inner = AsyncFd::new(Inner {
+            queue,
+            state,
+            retry_timer: Box::pin(tokio::time::sleep(Duration::ZERO)),
+        })?;
 
         Ok(LayerShellInputCapture(inner))
     }
@@ -584,6 +678,7 @@ impl State {
         qh: &QueueHandle<State>,
     ) {
         let window = self.focused.as_ref().unwrap();
+        self.regrab_backoff.grabbed(Instant::now());
 
         // hide the cursor
         pointer.set_cursor(serial, None, 0, 0);
@@ -626,6 +721,63 @@ impl State {
                 ));
             }
         }
+    }
+
+    /// Pointer focus reached an edge strip: take the grab, or start the
+    /// modifier preflight when the edge requires one.
+    fn enter_edge(
+        &mut self,
+        window: Arc<Window>,
+        pointer: &WlPointer,
+        serial: u32,
+        surface_x: f64,
+        surface_y: f64,
+        qh: &QueueHandle<State>,
+    ) {
+        self.focused = Some(window.clone());
+        let cursor = surface_to_screen(&window, surface_x, surface_y);
+        let layout = output_layout(&self.outputs);
+        let normalized_cursor = normalize_cursor_in_layout(&layout, cursor);
+        if self.crossing_modifiers.contains_key(&window.pos) {
+            self.start_crossing_preflight(serial, cursor, normalized_cursor);
+        } else {
+            self.grab(&window.surface, pointer, serial, qh);
+            self.pending_events.push_back((
+                window.pos,
+                CaptureEvent::Begin {
+                    cursor: Some(cursor),
+                    normalized_cursor,
+                },
+            ));
+        }
+    }
+
+    /// Run the grab that [`RegrabBackoff`] postponed, if the pointer is
+    /// still on the same live edge strip.
+    fn run_deferred_enter(&mut self) {
+        let Some(deferred) = self.deferred_enter.take() else {
+            return;
+        };
+        let still_live = self
+            .active_windows
+            .iter()
+            .any(|window| Arc::ptr_eq(window, &deferred.window));
+        let Some(pointer) = self.pointer.clone().filter(|_| still_live) else {
+            return;
+        };
+        if let Some(due) = self.regrab_backoff.retry_at(Instant::now()) {
+            self.deferred_enter = Some(DeferredEnter { due, ..deferred });
+            return;
+        }
+        let qh = self.qh.clone();
+        self.enter_edge(
+            deferred.window,
+            &pointer,
+            deferred.serial,
+            deferred.surface_x,
+            deferred.surface_y,
+            &qh,
+        );
     }
 
     fn start_crossing_preflight(
@@ -751,6 +903,7 @@ impl State {
         self.ungrab(None);
         self.focused = None;
         if let Some(position) = interrupted_position {
+            self.regrab_backoff.revoked(Instant::now());
             self.pending_events
                 .push_back((position, CaptureEvent::AutoRelease));
         }
@@ -944,6 +1097,28 @@ impl Stream for LayerShellInputCapture {
         }
 
         loop {
+            // A grab postponed by the backoff has no Wayland event to wake it.
+            {
+                let inner = self.0.get_mut();
+                if let Some(due) = inner.state.deferred_enter.as_ref().map(|d| d.due) {
+                    inner
+                        .retry_timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::from_std(due));
+                    if inner.retry_timer.as_mut().poll(cx).is_ready() {
+                        inner.state.run_deferred_enter();
+                        if let Err(e) = inner.flush_events() {
+                            if e.kind() != ErrorKind::WouldBlock {
+                                return Poll::Ready(Some(Err(e.into())));
+                            }
+                        }
+                        if let Some(event) = inner.state.pending_events.pop_front() {
+                            return Poll::Ready(Some(Ok(event)));
+                        }
+                    }
+                }
+            }
+
             let mut guard = ready!(self.0.poll_read_ready_mut(cx))?;
 
             {
@@ -1056,24 +1231,31 @@ impl Dispatch<WlPointer, ()> for State {
                 else {
                     return;
                 };
-                app.focused = Some(window.clone());
-                let cursor = surface_to_screen(&window, surface_x, surface_y);
-                let layout = output_layout(&app.outputs);
-                let normalized_cursor = normalize_cursor_in_layout(&layout, cursor);
-                if app.crossing_modifiers.contains_key(&window.pos) {
-                    app.start_crossing_preflight(serial, cursor, normalized_cursor);
-                } else {
-                    app.grab(&surface, pointer, serial, qh);
-                    app.pending_events.push_back((
-                        window.pos,
-                        CaptureEvent::Begin {
-                            cursor: Some(cursor),
-                            normalized_cursor,
-                        },
-                    ));
+                if let Some(due) = app.regrab_backoff.retry_at(Instant::now()) {
+                    log::debug!(
+                        "deferring the grab on {}: the compositor just revoked one",
+                        window.pos
+                    );
+                    app.deferred_enter = Some(DeferredEnter {
+                        window,
+                        serial,
+                        surface_x,
+                        surface_y,
+                        due,
+                    });
+                    return;
                 }
+                app.deferred_enter = None;
+                app.enter_edge(window, pointer, serial, surface_x, surface_y, qh);
             }
             wl_pointer::Event::Leave { surface, .. } => {
+                if app
+                    .deferred_enter
+                    .as_ref()
+                    .is_some_and(|deferred| deferred.window.surface == surface)
+                {
+                    app.deferred_enter = None;
+                }
                 /* There are rare cases, where when a window is opened in
                  * just the wrong moment, the pointer is released, while
                  * still grabbed.
@@ -1549,7 +1731,8 @@ delegate_noop!(State: ignore ZwpLockedPointerV1);
 #[cfg(test)]
 mod tests {
     use super::{
-        AbsoluteWarp, absolute_warp_target, crossing_preflight_allows,
+        AbsoluteWarp, REGRAB_BACKOFF_BASE, REGRAB_BACKOFF_MAX, REGRAB_FORGET_AFTER,
+        REGRAB_STABLE_AFTER, RegrabBackoff, absolute_warp_target, crossing_preflight_allows,
         deleting_position_interrupts_focus, held_modifiers_on_enter, lost_active_seat_device,
         modifier_mask_for_keys, screen_to_surface, surface_leave_matches_focus,
     };
@@ -1559,11 +1742,103 @@ mod tests {
         KeyRightShift, KeyScrollLock,
     };
     use input_event::{CrossingModifier, display::DisplayLayout};
+    use std::time::{Duration, Instant};
 
     fn native_keys(keys: &[input_event::scancode::Linux]) -> Vec<u8> {
         keys.iter()
             .flat_map(|key| (*key as u32).to_ne_bytes())
             .collect()
+    }
+
+    #[test]
+    fn regrab_is_allowed_until_the_compositor_revokes_a_grab() {
+        let t0 = Instant::now();
+        assert_eq!(RegrabBackoff::default().retry_at(t0), None);
+
+        let mut backoff = RegrabBackoff::default();
+        backoff.grabbed(t0);
+        backoff.revoked(t0 + Duration::from_millis(1));
+        let revoked = t0 + Duration::from_millis(1);
+        let due = revoked + REGRAB_BACKOFF_BASE;
+        assert_eq!(backoff.retry_at(revoked), Some(due));
+        assert_eq!(
+            backoff.retry_at(due - Duration::from_millis(1)),
+            Some(due),
+            "an Enter inside the wait is deferred to the due time"
+        );
+        assert_eq!(backoff.retry_at(due), None);
+    }
+
+    #[test]
+    fn a_quiet_spell_forgets_earlier_revokes() {
+        let mut backoff = RegrabBackoff::default();
+        let t0 = Instant::now();
+        for i in 0..5 {
+            let at = t0 + Duration::from_millis(i);
+            backoff.grabbed(at);
+            backoff.revoked(at + Duration::from_millis(1));
+        }
+        assert!(backoff.wait() > REGRAB_BACKOFF_BASE);
+
+        let later = t0 + REGRAB_FORGET_AFTER * 2;
+        backoff.grabbed(later);
+        backoff.revoked(later + Duration::from_millis(1));
+        assert_eq!(backoff.wait(), REGRAB_BACKOFF_BASE);
+    }
+
+    #[test]
+    fn regrab_wait_doubles_per_consecutive_revoke_up_to_the_cap() {
+        let mut backoff = RegrabBackoff::default();
+        let mut now = Instant::now();
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            backoff.grabbed(now);
+            now += Duration::from_millis(1);
+            backoff.revoked(now);
+            waits.push(backoff.wait());
+            now += backoff.wait();
+        }
+        assert_eq!(waits[0], REGRAB_BACKOFF_BASE);
+        assert_eq!(waits[1], REGRAB_BACKOFF_BASE * 2);
+        assert_eq!(waits[2], REGRAB_BACKOFF_BASE * 4);
+        assert!(waits.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(*waits.last().unwrap(), REGRAB_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn a_grab_that_holds_clears_the_backoff() {
+        let mut backoff = RegrabBackoff::default();
+        let t0 = Instant::now();
+        for i in 0..4 {
+            let at = t0 + Duration::from_millis(i);
+            backoff.grabbed(at);
+            backoff.revoked(at + Duration::from_millis(1));
+        }
+        assert!(backoff.wait() > REGRAB_BACKOFF_BASE);
+
+        let held_from = t0 + REGRAB_BACKOFF_MAX;
+        backoff.grabbed(held_from);
+        backoff.revoked(held_from + REGRAB_STABLE_AFTER);
+        assert_eq!(backoff.wait(), REGRAB_BACKOFF_BASE);
+    }
+
+    #[test]
+    fn a_revoke_loop_is_throttled_to_a_handful_of_grabs() {
+        // Reported livelock: pointer Enter grabs, the compositor revokes it
+        // a millisecond later, and the revoke produces another Enter. The
+        // unthrottled loop ran at ~170 grabs/s; model 10 s of it at 5 ms.
+        let mut backoff = RegrabBackoff::default();
+        let t0 = Instant::now();
+        let mut grabs = 0;
+        for tick in 0..2000 {
+            let now = t0 + Duration::from_millis(tick * 5);
+            if backoff.retry_at(now).is_none() {
+                grabs += 1;
+                backoff.grabbed(now);
+                backoff.revoked(now + Duration::from_millis(1));
+            }
+        }
+        assert!(grabs <= 12, "{grabs} grabs in 10 s");
     }
 
     #[test]

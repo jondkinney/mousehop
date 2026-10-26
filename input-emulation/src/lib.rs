@@ -6,7 +6,7 @@ use std::{
 
 use input_event::{
     ClipboardEvent, Event, KeyboardEvent, PointerEvent,
-    display::{DisplayEdge, DisplayLayout},
+    display::{DisplayEdge, DisplayLayout, EDGE_LANDING_INSET},
 };
 
 use crate::clipboard::ClipboardEmulation;
@@ -55,9 +55,11 @@ fn edge_warp_projection(
     layout: &DisplayLayout,
     edge: DisplayEdge,
     cross_fraction: f64,
+    inset: i32,
 ) -> Option<((i32, i32), (i32, i32))> {
     let bounds = layout.bounds()?;
-    let global = layout.project_fraction(edge, cross_fraction)?;
+    let on_edge = layout.project_fraction(edge, cross_fraction)?;
+    let global = layout.inset_from_edge(edge, on_edge, inset);
     let origin = bounds.origin();
     let relative = (
         i32::try_from(i64::from(global.0) - i64::from(origin.0)).ok()?,
@@ -368,7 +370,7 @@ impl InputEmulation {
             .display_layout()
             .ok_or(EmulationError::DisplayTopologyUnavailable)?;
         let Some(((global_x, global_y), (x, y))) =
-            edge_warp_projection(&layout, edge, cross_fraction)
+            edge_warp_projection(&layout, edge, cross_fraction, EDGE_LANDING_INSET)
         else {
             return Err(EmulationError::DisplayTopologyUnavailable);
         };
@@ -506,22 +508,42 @@ mod display_tests {
             (836, 1728, 1280, 360),
         ]);
         assert_eq!(
-            edge_warp_projection(&linux, DisplayEdge::Right, 500.5 / 2088.0),
+            edge_warp_projection(&linux, DisplayEdge::Right, 500.5 / 2088.0, 0),
             Some(((3071, 500), (4095, 500))),
         );
         assert_eq!(
-            edge_warp_projection(&linux, DisplayEdge::Right, 1800.5 / 2088.0),
+            edge_warp_projection(&linux, DisplayEdge::Right, 1800.5 / 2088.0, 0),
             Some(((2115, 1800), (3139, 1800))),
         );
 
         let mac = DisplayLayout::new([(0, 0, 3072, 1728), (-1728, 0, 1728, 1117)]);
         assert_eq!(
-            edge_warp_projection(&mac, DisplayEdge::Left, 500.5 / 1728.0),
+            edge_warp_projection(&mac, DisplayEdge::Left, 500.5 / 1728.0, 0),
             Some(((-1728, 500), (0, 500))),
         );
         assert_eq!(
-            edge_warp_projection(&mac, DisplayEdge::Left, 1500.5 / 1728.0),
+            edge_warp_projection(&mac, DisplayEdge::Left, 1500.5 / 1728.0, 0),
             Some(((0, 1500), (1728, 1500))),
+        );
+    }
+
+    #[test]
+    fn landing_is_inset_from_the_edge_along_its_inward_normal() {
+        let layout = DisplayLayout::new([(0, 0, 2400, 1350)]);
+        let at = |edge, inset| edge_warp_projection(&layout, edge, 0.5, inset).map(|p| p.0);
+        assert_eq!(at(DisplayEdge::Bottom, 0), Some((1200, 1349)));
+        assert_eq!(at(DisplayEdge::Bottom, 2), Some((1200, 1347)));
+        assert_eq!(at(DisplayEdge::Top, 2), Some((1200, 2)));
+        assert_eq!(at(DisplayEdge::Left, 2), Some((2, 675)));
+        assert_eq!(at(DisplayEdge::Right, 2), Some((2397, 675)));
+    }
+
+    #[test]
+    fn an_inset_wider_than_the_display_keeps_the_edge_point() {
+        let layout = DisplayLayout::new([(0, 0, 2400, 2)]);
+        assert_eq!(
+            edge_warp_projection(&layout, DisplayEdge::Bottom, 0.5, 2).map(|p| p.0),
+            Some((1200, 1)),
         );
     }
 }

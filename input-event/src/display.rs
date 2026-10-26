@@ -6,6 +6,15 @@
 //! in-layout cursor coordinate, so the right and bottom edges use the final
 //! contained coordinate rather than the exclusive rectangle end.
 
+/// How far inside the layout a returning cursor is placed, in pixels.
+///
+/// Wayland capture listens on a one-pixel layer surface along the display
+/// edge. A cursor placed exactly on the edge lands on that surface, which the
+/// capture side takes for a fresh crossing and grabs, and the compositor then
+/// revokes the grab again. Two pixels keep the cursor clear of the surface.
+/// Other platforms capture without an edge surface and keep the exact edge.
+pub const EDGE_LANDING_INSET: i32 = if cfg!(target_os = "linux") { 2 } else { 0 };
+
 /// A side of a logical display layout.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DisplayEdge {
@@ -316,6 +325,23 @@ impl DisplayLayout {
                     .then_with(|| left.1.cmp(&right.1))
             })
             .map(|(_, _, clamped)| clamped)
+    }
+
+    /// Moves a point on `edge` of this layout `inset` pixels inward.
+    ///
+    /// Returns `point` unchanged when the moved point would leave the layout,
+    /// as on a display thinner than the inset.
+    pub fn inset_from_edge(&self, edge: DisplayEdge, point: (i32, i32), inset: i32) -> (i32, i32) {
+        let moved = match edge {
+            DisplayEdge::Left => (point.0.saturating_add(inset), point.1),
+            DisplayEdge::Right => (point.0.saturating_sub(inset), point.1),
+            DisplayEdge::Top => (point.0, point.1.saturating_add(inset)),
+            DisplayEdge::Bottom => (point.0, point.1.saturating_sub(inset)),
+        };
+        match self.clamp_to_nearest_display((f64::from(moved.0), f64::from(moved.1))) {
+            Some((x, y)) if x == f64::from(moved.0) && y == f64::from(moved.1) => moved,
+            _ => point,
+        }
     }
 
     /// Enumerates the non-overlapping exposed segments on `edge`.
@@ -833,5 +859,50 @@ mod tests {
         assert_eq!(segment.point_at(-10), Some((9, -10)));
         assert_eq!(segment.point_at(9), Some((9, 9)));
         assert_eq!(segment.point_at(10), None);
+    }
+
+    #[test]
+    fn inset_moves_an_edge_point_inward_on_every_edge() {
+        let layout = DisplayLayout::new([(0, 0, 100, 50)]);
+        assert_eq!(
+            layout.inset_from_edge(DisplayEdge::Left, (0, 20), 2),
+            (2, 20)
+        );
+        assert_eq!(
+            layout.inset_from_edge(DisplayEdge::Right, (99, 20), 2),
+            (97, 20)
+        );
+        assert_eq!(
+            layout.inset_from_edge(DisplayEdge::Top, (30, 0), 2),
+            (30, 2)
+        );
+        assert_eq!(
+            layout.inset_from_edge(DisplayEdge::Bottom, (30, 49), 2),
+            (30, 47)
+        );
+    }
+
+    #[test]
+    fn inset_follows_the_owning_display_of_a_stepped_edge() {
+        // The lower-right display owns the bottom edge at x >= 50.
+        let layout = DisplayLayout::new([(0, 0, 50, 40), (50, 0, 50, 60)]);
+        assert_eq!(
+            layout.inset_from_edge(DisplayEdge::Bottom, (10, 39), 2),
+            (10, 37)
+        );
+        assert_eq!(
+            layout.inset_from_edge(DisplayEdge::Bottom, (70, 59), 2),
+            (70, 57)
+        );
+    }
+
+    #[test]
+    fn inset_is_skipped_when_it_would_leave_the_layout() {
+        let layout = DisplayLayout::new([(0, 0, 100, 2)]);
+        assert_eq!(
+            layout.inset_from_edge(DisplayEdge::Bottom, (30, 1), 2),
+            (30, 1)
+        );
+        assert_eq!(layout.inset_from_edge(DisplayEdge::Left, (0, 1), 0), (0, 1));
     }
 }
