@@ -1,14 +1,16 @@
 use crate::client::ClientManager;
 use crate::config::local_commit;
+use crate::crypto;
 use crate::discovery::{PrimaryCache, normalize_mdns_name};
 use input_event::{Event as InputEvent, KeyboardEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
-use mousehop_ipc::{ClientHandle, ConnectionMode, DEFAULT_PORT};
+use mousehop_ipc::{ClientHandle, ConnectionMode, DEFAULT_PORT, IncomingPeerConfig};
 use mousehop_proto::{
     MAX_CLIPBOARD_SIZE, MAX_EVENT_SIZE, PROTOCOL_MAGIC, ProtoEvent, decode_clipboard_event,
     decode_display_layout_event, decode_fixed_event, encode_clipboard_event,
     encode_display_layout_event,
 };
+use rustls::pki_types::CertificateDer;
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
@@ -16,7 +18,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -34,6 +36,42 @@ use webrtc_util::Conn;
 
 type ArcConn = Arc<dyn Conn + Send + Sync>;
 pub(crate) type ConnectionSession = u64;
+
+/// Certificate fingerprints this machine trusts (the same map the listener
+/// authorizes incoming peers against). Shared, so authorizing or revoking a
+/// device in the UI applies to the next outgoing handshake too.
+pub(crate) type TrustedPeers = Arc<RwLock<HashMap<String, IncomingPeerConfig>>>;
+
+type VerifyPeerCertificateFn = Arc<
+    dyn (Fn(&[Vec<u8>], &[CertificateDer<'static>]) -> Result<(), webrtc_dtls::Error>)
+        + Send
+        + Sync,
+>;
+
+/// Pins the peer we dial to a trusted fingerprint. Peers use self-signed
+/// certificates, so there is no chain to verify (`insecure_skip_verify`), but
+/// the handshake has already checked that the peer holds the presented
+/// certificate's key. Without this check, anyone answering on the dialed
+/// address (or spoofing its mDNS record) would receive our input and clipboard.
+fn trusted_peer_verifier(trusted: TrustedPeers) -> VerifyPeerCertificateFn {
+    Arc::new(
+        move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
+            let Some(cert) = certs.first() else {
+                return Err(webrtc_dtls::Error::ErrNoCertificates);
+            };
+            let fingerprint = crypto::generate_fingerprint(cert);
+            if trusted.read().expect("lock").contains_key(&fingerprint) {
+                Ok(())
+            } else {
+                log::warn!(
+                    "refusing to send input to untrusted peer with fingerprint {fingerprint}; \
+                 authorize it on this machine to allow outgoing connections"
+                );
+                Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
+            }
+        },
+    )
+}
 
 #[derive(Clone)]
 struct ConnectionSlot {
@@ -207,6 +245,7 @@ fn record_retry_failure(
 async fn connect(
     addr: SocketAddr,
     cert: Certificate,
+    trusted: TrustedPeers,
 ) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, MousehopConnectionError)> {
     log::info!("connecting to {addr} ...");
     // Bind family must match the target's: a 0.0.0.0 socket fails
@@ -226,7 +265,10 @@ async fn connect(
     let config = Config {
         certificates: vec![cert],
         server_name: "ignored".to_owned(),
+        // self-signed peers: no chain to check; the fingerprint pin below
+        // is what authenticates the peer
         insecure_skip_verify: true,
+        verify_peer_certificate: Some(trusted_peer_verifier(trusted)),
         extended_master_secret: ExtendedMasterSecretType::Require,
         ..Default::default()
     };
@@ -251,6 +293,7 @@ async fn connect_any(
     addrs: &[SocketAddr],
     preferred: Option<SocketAddr>,
     cert: Certificate,
+    trusted: TrustedPeers,
 ) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), MousehopConnectionError> {
     let mut joinset = JoinSet::new();
     if let Some(p) = preferred {
@@ -259,7 +302,7 @@ async fn connect_any(
         // before the others even start — the dialer biases toward
         // the OS-preferred interface (Mac service order, Linux
         // default route) without relying on RTT racing alone.
-        joinset.spawn_local(connect(p, cert.clone()));
+        joinset.spawn_local(connect(p, cert.clone(), trusted.clone()));
         let head_start = tokio::time::sleep(PREFERRED_ADDR_HEAD_START);
         tokio::pin!(head_start);
         loop {
@@ -277,7 +320,7 @@ async fn connect_any(
             // already racing; don't dial the same socket twice
             continue;
         }
-        joinset.spawn_local(connect(addr, cert.clone()));
+        joinset.spawn_local(connect(addr, cert.clone(), trusted.clone()));
     }
     loop {
         match joinset.join_next().await {
@@ -294,6 +337,8 @@ async fn connect_any(
 
 pub(crate) struct MousehopConnection {
     cert: Certificate,
+    /// Fingerprints a dialed peer must present (see [`trusted_peer_verifier`]).
+    trusted: TrustedPeers,
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, ConnectionSlot>>>,
     sessions: SessionTracker,
@@ -328,12 +373,14 @@ pub(crate) struct MousehopConnection {
 impl MousehopConnection {
     pub(crate) fn new(
         cert: Certificate,
+        trusted: TrustedPeers,
         client_manager: ClientManager,
         primary_hints: PrimaryCache,
     ) -> Self {
         let (recv_tx, recv_rx) = channel();
         Self {
             cert,
+            trusted,
             client_manager,
             conns: Default::default(),
             sessions: Default::default(),
@@ -394,6 +441,7 @@ impl MousehopConnection {
         let (_, dead_rx) = channel();
         Self {
             cert: self.cert.clone(),
+            trusted: self.trusted.clone(),
             client_manager: self.client_manager.clone(),
             conns: self.conns.clone(),
             sessions: self.sessions.clone(),
@@ -507,6 +555,7 @@ impl MousehopConnection {
             spawn_local(connect_to_handle(
                 self.client_manager.clone(),
                 self.cert.clone(),
+                self.trusted.clone(),
                 handle,
                 session,
                 self.conns.clone(),
@@ -704,6 +753,7 @@ async fn finish_failed_dial(
 async fn connect_to_handle(
     client_manager: ClientManager,
     cert: Certificate,
+    trusted: TrustedPeers,
     handle: ClientHandle,
     session: ConnectionSession,
     conns: Rc<Mutex<HashMap<SocketAddr, ConnectionSlot>>>,
@@ -769,7 +819,7 @@ async fn connect_to_handle(
             finish_failed_dial(&connecting, &sessions, handle, session).await;
             return Err(MousehopConnectionError::NotConnected);
         }
-        let res = connect_any(&addrs, preferred, cert).await;
+        let res = connect_any(&addrs, preferred, cert, trusted).await;
         let (conn, addr) = match res {
             Ok(c) => c,
             Err(e) => {
@@ -1580,8 +1630,12 @@ mod tests {
         let handle = client_manager.add_client();
         let cert = Certificate::generate_self_signed(["mousehop-dial-reset-test".to_owned()])
             .expect("test certificate");
-        let connection =
-            MousehopConnection::new(cert, client_manager.clone(), PrimaryCache::default());
+        let connection = MousehopConnection::new(
+            cert,
+            Default::default(),
+            client_manager.clone(),
+            PrimaryCache::default(),
+        );
         let session = connection.sessions.allocate(handle);
         connection.connecting.lock().await.insert(handle, session);
 
@@ -1616,8 +1670,12 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:4242".parse().expect("test address");
         let cert = Certificate::generate_self_signed(["mousehop-session-send-test".to_owned()])
             .expect("test certificate");
-        let connection =
-            MousehopConnection::new(cert, client_manager.clone(), PrimaryCache::default());
+        let connection = MousehopConnection::new(
+            cert,
+            Default::default(),
+            client_manager.clone(),
+            PrimaryCache::default(),
+        );
         let old_session = connection.sessions.allocate(handle);
         let replacement_session = connection.sessions.allocate(handle);
         connection.conns.lock().await.insert(
@@ -1649,8 +1707,12 @@ mod tests {
         let handle = client_manager.add_client();
         let cert = Certificate::generate_self_signed(["mousehop-release-cleanup-test".to_owned()])
             .expect("test certificate");
-        let connection =
-            MousehopConnection::new(cert, client_manager.clone(), PrimaryCache::default());
+        let connection = MousehopConnection::new(
+            cert,
+            Default::default(),
+            client_manager.clone(),
+            PrimaryCache::default(),
+        );
         let session = connection.sessions.allocate(handle);
         let (conn, receiver, addr) = connected_test_conn().await;
         connection.conns.lock().await.insert(
@@ -1742,5 +1804,96 @@ mod tests {
                 .await,
             Err(MousehopConnectionError::NotConnected)
         ));
+    }
+
+    fn test_cert(name: &str) -> Certificate {
+        Certificate::generate_self_signed([name.to_owned()]).expect("test certificate")
+    }
+
+    fn trusting(fingerprints: &[String]) -> TrustedPeers {
+        Arc::new(RwLock::new(
+            fingerprints
+                .iter()
+                .map(|f| (f.clone(), IncomingPeerConfig::default()))
+                .collect(),
+        ))
+    }
+
+    #[test]
+    fn trusted_peer_verifier_accepts_only_trusted_fingerprints() {
+        let peer = test_cert("peer");
+        let der = peer.certificate[0].as_ref().to_vec();
+        let fingerprint = crypto::generate_fingerprint(&der);
+
+        let verify = trusted_peer_verifier(trusting(&[fingerprint]));
+        assert!(verify(std::slice::from_ref(&der), &[]).is_ok());
+
+        let verify = trusted_peer_verifier(trusting(&[]));
+        assert!(verify(std::slice::from_ref(&der), &[]).is_err());
+
+        let other = test_cert("other");
+        let other_fingerprint = crypto::certificate_fingerprint(&other);
+        let verify = trusted_peer_verifier(trusting(&[other_fingerprint]));
+        assert!(verify(&[der], &[]).is_err());
+
+        let verify = trusted_peer_verifier(trusting(&[]));
+        assert!(verify(&[], &[]).is_err());
+    }
+
+    #[test]
+    fn trusted_peer_verifier_sees_later_authorizations() {
+        let peer = test_cert("peer");
+        let der = peer.certificate[0].as_ref().to_vec();
+        let trusted = trusting(&[]);
+        let verify = trusted_peer_verifier(trusted.clone());
+        assert!(verify(std::slice::from_ref(&der), &[]).is_err());
+        trusted.write().expect("lock").insert(
+            crypto::generate_fingerprint(&der),
+            IncomingPeerConfig::default(),
+        );
+        assert!(verify(&[der], &[]).is_ok());
+    }
+
+    /// A real DTLS handshake: dialing a listener whose certificate is not
+    /// trusted fails; trusting its fingerprint makes the same dial succeed.
+    #[tokio::test]
+    async fn connect_refuses_untrusted_listener() {
+        use webrtc_dtls::listener::listen;
+        use webrtc_util::conn::Listener;
+
+        let server_cert = test_cert("server");
+        let server_fingerprint = crypto::certificate_fingerprint(&server_cert);
+        let listener = listen(
+            "127.0.0.1:0",
+            Config {
+                certificates: vec![server_cert],
+                extended_master_secret: ExtendedMasterSecretType::Require,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("dtls listener");
+        let addr = listener.addr().await.expect("listener addr");
+        let listener = Arc::new(listener);
+        let accept = {
+            let listener = listener.clone();
+            tokio::spawn(async move {
+                // keep accepting so each dial gets a handshake partner;
+                // a refused handshake surfaces here as an accept error
+                loop {
+                    let _ = listener.accept().await;
+                }
+            })
+        };
+
+        let client_cert = test_cert("client");
+        let refused = connect(addr, client_cert.clone(), trusting(&[])).await;
+        assert!(refused.is_err(), "untrusted listener must be refused");
+
+        let accepted = connect(addr, client_cert, trusting(&[server_fingerprint])).await;
+        assert!(accepted.is_ok(), "trusted listener must be accepted");
+
+        accept.abort();
+        let _ = listener.close().await;
     }
 }
