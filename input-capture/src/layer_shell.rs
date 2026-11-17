@@ -588,13 +588,12 @@ impl State {
         // hide the cursor
         pointer.set_cursor(serial, None, 0, 0);
 
-        // capture input
-        window
-            .layer_surface
-            .set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        window.surface.commit();
-
-        // lock pointer
+        // lock pointer — before taking keyboard focus. labwc activates a
+        // constraint on a layer surface only when that surface gains focus
+        // (seat_focus looks it up then); a lock created afterwards is never
+        // activated because labwc only activates new constraints for the
+        // active toplevel. The pointer then stays free and the first move
+        // off the 1px edge strip sends Leave, releasing the capture.
         if self.pointer_lock.is_none() {
             self.pointer_lock = Some(self.globals.pointer_constraints.lock_pointer(
                 surface,
@@ -605,6 +604,12 @@ impl State {
                 (),
             ));
         }
+
+        // capture input
+        window
+            .layer_surface
+            .set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        window.surface.commit();
 
         // request relative input
         if self.rel_pointer.is_none() {
