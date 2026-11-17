@@ -2164,7 +2164,12 @@ mod command_ctrl_tests {
             "mousehop-disconnect-test".to_owned(),
         ])
         .expect("test certificate");
-        let conn = MousehopConnection::new(cert, Default::default(), Default::default());
+        let conn = MousehopConnection::new(
+            cert,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
         let (event_tx, _event_rx) = channel();
         let (_request_tx, request_rx) = channel();
         CaptureTask {

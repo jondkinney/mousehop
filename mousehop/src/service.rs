@@ -226,8 +226,12 @@ impl Service {
         let listener =
             MousehopListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
         let primary_cache: PrimaryCache = Default::default();
-        let conn =
-            MousehopConnection::new(cert.clone(), client_manager.clone(), primary_cache.clone());
+        let conn = MousehopConnection::new(
+            cert.clone(),
+            authorized_keys.clone(),
+            client_manager.clone(),
+            primary_cache.clone(),
+        );
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
